@@ -1,0 +1,11 @@
+ #  bắt đầu  tổng(s)  chờ≈(s)  kết quả                    chi tiết
+ 1     0.0s      8.7      0.6  OK                         bạn có thể truy cập website vnpost.vn hoặc gọi tổn
+ 2     1.0s      8.5      0.5  OK                         bạn có thể truy cập website vnpost.vn hoặc gọi tổn
+ 3     2.0s      8.6      0.5  OK                         bạn có thể truy cập website vnpost.vn hoặc gọi tổn
+ 4     3.0s      8.5      0.5  OK                         bạn có thể truy cập website vnpost.vn hoặc gọi tổn
+ 5     4.0s     12.4      0.6  OK                         bạn có thể truy cập website vnpost.vn hoặc gọi tổn
+ 6     5.0s      8.6      0.5  OK                         bạn có thể truy cập website vnpost.vn hoặc gọi tổn
+ 7     6.0s      8.6      0.6  OK                         bạn có thể truy cập website vnpost.vn hoặc gọi tổn
+ 8     7.0s      8.7      0.6  OK                         bạn có thể truy cập website vnpost.vn hoặc gọi tổn
+==> 8/8 phiên OK; còn lại: không có
+(chờ≈ là ước lượng = tổng - độ dài audio - thời gian finish->final)

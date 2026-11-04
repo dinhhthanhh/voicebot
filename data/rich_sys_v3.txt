@@ -1,0 +1,146 @@
+
+=== PROMPT: So sánh ngắn gọn dịch vụ chuyển phát nhanh và chuyển phát thường dưới dạng bảng.
+--- THÔ (chỉ content) ---
+Chuyển phát nhanh có tốc độ cao và chi phí lớn hơn, trong khi chuyển phát thường tiết kiệm chi phí nhưng thời gian giao hàng lâu hơn.
+
+| Tiêu chí | Chuyển phát nhanh | Chuyển phát thường |
+| :--- | :--- | :--- |
+| Thời gian giao | 1 đến 3 ngày | 3 đến 7 ngày hoặc hơn |
+| Chi phí | Cao | Thấp |
+| Theo dõi đơn hàng | Chi tiết, cập nhật liên tục | Cơ bản, ít cập nhật |
+| Phù hợp | Hàng gấp, giá trị cao | Hàng không gấp, giá trị thấp |
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 2.64s] Chuyển phát nhanh có tốc độ cao và chi phí lớn hơn, trong khi chuyển phát thường tiết kiệm chi phí nhưng thời gian giao hàng lâu hơn.
+[ 2.64s] Chi tiết dạng bảng đã được hiển thị trên màn hình.
+--- content đầu: 2.64s | câu đầu: 2.64s | tổng: 2.65s | 2 câu, 435 ký tự
+--- số mẩu=45 | đầu=2.64s | cuối=2.65s
+
+=== PROMPT: Liệt kê 5 bước đóng gói một món hàng dễ vỡ.
+--- THÔ (chỉ content) ---
+Dưới đây là 5 bước đóng gói hàng dễ vỡ:
+
+1. Bọc kín sản phẩm bằng giấy bọt khí hoặc mút xốp.
+2. Đặt sản phẩm vào hộp carton có kích thước vừa vặn.
+3. Lấp đầy khoảng trống xung quanh bằng vật liệu đệm như giấy vụn hoặc mút.
+4. Dán kín các mép hộp bằng băng keo chắc chắn.
+5. Dán nhãn "Hàng dễ vỡ" rõ ràng lên nhiều mặt của thùng.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 2.24s] Dưới đây là 5 bước đóng gói hàng dễ vỡ:
+[ 2.24s] Bọc kín sản phẩm bằng giấy bọt khí hoặc mút xốp.
+[ 2.24s] Đặt sản phẩm vào hộp carton có kích thước vừa vặn.
+[ 2.24s] Lấp đầy khoảng trống xung quanh bằng vật liệu đệm như giấy vụn hoặc mút.
+[ 2.24s] Dán kín các mép hộp bằng băng keo chắc chắn.
+[ 2.24s] Phần còn lại đã được hiển thị trên màn hình.
+--- content đầu: 2.24s | câu đầu: 2.24s | tổng: 2.24s | 6 câu, 328 ký tự
+--- số mẩu=40 | đầu=2.24s | cuối=2.24s
+
+=== PROMPT: Viết một đoạn code Python tính tổng từ 1 đến 100 rồi giải thích.
+--- THÔ (chỉ content) ---
+Dưới đây là đoạn mã Python tính tổng từ 1 đến 100.
+
+```python
+total = 0
+for i in range(1, 101):
+    total += i
+print(total)
+```
+
+Đoạn mã này hoạt động như sau:
+1. Khởi tạo biến `total` bằng 0 để lưu trữ kết quả cộng dồn.
+2. Vòng lặp `for` chạy từ 1 đến 100 (hàm `range(1, 101)` bao gồm 1 và kết thúc trước 101).
+3. Trong mỗi lần lặp, giá trị của `i` được cộng thêm vào `total`.
+4. Cuối cùng, in ra kết quả là 5050.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 2.57s] Dưới đây là đoạn mã Python tính tổng từ 1 đến 100.
+[ 2.57s] Phần mã đã được hiển thị trên màn hình.
+[ 2.57s] Đoạn mã này hoạt động như sau:
+[ 2.57s] Khởi tạo biến total bằng 0 để lưu trữ kết quả cộng dồn.
+[ 2.57s] Vòng lặp for chạy từ 1 đến 100 (hàm range(1, 101) bao gồm 1 và kết thúc trước 101).
+[ 2.57s] Phần còn lại đã được hiển thị trên màn hình.
+--- content đầu: 2.57s | câu đầu: 2.57s | tổng: 2.57s | 6 câu, 414 ký tự
+--- số mẩu=50 | đầu=2.57s | cuối=2.57s
+
+=== PROMPT: Vẽ cho tôi biểu đồ doanh thu 4 quý: 120, 150, 90, 200 triệu đồng.
+--- THÔ (chỉ content) ---
+Doanh thu cao nhất đạt 200 triệu đồng ở quý 4, trong khi quý 3 thấp nhất với 90 triệu đồng.
+
+```
+Quý 1: [====] (120)
+Quý 2: [=====] (150)
+Quý 3: [===] (90)
+Quý 4: [======] (200)
+```
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 2.19s] Doanh thu cao nhất đạt 200 triệu đồng ở quý 4, trong khi quý 3 thấp nhất với 90 triệu đồng.
+--- content đầu: 2.19s | câu đầu: 2.19s | tổng: 2.19s | 1 câu, 181 ký tự
+--- số mẩu=28 | đầu=2.19s | cuối=2.19s
+
+=== PROMPT: Cho tôi đường link trang web chính thức của Bưu điện Việt Nam.
+--- THÔ (chỉ content) ---
+Đường link trang web chính thức của Bưu điện Việt Nam là: https://www.vnpost.vn
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 0.88s] Đường link trang web chính thức của Bưu điện Việt Nam là: đường dẫn trên màn hình.
+--- content đầu: 0.88s | câu đầu: 0.88s | tổng: 0.88s | 1 câu, 79 ký tự
+--- số mẩu=7 | đầu=0.88s | cuối=0.88s
+
+=== PROMPT: Giải thích ngắn gọn khác biệt giữa TCP và UDP.
+--- THÔ (chỉ content) ---
+TCP là giao thức truyền dữ liệu có kết nối, đảm bảo dữ liệu đến đúng thứ tự và không bị mất, nhưng tốc độ chậm hơn. UDP là giao thức không kết nối, gửi dữ liệu nhanh và nhẹ, nhưng không đảm bảo dữ liệu sẽ đến nơi hoặc đúng thứ tự.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 1.68s] TCP là giao thức truyền dữ liệu có kết nối, đảm bảo dữ liệu đến đúng thứ tự và không bị mất, nhưng tốc độ chậm hơn.
+[ 1.69s] UDP là giao thức không kết nối, gửi dữ liệu nhanh và nhẹ, nhưng không đảm bảo dữ liệu sẽ đến nơi hoặc đúng thứ tự.
+--- content đầu: 1.68s | câu đầu: 1.68s | tổng: 1.69s | 2 câu, 230 ký tự
+--- số mẩu=26 | đầu=1.68s | cuối=1.68s
+
+=== PROMPT: Viết một email xin nghỉ phép gồm tiêu đề và ba đoạn.
+--- THÔ (chỉ content) ---
+Tiêu đề: Đơn xin nghỉ phép
+
+Kính gửi Trưởng phòng, tôi viết email này để xin phép nghỉ việc trong hai ngày, từ thứ Ba đến thứ Tư tuần sau, do có việc gia đình đột xuất cần giải quyết.
+
+Trong thời gian vắng mặt, tôi đã bàn giao công việc cho đồng nghiệp và cam kết sẽ hoàn thành các nhiệm vụ còn lại ngay khi quay lại làm việc.
+
+Tôi rất mong nhận được sự chấp thuận của anh chị và xin chân thành cảm ơn.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 2.30s] Tiêu đề: Đơn xin nghỉ phép.
+[ 2.30s] Kính gửi Trưởng phòng, tôi viết email này để xin phép nghỉ việc trong hai ngày, từ thứ Ba đến thứ Tư tuần sau, do có việc gia đình đột xuất cần giải quyết.
+[ 2.30s] Trong thời gian vắng mặt, tôi đã bàn giao công việc cho đồng nghiệp và cam kết sẽ hoàn thành các nhiệm vụ còn lại ngay khi quay lại làm việc.
+[ 2.30s] Tôi rất mong nhận được sự chấp thuận của anh chị và xin chân thành cảm ơn.
+--- content đầu: 2.30s | câu đầu: 2.30s | tổng: 2.30s | 4 câu, 402 ký tự
+--- số mẩu=43 | đầu=2.30s | cuối=2.30s
+
+=== PROMPT: Tóm tắt 3 ý chính về lợi ích của việc đọc sách, dùng gạch đầu dòng.
+--- THÔ (chỉ content) ---
+Việc đọc sách mang lại ba lợi ích chính sau đây:
+
+- Mở rộng kiến thức và hiểu biết về nhiều lĩnh vực khác nhau.
+- Rèn luyện khả năng tư duy logic và tăng cường sự tập trung.
+- Giúp giảm căng thẳng và cải thiện sức khỏe tinh thần.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 1.51s] Việc đọc sách mang lại ba lợi ích chính sau đây:
+[ 1.51s] Mở rộng kiến thức và hiểu biết về nhiều lĩnh vực khác nhau.
+[ 1.51s] Rèn luyện khả năng tư duy logic và tăng cường sự tập trung.
+[ 1.51s] Giúp giảm căng thẳng và cải thiện sức khỏe tinh thần.
+--- content đầu: 1.51s | câu đầu: 1.51s | tổng: 1.51s | 4 câu, 229 ký tự
+--- số mẩu=23 | đầu=1.51s | cuối=1.51s
+
+=== PROMPT: Giải thích công thức tính diện tích hình tròn.
+--- THÔ (chỉ content) ---
+Diện tích hình tròn được tính bằng cách lấy hằng số pi nhân với bình phương bán kính. Công thức là S bằng pi nhân r bình phương. Trong đó, S là diện tích, pi là hằng số xấp xỉ 3,14, và r là độ dài bán kính của hình tròn.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 1.70s] Diện tích hình tròn được tính bằng cách lấy hằng số pi nhân với bình phương bán kính.
+[ 1.70s] Công thức là S bằng pi nhân r bình phương.
+[ 1.70s] Trong đó, S là diện tích, pi là hằng số xấp xỉ 3,14, và r là độ dài bán kính của hình tròn.
+--- content đầu: 1.70s | câu đầu: 1.70s | tổng: 1.70s | 3 câu, 220 ký tự
+--- số mẩu=24 | đầu=1.70s | cuối=1.70s
+
+=== PROMPT: Kể ngắn gọn về lịch sử ngành bưu chính.
+--- THÔ (chỉ content) ---
+Ngành bưu chính có lịch sử hàng nghìn năm, bắt đầu từ các hệ thống truyền tin bằng ngựa và trạm nghỉ của người Ba Tư cổ đại. Đến thế kỷ 17, các quốc gia châu Âu bắt đầu thiết lập hệ thống thư tín quốc gia có tổ chức. Bước ngoặt lớn là sự ra đời của tem bưu chính đầu tiên vào năm 1840 tại Anh, giúp đơn giản hóa việc thanh toán. Từ đó, ngành này phát triển mạnh mẽ, mở rộng ra toàn cầu và hiện đại hóa với công nghệ số, trở thành mạng lưới kết nối thông tin và hàng hóa quan trọng nhất thế giới.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 2.69s] Ngành bưu chính có lịch sử hàng nghìn năm, bắt đầu từ các hệ thống truyền tin bằng ngựa và trạm nghỉ của người Ba Tư cổ đại.
+[ 2.69s] Đến thế kỷ 17, các quốc gia châu Âu bắt đầu thiết lập hệ thống thư tín quốc gia có tổ chức.
+[ 2.69s] Bước ngoặt lớn là sự ra đời của tem bưu chính đầu tiên vào năm 1840 tại Anh, giúp đơn giản hóa việc thanh toán.
+[ 2.70s] Phần còn lại đã được hiển thị trên màn hình.
+--- content đầu: 2.69s | câu đầu: 2.69s | tổng: 2.70s | 4 câu, 495 ký tự
+--- số mẩu=52 | đầu=2.69s | cuối=2.69s

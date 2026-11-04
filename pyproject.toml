@@ -1,0 +1,11 @@
+[project]
+name = "voice-bot"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.162.0",
+    "httpx>=0.28.1",
+    "numpy>=2.4.6",
+    "uvicorn[standard]>=0.54.0",
+    "websockets>=17.3",
+]

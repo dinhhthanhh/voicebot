@@ -1,0 +1,153 @@
+
+=== PROMPT: So sánh ngắn gọn dịch vụ chuyển phát nhanh và chuyển phát thường dưới dạng bảng.
+--- THÔ (chỉ content) ---
+Chuyển phát nhanh có tốc độ giao hàng cao hơn và chi phí đắt hơn so với chuyển phát thường, phù hợp cho hàng gấp, trong khi chuyển phát thường tiết kiệm chi phí nhưng mất nhiều thời gian hơn.
+
+| Tiêu chí | Chuyển phát nhanh | Chuyển phát thường |
+| :--- | :--- | :--- |
+| Tốc độ giao hàng | Nhanh (1-3 ngày) | Chậm (3-7 ngày hoặc hơn) |
+| Chi phí | Cao | Thấp |
+| Theo dõi đơn hàng | Chi tiết, cập nhật liên tục | Cơ bản, ít cập nhật |
+| Phù hợp với | Hàng gấp, quan trọng | Hàng không gấp, giá trị thấp |
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 1.05s] Chuyển phát nhanh có tốc độ giao hàng cao hơn và chi phí đắt hơn so với chuyển phát thường, phù hợp cho hàng gấp, trong khi chuyển phát thường tiết kiệm chi phí nhưng mất nhiều thời gian hơn.
+[ 1.05s] Chi tiết dạng bảng đã được hiển thị trên màn hình.
+--- content đầu: 1.05s | câu đầu: 1.05s | tổng: 1.05s | 2 câu, 505 ký tự
+--- số mẩu=52 | đầu=1.05s | cuối=1.05s
+
+=== PROMPT: Liệt kê 5 bước đóng gói một món hàng dễ vỡ.
+--- THÔ (chỉ content) ---
+Dưới đây là 5 bước cơ bản để đóng gói hàng dễ vỡ:
+
+1. Bọc kín sản phẩm bằng giấy bọt khí hoặc mút xốp.
+2. Đặt sản phẩm vào hộp carton có kích thước vừa vặn.
+3. Lấp đầy khoảng trống xung quanh bằng vật liệu đệm như giấy vụn hoặc mút.
+4. Dán kín các mép hộp bằng băng keo chắc chắn.
+5. Dán nhãn "Dễ vỡ" rõ ràng lên nhiều mặt của thùng hàng.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 0.76s] Dưới đây là 5 bước cơ bản để đóng gói hàng dễ vỡ:
+[ 0.76s] Bọc kín sản phẩm bằng giấy bọt khí hoặc mút xốp.
+[ 0.76s] Đặt sản phẩm vào hộp carton có kích thước vừa vặn.
+[ 0.76s] Lấp đầy khoảng trống xung quanh bằng vật liệu đệm như giấy vụn hoặc mút.
+[ 0.76s] Dán kín các mép hộp bằng băng keo chắc chắn.
+[ 0.76s] Dán nhãn "Dễ vỡ" rõ ràng lên nhiều mặt của thùng hàng.
+--- content đầu: 0.76s | câu đầu: 0.76s | tổng: 0.76s | 6 câu, 338 ký tự
+--- số mẩu=41 | đầu=0.76s | cuối=0.76s
+
+=== PROMPT: Viết một đoạn code Python tính tổng từ 1 đến 100 rồi giải thích.
+--- THÔ (chỉ content) ---
+Dưới đây là đoạn mã Python tính tổng từ 1 đến 100.
+
+```python
+total = 0
+for i in range(1, 101):
+    total += i
+print(total)
+```
+
+Đoạn mã này hoạt động như sau:
+1.  Khởi tạo biến `total` bằng 0 để lưu trữ kết quả cộng dồn.
+2.  Sử dụng vòng lặp `for` để chạy qua các số từ 1 đến 100 (hàm `range(1, 101)` tạo ra dãy số bắt đầu từ 1 và kết thúc ở 100).
+3.  Trong mỗi lần lặp, giá trị của biến `i` (số hiện tại) được cộng thêm vào biến `total`.
+4.  Sau khi vòng lặp kết thúc, in ra giá trị cuối cùng của `total`.
+
+Kết quả in ra sẽ là 5050.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 1.09s] Dưới đây là đoạn mã Python tính tổng từ 1 đến 100.
+[ 1.09s] Phần mã đã được hiển thị trên màn hình.
+[ 1.09s] Đoạn mã này hoạt động như sau:
+[ 1.09s] Khởi tạo biến total bằng 0 để lưu trữ kết quả cộng dồn.
+[ 1.09s] Sử dụng vòng lặp for để chạy qua các số từ 1 đến 100 (hàm hàm range tạo ra dãy số bắt đầu từ 1 và kết thúc ở 100).
+[ 1.09s] Trong mỗi lần lặp, giá trị của biến i (số hiện tại) được cộng thêm vào biến total.
+[ 1.09s] Sau khi vòng lặp kết thúc, in ra giá trị cuối cùng của total.
+[ 1.10s] Kết quả in ra sẽ là 5050.
+--- content đầu: 1.09s | câu đầu: 1.09s | tổng: 1.10s | 8 câu, 534 ký tự
+--- số mẩu=62 | đầu=1.09s | cuối=1.09s
+
+=== PROMPT: Vẽ cho tôi biểu đồ doanh thu 4 quý: 120, 150, 90, 200 triệu đồng.
+--- THÔ (chỉ content) ---
+Biểu đồ cho thấy quý 4 có doanh thu cao nhất với 200 triệu đồng, trong khi quý 3 thấp nhất với 90 triệu đồng.
+
+```
+Quý 1: [===] (120)
+Quý 2: [====] (150)
+Quý 3: [==] (90)
+Quý 4: [======] (200)
+```
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 0.57s] Biểu đồ cho thấy quý 4 có doanh thu cao nhất với 200 triệu đồng, trong khi quý 3 thấp nhất với 90 triệu đồng.
+--- content đầu: 0.57s | câu đầu: 0.57s | tổng: 0.57s | 1 câu, 196 ký tự
+--- số mẩu=27 | đầu=0.57s | cuối=0.57s
+
+=== PROMPT: Cho tôi đường link trang web chính thức của Bưu điện Việt Nam.
+--- THÔ (chỉ content) ---
+Đường link trang web chính thức của Bưu điện Việt Nam là: https://www.vnpost.vn/
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 0.25s] Đường link trang web chính thức của Bưu điện Việt Nam là: đường dẫn trên màn hình.
+--- content đầu: 0.24s | câu đầu: 0.25s | tổng: 0.25s | 1 câu, 80 ký tự
+--- số mẩu=8 | đầu=0.24s | cuối=0.24s
+
+=== PROMPT: Giải thích ngắn gọn khác biệt giữa TCP và UDP.
+--- THÔ (chỉ content) ---
+TCP là giao thức truyền dữ liệu có kết nối, đảm bảo dữ liệu đến đúng thứ tự và không bị mất, phù hợp cho email hay duyệt web. UDP là giao thức không kết nối, truyền dữ liệu nhanh nhưng không đảm bảo độ tin cậy, thường dùng cho video trực tiếp hay game.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 0.59s] TCP là giao thức truyền dữ liệu có kết nối, đảm bảo dữ liệu đến đúng thứ tự và không bị mất, phù hợp cho email hay duyệt web.
+[ 0.59s] UDP là giao thức không kết nối, truyền dữ liệu nhanh nhưng không đảm bảo độ tin cậy, thường dùng cho video trực tiếp hay game.
+--- content đầu: 0.59s | câu đầu: 0.59s | tổng: 0.59s | 2 câu, 252 ký tự
+--- số mẩu=30 | đầu=0.59s | cuối=0.59s
+
+=== PROMPT: Viết một email xin nghỉ phép gồm tiêu đề và ba đoạn.
+--- THÔ (chỉ content) ---
+Tiêu đề: Đơn xin nghỉ phép
+
+Kính gửi sếp, em viết email này để báo trước về việc em cần xin nghỉ phép trong thời gian tới.
+
+Lý do em xin nghỉ là vì gia đình có việc đột xuất cần giải quyết. Em dự kiến sẽ nghỉ từ ngày mai đến hết tuần này.
+
+Em đã bàn giao công việc cho đồng nghiệp và sẽ liên lạc khi cần thiết. Mong sếp xem xét và phê duyệt giúp em.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 0.79s] Tiêu đề: Đơn xin nghỉ phép.
+[ 0.79s] Kính gửi sếp, em viết email này để báo trước về việc em cần xin nghỉ phép trong thời gian tới.
+[ 0.79s] Lý do em xin nghỉ là vì gia đình có việc đột xuất cần giải quyết.
+[ 0.79s] Em dự kiến sẽ nghỉ từ ngày mai đến hết tuần này.
+[ 0.79s] Em đã bàn giao công việc cho đồng nghiệp và sẽ liên lạc khi cần thiết.
+[ 0.79s] Mong sếp xem xét và phê duyệt giúp em.
+--- content đầu: 0.79s | câu đầu: 0.79s | tổng: 0.79s | 6 câu, 349 ký tự
+--- số mẩu=43 | đầu=0.79s | cuối=0.79s
+
+=== PROMPT: Tóm tắt 3 ý chính về lợi ích của việc đọc sách, dùng gạch đầu dòng.
+--- THÔ (chỉ content) ---
+Dưới đây là ba lợi ích chính của việc đọc sách:
+
+- Mở rộng kiến thức và hiểu biết về nhiều lĩnh vực khác nhau.
+- Rèn luyện khả năng tư duy logic và sáng tạo.
+- Giúp giảm căng thẳng và cải thiện sức khỏe tinh thần.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 0.43s] Dưới đây là ba lợi ích chính của việc đọc sách:
+[ 0.43s] Mở rộng kiến thức và hiểu biết về nhiều lĩnh vực khác nhau.
+[ 0.43s] Rèn luyện khả năng tư duy logic và sáng tạo.
+[ 0.44s] Giúp giảm căng thẳng và cải thiện sức khỏe tinh thần.
+--- content đầu: 0.43s | câu đầu: 0.43s | tổng: 0.44s | 4 câu, 213 ký tự
+--- số mẩu=21 | đầu=0.43s | cuối=0.43s
+
+=== PROMPT: Giải thích công thức tính diện tích hình tròn.
+--- THÔ (chỉ content) ---
+Diện tích hình tròn được tính bằng cách lấy số pi nhân với bình phương bán kính. Công thức là S bằng pi nhân r bình phương. Trong đó, S là diện tích, pi là hằng số xấp xỉ 3,14, và r là độ dài bán kính của hình tròn.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 0.50s] Diện tích hình tròn được tính bằng cách lấy số pi nhân với bình phương bán kính.
+[ 0.50s] Công thức là S bằng pi nhân r bình phương.
+[ 0.51s] Trong đó, S là diện tích, pi là hằng số xấp xỉ 3,14, và r là độ dài bán kính của hình tròn.
+--- content đầu: 0.50s | câu đầu: 0.50s | tổng: 0.51s | 3 câu, 215 ký tự
+--- số mẩu=24 | đầu=0.50s | cuối=0.50s
+
+=== PROMPT: Kể ngắn gọn về lịch sử ngành bưu chính.
+--- THÔ (chỉ content) ---
+Ngành bưu chính có lịch sử hàng nghìn năm, bắt đầu từ các hệ thống truyền tin bằng ngựa và trạm nghỉ của người Ba Tư cổ đại. Về sau, các đế chế La Mã và Trung Quốc phát triển mạng lưới đường bộ và trạm chuyển tiếp để vận chuyển thư từ chính thức. Đến thế kỷ mười bảy, dịch vụ bưu chính công cộng đầu tiên xuất hiện ở châu Âu, đánh dấu bước chuyển từ hệ thống hoàng gia sang phục vụ người dân. Vào thế kỷ mười chín, sự ra đời của tem bưu chính và các hiệp ước quốc tế đã giúp ngành này trở nên phổ biến và thống nhất trên toàn cầu. Ngày nay, bưu chính không chỉ gửi thư mà còn tích hợp mạnh mẽ với thương mại điện tử và công nghệ số.
+--- CÂU ĐƯA VÀO TTS (thời điểm sẵn sàng) ---
+[ 1.14s] Ngành bưu chính có lịch sử hàng nghìn năm, bắt đầu từ các hệ thống truyền tin bằng ngựa và trạm nghỉ của người Ba Tư cổ đại.
+[ 1.14s] Về sau, các đế chế La Mã và Trung Quốc phát triển mạng lưới đường bộ và trạm chuyển tiếp để vận chuyển thư từ chính thức.
+[ 1.14s] Đến thế kỷ mười bảy, dịch vụ bưu chính công cộng đầu tiên xuất hiện ở châu Âu, đánh dấu bước chuyển từ hệ thống hoàng gia sang phục vụ người dân.
+[ 1.14s] Vào thế kỷ mười chín, sự ra đời của tem bưu chính và các hiệp ước quốc tế đã giúp ngành này trở nên phổ biến và thống nhất trên toàn cầu.
+[ 1.19s] Phần còn lại đã được hiển thị trên màn hình.
+--- content đầu: 1.14s | câu đầu: 1.14s | tổng: 1.19s | 5 câu, 632 ký tự
+--- số mẩu=67 | đầu=1.14s | cuối=1.18s

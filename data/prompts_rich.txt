@@ -1,0 +1,10 @@
+So sánh ngắn gọn dịch vụ chuyển phát nhanh và chuyển phát thường dưới dạng bảng.
+Liệt kê 5 bước đóng gói một món hàng dễ vỡ.
+Viết một đoạn code Python tính tổng từ 1 đến 100 rồi giải thích.
+Vẽ cho tôi biểu đồ doanh thu 4 quý: 120, 150, 90, 200 triệu đồng.
+Cho tôi đường link trang web chính thức của Bưu điện Việt Nam.
+Giải thích ngắn gọn khác biệt giữa TCP và UDP.
+Viết một email xin nghỉ phép gồm tiêu đề và ba đoạn.
+Tóm tắt 3 ý chính về lợi ích của việc đọc sách, dùng gạch đầu dòng.
+Giải thích công thức tính diện tích hình tròn.
+Kể ngắn gọn về lịch sử ngành bưu chính.
