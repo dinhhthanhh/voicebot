@@ -21,6 +21,15 @@ from typing import Any, Awaitable, Callable
 import numpy as np
 import onnxruntime as ort
 import websockets
+
+try:
+    from websockets.asyncio.client import ClientConnection as WsClientConnection
+except ImportError:
+    try:
+        from websockets.client import WebSocketClientProtocol as WsClientConnection
+    except ImportError:
+        WsClientConnection = Any
+
 from transformers import WhisperFeatureExtractor
 
 logger = logging.getLogger("stt")
@@ -83,7 +92,7 @@ class SttSession:
     def __init__(self, url: str, on_event: Callable[[str, Any], Awaitable[None]]) -> None:
         self.url = url
         self.on_event = on_event
-        self.ws: websockets.WebSocketClientProtocol | None = None
+        self.ws: WsClientConnection | None = None
         self.final_text = ""
         self.error: dict[str, Any] | None = None
         self._done = asyncio.Event()
@@ -112,8 +121,11 @@ class SttSession:
 
     async def _read(self) -> None:
         """Đọc kết quả từ server STT và kích hoạt callback sự kiện."""
+        ws = self.ws
+        if ws is None:
+            return
         try:
-            async for raw in self.ws:
+            async for raw in ws:
                 if isinstance(raw, bytes):
                     continue
                 msg = json.loads(raw)
@@ -397,7 +409,7 @@ class SmartTurnDetector:
         return self.session is not None and self.feature_extractor is not None
 
     def predict(self, audio_f32: np.ndarray, threshold: float = 0.5) -> dict[str, Any]:
-        if not self.is_available:
+        if self.session is None or self.feature_extractor is None:
             return {"prediction": 0, "probability": 0.0, "available": False}
 
         if len(audio_f32) > 0:
@@ -479,7 +491,7 @@ class SileroVadModel:
         self, chunk: np.ndarray, state: np.ndarray, sr: np.ndarray
     ) -> tuple[float, np.ndarray]:
         """Chạy suy luận 1 khối 576 mẫu âm thanh float32 mono 16kHz (kèm 64 mẫu context)."""
-        if not self.is_available:
+        if self.session is None:
             return 0.0, state
         outputs = self.session.run(None, {"input": chunk, "state": state, "sr": sr})
         prob = float(outputs[0][0][0])
