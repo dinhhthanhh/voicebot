@@ -7,16 +7,14 @@ from pathlib import Path
 
 import httpx
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # để import được app/
-from app.llm import SYSTEM_PROMPT_V1, SYSTEM_PROMPT_V2, stream_reply  # noqa: E402
-from app.text_clean import SpeechFilter  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tts import SYSTEM_PROMPT, SpeechFilter, stream_reply  # noqa: E402
 
 
 async def one(prompt: str, args, log, client: httpx.AsyncClient | None = None) -> None:
     messages = [{"role": "user", "content": prompt}]
     if not args.no_system:
-        sp = SYSTEM_PROMPT_V1 if args.v1 else SYSTEM_PROMPT_V2
-        messages.insert(0, {"role": "system", "content": sp})
+        messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
     flt, raw, sents = SpeechFilter(), [], []
     t0, t_first = time.perf_counter(), None
     pieces = []
@@ -78,7 +76,6 @@ def main() -> None:
     p.add_argument("--think", action="store_true", help="bật suy luận (reasoning_effort=low)")
     p.add_argument("--no-system", action="store_true", help="không gửi system prompt")
     p.add_argument("--out")
-    p.add_argument("--v1", action="store_true", help="dùng system prompt v1 (không markdown)")
     a = p.parse_args()
     if not a.url:
         sys.exit("Thiếu --url (hoặc biến môi trường LLM_URL)")

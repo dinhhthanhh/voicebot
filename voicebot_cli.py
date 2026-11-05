@@ -13,10 +13,8 @@ import wave
 
 import httpx
 
-from app.llm import SYSTEM_PROMPT, stream_reply
-from app.stt import to_16k_mono_pcm16, transcribe_pcm16_16k
-from app.text_clean import SpeechFilter
-from app.tts import split_for_tts, synth
+from stt import to_16k_mono_pcm16, transcribe_pcm16_16k
+from tts import SYSTEM_PROMPT, SpeechFilter, split_for_tts, stream_reply, synth
 
 
 def load_wav_as_16k_mono_pcm16(path: str) -> bytes:

@@ -8,11 +8,10 @@ import uuid
 import wave
 from pathlib import Path
 
-import numpy as np
 import websockets
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from app.stt import to_16k_mono_pcm16 as resample_to_16k
+from stt import to_16k_mono_pcm16 as resample_to_16k
 
 PING_EVERY_SEC = 30  # heartbeat mức ứng dụng, theo tài liệu
 TARGET_SR = 16000

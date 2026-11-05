@@ -6,6 +6,13 @@ dependencies = [
     "fastapi>=0.162.0",
     "httpx>=0.28.1",
     "numpy>=2.4.6",
+    "onnxruntime>=1.20.0",
+    "transformers>=4.40.0",
     "uvicorn[standard]>=0.54.0",
     "websockets>=17.3",
+]
+
+[tool.pyright]
+extraPaths = [
+    "C:/Users/admin/AppData/Local/Programs/Python/Python311/Lib/site-packages",
 ]
