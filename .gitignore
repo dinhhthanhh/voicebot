@@ -16,7 +16,7 @@ env/
 *.swo
 
 # Generated output wav files
-data/voicebot_out*.wav
+data/
 
 # ONNX model files
 *.onnx

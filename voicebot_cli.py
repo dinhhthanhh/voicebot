@@ -14,7 +14,7 @@ import wave
 import httpx
 
 from stt import to_16k_mono_pcm16, transcribe_pcm16_16k
-from tts import SYSTEM_PROMPT, SpeechFilter, split_for_tts, stream_reply, synth
+from tts import SYSTEM_PROMPT, SpeechFilter, normalize_text_for_tts, split_for_tts, stream_reply, synth
 
 
 def load_wav_as_16k_mono_pcm16(path: str) -> bytes:
@@ -76,7 +76,8 @@ async def run(args: argparse.Namespace) -> None:
         # 3. Tổng hợp giọng nói (TTS) từng câu
         idx = 0
         for sent in sentences:
-            for piece in split_for_tts(sent):
+            norm_sent = normalize_text_for_tts(sent)
+            for piece in split_for_tts(norm_sent):
                 idx += 1
                 print(f"  câu/đoạn {idx}: {piece}")
                 t_call = time.perf_counter()

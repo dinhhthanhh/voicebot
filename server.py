@@ -1,7 +1,3 @@
-"""server.py - Máy chủ Web Voicebot thời gian thực (FastAPI + WebSocket).
-Quản lý trạng thái phiên: idle -> listening -> thinking -> speaking -> idle.
-Hỗ trợ cơ chế ngắt lời (Barge-in), bộ nhớ ngữ cảnh đa lượt (RAM) và kiểm soát lỗi STT thân thiện.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -27,7 +23,9 @@ from stt import (
     is_only_filler,
     is_reading_sequence,
     normalize_phone_words_in_text,
+    normalize_speech_input,
     normalize_text,
+    validate_vietnam_phone,
 )
 from tts import run_turn
 
@@ -191,7 +189,7 @@ class VoiceSession:
         t = msg.get("type")
         if t == "config":
             if "auto_turn" in msg:
-                self.auto_turn = bool(msg.get("auto_turn", True))
+                self.auto_turn = bool(msg["auto_turn"])
         elif t == "start_turn":
             await self.start_turn()
         elif t == "stop_turn":
@@ -223,12 +221,13 @@ class VoiceSession:
         if len(self.audio_buf) > 256000:
             self.audio_buf = self.audio_buf[-256000:]
 
-        # Silero VAD: Xác suất có tiếng người trên frame 100ms (chống ồn, lọc tiếng gõ phím/thở)
+        # Silero VAD & Energy Gate: Xác suất tiếng người kết hợp lọc âm lượng để chống ồn nền
         samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(samples**2)))
         speech_prob = self.vad.speech_prob(samples)
 
-        # Ngưỡng hysteresis: bắt đầu nói >= 0.50, duy trì nói >= 0.35
-        is_speaking = speech_prob >= 0.50 if not self.has_speech else speech_prob >= 0.35
+        # Ngưỡng hysteresis + Energy gate: Bắt đầu nói cần >= 0.55 và rms >= 0.008 (-42dB) để tránh quạt/thở nhẹ
+        is_speaking = (speech_prob >= 0.55 and rms >= 0.008) if not self.has_speech else (speech_prob >= 0.35 and rms >= 0.005)
 
         if is_speaking:
             self.has_speech = True
@@ -240,8 +239,8 @@ class VoiceSession:
             if self.has_speech:
                 self.silence_frames += 1
 
-        # Nếu người dùng đã nói (>= 4 frame = 400ms) và bắt đầu có khoảng lặng >= 5 frame (500ms)
-        if self.has_speech and self.speech_frames >= 4 and self.silence_frames >= 5 and not self._detecting:
+        # Nếu người dùng đã nói (>= 3 frame = 300ms) và bắt đầu có khoảng lặng >= 5 frame (500ms)
+        if self.has_speech and self.speech_frames >= 3 and self.silence_frames >= 5 and not self._detecting:
             self._detecting = True
             asyncio.create_task(self._check_turn_endpoint())
 
@@ -250,17 +249,19 @@ class VoiceSession:
             if self.state != "listening" or not self.stt:
                 return
 
-            if len(self.audio_buf) < 16000 or self.speech_frames < 4:
+            if len(self.audio_buf) < 12000 or self.speech_frames < 3:
                 return
 
+            # Nếu STT chưa nhận diện được từ nào (chỉ có tạp âm / tiếng thở)
             if not self.last_partial_text.strip():
-                if self.silence_frames >= 20:
+                if self.silence_frames >= 15:
                     self._reset_turn_audio()
                 return
 
+            norm_partial = normalize_text(self.last_partial_text)
             only_filler = is_only_filler(self.last_partial_text)
             hesitating = is_hesitating(self.last_partial_text)
-            extra_frames = 5 if is_reading_sequence(self.last_partial_text) else 0
+            extra_frames = 10 if is_reading_sequence(self.last_partial_text) else 0
 
             if only_filler:
                 if self.silence_frames >= 25:
@@ -272,6 +273,17 @@ class VoiceSession:
                     await self.stop_turn()
                 return
 
+            # Ưu tiên dứt câu nhanh cho câu trả lời ngắn phổ biến ("có", "không", "vâng", "ok", "đúng", "đúng rồi")
+            is_short_answer = norm_partial in ("có", "không", "vâng", "ok", "đúng", "đúng rồi", "được", "rồi")
+            if is_short_answer and self.silence_frames >= 8:
+                await self.send_json({
+                    "type": "auto_stop",
+                    "probability": 0.95,
+                    "reason": "short_answer_fast",
+                })
+                await self.stop_turn()
+                return
+
             audio_f32 = np.frombuffer(self.audio_buf, dtype=np.int16).astype(np.float32) / 32768.0
             res = await asyncio.to_thread(self.detector.predict, audio_f32, 0.75)
             prob = res.get("probability", 0.0)
@@ -280,20 +292,22 @@ class VoiceSession:
             reason = ""
 
             if hesitating:
-                if (prob >= 0.80 and self.silence_frames >= (10 + extra_frames)) or self.silence_frames >= (18 + extra_frames):
+                # Khi người dùng ngập ngừng, nói chậm hoặc câu chưa đủ ý: kiên nhẫn chờ 1.5s - 2.2s
+                if (prob >= 0.85 and self.silence_frames >= (15 + extra_frames)) or self.silence_frames >= (22 + extra_frames):
                     should_stop = True
                     reason = "hesitation_timeout"
             else:
-                if prob >= 0.80 and self.silence_frames >= 5:
+                # Khi câu đã đầy đủ ý, vẫn chờ tối thiểu 1.0s (10 frame) để người dùng lấy hơi/đọc chậm tự nhiên
+                if prob >= 0.85 and self.silence_frames >= (10 + extra_frames):
                     should_stop = True
                     reason = "smart_turn_confident"
-                elif prob >= 0.70 and self.silence_frames >= (6 + extra_frames):  
+                elif prob >= 0.70 and self.silence_frames >= (13 + extra_frames):  
                     should_stop = True
                     reason = "smart_turn_high"
-                elif prob >= 0.50 and self.silence_frames >= (8 + extra_frames):   
+                elif prob >= 0.50 and self.silence_frames >= (16 + extra_frames):   
                     should_stop = True
                     reason = "smart_turn_normal"
-                elif self.silence_frames >= (16 + extra_frames):               
+                elif self.silence_frames >= (22 + extra_frames):               
                     should_stop = True
                     reason = "silence_timeout"
 
@@ -308,11 +322,11 @@ class VoiceSession:
                 not should_stop
                 and self.state == "listening"
                 and not hesitating
-                and prob >= 0.50
-                and self.silence_frames >= 4
+                and prob >= 0.60
+                and self.silence_frames >= 7
                 and self.last_partial_text.strip()
             ):
-                cur_text = normalize_phone_words_in_text(self.last_partial_text.strip())
+                cur_text = normalize_speech_input(self.last_partial_text.strip())
                 if not is_only_filler(cur_text):
                     if self.spec_run is None:
                         self.spec_run = SpeculativeRun(
@@ -339,7 +353,7 @@ class VoiceSession:
     # ---- Vòng đời một lượt thoại ----
     async def start_turn(self) -> None:
         if self.state in ("thinking", "speaking"):
-            # Bỏ barge-in: bắt buộc phải chờ bot nói xong, từ chối nhận lệnh khi bot đang nói
+            # Đàm thoại luân phiên (Half-duplex): chờ bot nói xong, từ chối nhận lệnh khi bot đang xử lý hoặc phát âm thanh
             await self.send_json({"type": "busy"})
             return
 
@@ -368,19 +382,29 @@ class VoiceSession:
 
     async def _turn(self, stt: SttSession) -> None:
         t_stop = time.perf_counter()
+        fallback_text = self.last_partial_text.strip()
         try:
             try:
-                text = normalize_phone_words_in_text((await stt.finish()).strip())
+                raw_text = (await stt.finish()).strip()
+                if not raw_text and fallback_text:
+                    raw_text = fallback_text
+                text = normalize_speech_input(raw_text)
             except SttError as exc:
-                await self._cancel_spec()
-                await self.send_json({"type": "error", "message": friendly_stt_error(exc.payload)})
-                await self.send_json({"type": "bot_done"})
-                return
+                if fallback_text:
+                    text = normalize_speech_input(fallback_text)
+                else:
+                    await self._cancel_spec()
+                    await self.send_json({"type": "error", "message": friendly_stt_error(exc.payload)})
+                    await self.send_json({"type": "bot_done"})
+                    return
             except Exception:
-                await self._cancel_spec()
-                await self.send_json({"type": "error", "message": "Nhận dạng giọng nói thất bại, hãy thử lại."})
-                await self.send_json({"type": "bot_done"})
-                return
+                if fallback_text:
+                    text = normalize_speech_input(fallback_text)
+                else:
+                    await self._cancel_spec()
+                    await self.send_json({"type": "error", "message": "Nhận dạng giọng nói thất bại, hãy thử lại."})
+                    await self.send_json({"type": "bot_done"})
+                    return
 
             await self.send_json({
                 "type": "final",

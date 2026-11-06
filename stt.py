@@ -1,11 +1,3 @@
-"""stt.py - Hợp nhất xử lý âm thanh đầu vào, nhận dạng giọng nói và phát hiện dứt câu.
-Bao gồm:
-- Chuyển đổi định dạng PCM16LE mono 16 kHz (to_16k_mono_pcm16).
-- Giao tiếp streaming WebSocket với Qwen3-ASR (SttSession, transcribe_pcm16_16k).
-- Tích hợp Silero VAD v5 (nhận diện tiếng người thời gian thực).
-- Tích hợp Smart Turn v3.2 ONNX (dự đoán ngữ điệu kết thúc câu).
-- Bộ lọc ngập ngừng, filler và quy tắc phát hiện đọc dở số điện thoại / địa chỉ.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -98,26 +90,49 @@ class SttSession:
         self._done = asyncio.Event()
         self._reader: asyncio.Task | None = None
 
-    async def open(self) -> None:
-        """Mở kết nối WebSocket và gửi gói tin khởi tạo `start`."""
-        self.ws = await websockets.connect(self.url, max_size=10 * 2**20)
-        try:
-            start = {
-                "type": "start",
-                "request_id": str(uuid.uuid4()),
-                "language": "Vietnamese",
-                "sample_rate": TARGET_SR,
-                "encoding": "pcm_s16le",
-                "channels": 1,
-            }
-            await self.ws.send(json.dumps(start))
-            ready = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=15.0))
-            if ready.get("type") == "error":
-                raise SttError(ready)
-        except Exception:
-            await self.ws.close()
-            raise
-        self._reader = asyncio.create_task(self._read())
+    async def open(self, max_retries: int = 2) -> None:
+        """Mở kết nối WebSocket và gửi gói tin khởi tạo `start`, tự động retry khi gặp lỗi 429/overload."""
+        last_exc: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                self.ws = await websockets.connect(self.url, max_size=10 * 2**20)
+                start = {
+                    "type": "start",
+                    "request_id": str(uuid.uuid4()),
+                    "language": "Vietnamese",
+                    "sample_rate": TARGET_SR,
+                    "encoding": "pcm_s16le",
+                    "channels": 1,
+                }
+                await self.ws.send(json.dumps(start))
+                ready = json.loads(await asyncio.wait_for(self.ws.recv(), timeout=15.0))
+                if ready.get("type") == "error":
+                    code = ready.get("error_code", "")
+                    if code in ("OVERLOADED", "QUEUE_TIMEOUT") and attempt < max_retries:
+                        await self.ws.close()
+                        await asyncio.sleep(0.5 * (2**attempt))
+                        continue
+                    raise SttError(ready)
+                self._reader = asyncio.create_task(self._read())
+                return
+            except SttError:
+                if self.ws is not None:
+                    try:
+                        await self.ws.close()
+                    except Exception:
+                        pass
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if self.ws is not None:
+                    try:
+                        await self.ws.close()
+                    except Exception:
+                        pass
+                if attempt < max_retries:
+                    await asyncio.sleep(0.5 * (2**attempt))
+                else:
+                    raise last_exc
 
     async def _read(self) -> None:
         """Đọc kết quả từ server STT và kích hoạt callback sự kiện."""
@@ -152,9 +167,16 @@ class SttSession:
     async def finish(self, timeout: float = 10.0) -> str:
         """Gửi tín hiệu kết thúc thu âm và chờ nhận kết quả final cuối cùng."""
         if self.ws is not None:
-            await self.ws.send(json.dumps({"type": "finish"}))
-            await asyncio.wait_for(self._done.wait(), timeout)
-            await self.ws.close()
+            try:
+                await self.ws.send(json.dumps({"type": "finish"}))
+                await asyncio.wait_for(self._done.wait(), timeout)
+            except asyncio.TimeoutError:
+                logger.warning("STT finish timeout sau %.1fs", timeout)
+            finally:
+                try:
+                    await self.ws.close()
+                except Exception:
+                    pass
         if self.error and not self.final_text:
             raise SttError(self.error)
         return self.final_text
@@ -257,16 +279,19 @@ FILLER_WORDS = {
 }
 
 DANGLING_SUFFIXES = (
-    "ừ", "ừm", "ờ", "ờm", "à", "ơ",
+    "ừ", "ừm", "ờ", "ờm", "à", "ơ", "ê", "nè", "nha", "nhé",
     "là", "và", "hoặc", "nhưng", "mà", "thì", "vì", "do", "bởi", "nếu", "khi",
-    "của", "cho", "với", "tại", "ở", "về", "đến", "tới", "trong", "ngoài",
+    "của", "cho", "với", "ở tại", "tại vì", "ở", "về", "đến", "tới", "trong", "ngoài",
+    "từ", "đi", "sang", "qua", "lên", "xuống", "vào", "ra", "được",
     "như", "như là", "ví dụ", "chẳng hạn", "kiểu", "kiểu như",
     "tôi muốn", "cho tôi", "giúp tôi", "làm sao để", "có nghĩa là", "tức là", "tên là",
+    "cho tôi hỏi", "cho em hỏi", "tôi muốn hỏi", "em cho anh hỏi", "em cho chị hỏi",
+    "hỏi", "xem", "rằng", "để", "sau", "trước", "khoảng", "tầm", "cỡ",
+    "gửi", "chuyển", "phát", "nhận", "lấy", "tính",
 )
 
 NUMBER_AND_ADDRESS_SUFFIXES = (
-    "không", "một", "mốt", "hai", "ba", "bốn", "tư", "năm", "lăm",
-    "sáu", "bảy", "tám", "chín", "mười", "trăm", "nghìn", "ngàn", "triệu",
+    "mười", "trăm", "nghìn", "ngàn", "triệu",
     "số", "ngõ", "ngách", "hẻm", "đường", "phố", "phường", "xã", "thị trấn",
     "quận", "huyện", "tỉnh", "thành phố", "bưu cục", "chi nhánh",
     "mã", "mã đơn", "vận đơn", "bưu phẩm", "điện thoại", "tòa", "tầng",
@@ -278,7 +303,7 @@ WORD_TO_DIGIT = {
     "bảy": "7", "tám": "8", "chín": "9",
 }
 
-TRAILING_DIGIT_RE = re.compile(r"(\d+|\b(eb|vn|ems|cp|lp)\s*\d*)$", re.IGNORECASE)
+TRAILING_DIGIT_RE = re.compile(r"(\d{3,}|\b(eb|vn|ems|cp|lp)\s*\d+)$", re.IGNORECASE)
 NON_WORD_RE = re.compile(r"[^\w\s]")
 SPACES_RE = re.compile(r"\s+")
 TAIL_DIGITS_RE = re.compile(r"(\d[\d\s]*)$")
@@ -325,6 +350,46 @@ def normalize_phone_words_in_text(text: str) -> str:
     return " ".join(converted)
 
 
+def normalize_speech_input(text: str) -> str:
+    """Chuẩn hóa chuỗi nhận dạng giọng nói từ người dùng (gom từ đọc số thành chữ số). Việc nhận diện mã bưu phẩm do LLM trực tiếp xử lý."""
+    return normalize_phone_words_in_text(text)
+
+
+def validate_vietnam_phone(text: str) -> tuple[bool, str]:
+    """Kiểm tra và chuẩn hóa số điện thoại di động Việt Nam bằng thư viện Google phonenumbers.
+    Trả về (is_valid, formatted_phone).
+    """
+    import phonenumbers
+    try:
+        # Tìm các chuỗi số 10 chữ số bắt đầu bằng 0
+        matches = re.findall(r"\b0[35789]\d{8}\b", text)
+        if not matches:
+            return False, ""
+        p = phonenumbers.parse(matches[0], "VN")
+        if phonenumbers.is_valid_number(p):
+            formatted = phonenumbers.format_number(p, phonenumbers.PhoneNumberFormat.NATIONAL)
+            return True, formatted.replace(" ", "")
+    except Exception:
+        pass
+    return False, ""
+
+
+def _ends_with_any(norm: str, phrases: tuple[str, ...]) -> bool:
+    """Kiểm tra xem câu kết thúc bằng một cụm từ (so khớp theo ranh giới từ, không theo ký tự)."""
+    padded = f" {norm}"
+    return any(padded.endswith(f" {p}") for p in phrases)
+
+
+def _tail_digit_run(tokens: list[str]) -> int:
+    """Đếm số token chữ số liên tiếp ở cuối câu."""
+    n = 0
+    for t in reversed(tokens):
+        if not t.isdigit():
+            break
+        n += 1
+    return n
+
+
 def is_only_filler(text: str) -> bool:
     """Kiểm tra xem văn bản nhận diện được mới chỉ có tiếng 'ừ, ờ, ùm' hoặc còn trống."""
     norm = _normalize_text(text)
@@ -346,21 +411,23 @@ def is_reading_sequence(text: str) -> bool:
     tail_match = TAIL_DIGITS_RE.search(norm_digits)
     if tail_match:
         tail_digits = SPACES_RE.sub("", tail_match.group(1))
-        # Nếu có tiền tố đầu số di động VN (03, 05, 07, 08, 09), lấy cụm SĐT gần nhất (kể cả khi đọc lặp/sửa lời)
-        phone_starts = list(PHONE_START_RE.finditer(tail_digits))
-        if phone_starts:
-            last_start = phone_starts[-1].start()
-            current_phone = tail_digits[last_start:]
-            if len(current_phone) >= 10:
+        # Chỉ coi là dãy số/SĐT khi có >= 2 chữ số (loại trừ từ 'không' đơn lẻ cuối câu hỏi)
+        if len(tail_digits) >= 2:
+            # Nếu có tiền tố đầu số di động VN (03, 05, 07, 08, 09), lấy cụm SĐT gần nhất
+            phone_starts = list(PHONE_START_RE.finditer(tail_digits))
+            if phone_starts:
+                last_start = phone_starts[-1].start()
+                current_phone = tail_digits[last_start:]
+                if len(current_phone) >= 10:
+                    return False
+                return True
+            if len(tail_digits) >= 10:
                 return False
             return True
-        if len(tail_digits) >= 10:
-            return False
-        return True
 
     if TRAILING_DIGIT_RE.search(norm):
         return True
-    return norm.endswith(NUMBER_AND_ADDRESS_SUFFIXES)
+    return _ends_with_any(norm, NUMBER_AND_ADDRESS_SUFFIXES)
 
 
 def is_hesitating(text: str) -> bool:
@@ -368,12 +435,17 @@ def is_hesitating(text: str) -> bool:
     if is_only_filler(text):
         return True
     norm = _normalize_text(text)
+    if not norm:
+        return True
     if text.rstrip().endswith("..."):
         return True
     words = norm.split()
     if len(words) <= 1 and words[0] in FILLER_WORDS:
         return True
-    return norm.endswith(DANGLING_SUFFIXES)
+    # Câu quá ngắn (1-3 từ) chưa hoàn chỉnh nội dung (trừ câu trả lời chốt ngắn) -> coi là đang ngập ngừng/nghĩ tiếp
+    if len(words) <= 3 and norm not in ("có", "không", "vâng", "ok", "được", "đúng", "đúng rồi", "rồi", "xong"):
+        return True
+    return _ends_with_any(norm, DANGLING_SUFFIXES)
 
 
 # ==============================================================================
@@ -396,6 +468,7 @@ class SmartTurnDetector:
             so = ort.SessionOptions()
             so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             so.inter_op_num_threads = 1
+            so.intra_op_num_threads = 1
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             self.session = ort.InferenceSession(str(self.model_path), sess_options=so)
             self.feature_extractor = WhisperFeatureExtractor(chunk_length=MAX_SECONDS)
@@ -412,19 +485,18 @@ class SmartTurnDetector:
         if self.session is None or self.feature_extractor is None:
             return {"prediction": 0, "probability": 0.0, "available": False}
 
-        if len(audio_f32) > 0:
-            mean = np.mean(audio_f32)
-            std = np.std(audio_f32)
-            audio_norm = (audio_f32 - mean) / np.sqrt(std**2 + 1e-7)
+        # Pad trước, rồi mới chuẩn hóa (khớp code tham chiếu pipecat-ai/smart-turn)
+        if len(audio_f32) > MAX_SAMPLES:
+            audio = audio_f32[-MAX_SAMPLES:].copy()
+        elif len(audio_f32) < MAX_SAMPLES:
+            audio = np.pad(audio_f32, (MAX_SAMPLES - len(audio_f32), 0), mode="constant")
         else:
-            audio_norm = audio_f32
+            audio = audio_f32.copy()
 
-        if len(audio_norm) > MAX_SAMPLES:
-            audio = audio_norm[-MAX_SAMPLES:]
-        elif len(audio_norm) < MAX_SAMPLES:
-            audio = np.pad(audio_norm, (MAX_SAMPLES - len(audio_norm), 0), mode="constant")
-        else:
-            audio = audio_norm
+        if len(audio) > 0:
+            mean = np.mean(audio)
+            std = np.std(audio)
+            audio = (audio - mean) / np.sqrt(std**2 + 1e-7)
 
         inputs = self.feature_extractor(
             audio,
@@ -476,6 +548,7 @@ class SileroVadModel:
             so = ort.SessionOptions()
             so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             so.inter_op_num_threads = 1
+            so.intra_op_num_threads = 1
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             self.session = ort.InferenceSession(str(self.model_path), sess_options=so)
             logger.info("Đã tải thành công Silero VAD model: %s", self.model_path.name)

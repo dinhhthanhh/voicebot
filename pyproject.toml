@@ -3,13 +3,15 @@ name = "voice-bot"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.162.0",
+    "fastapi>=0.115.0",
     "httpx>=0.28.1",
-    "numpy>=2.4.6",
+    "num2words>=0.5.13",
+    "numpy>=2.0.0",
     "onnxruntime>=1.20.0",
-    "transformers>=4.40.0",
-    "uvicorn[standard]>=0.54.0",
-    "websockets>=17.3",
+    "phonenumbers>=9.0.42",
+    "transformers>=4.40.0,<5.0.0",
+    "uvicorn[standard]>=0.34.0",
+    "websockets>=14.0",
 ]
 
 [tool.pyright]

@@ -16,28 +16,48 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
+from num2words import num2words
 
 # ==============================================================================
 # 1. Cấu hình LLM & Prompt
 # ==============================================================================
 SYSTEM_PROMPT = (
     "Bạn là trợ lý giọng nói tiếng Việt. Câu trả lời của bạn vừa được đọc to thành tiếng, "
-    "vừa hiển thị trên màn hình. Viết ngắn gọn như văn nói, đủ câu, không dùng emoji. "
+    "vừa hiển thị trên màn hình. Viết ngắn gọn như văn nói, tối đa 3 câu trừ khi người dùng yêu cầu chi tiết. "
+    "Câu đầu tiên phải ngắn (dưới 12 từ) để hệ thống phát âm thanh ngay lập tức. "
+    "Không dùng emoji. "
     "Tuân thủ đúng yêu cầu định dạng của người dùng: nếu họ yêu cầu gạch đầu dòng, bảng, "
     "danh sách, mã nguồn hay biểu đồ thì phải làm đúng như vậy, không từ chối. "
     "Xử lý nhận dạng giọng nói, số điện thoại và mã vận đơn: "
     "- Người dùng nói qua micro nên văn bản có thể có từ ngữ ngập ngừng, lặp từ, hoặc tự sửa lời. "
     "- Số điện thoại di động Việt Nam chuẩn gồm đúng 10 chữ số (bắt đầu bằng 03, 05, 07, 08, 09). "
-    "Khi người dùng đọc số điện thoại hoặc mã bưu phẩm mà có hiện tượng nói ngập ngừng, đọc lặp đầu số hoặc đọc lại từ đầu "
-    "(ví dụ: 'số điện thoại của tôi là 09 093 45 43 22 69', '098... à 0981234567'): Hãy thông minh hiểu đây là người dùng đọc lại/sửa lại, "
-    "tự động trích xuất đúng số điện thoại 10 chữ số hoàn chỉnh (trong ví dụ trên là 09345432269), "
+    "Khi người dùng đọc số điện thoại mà có hiện tượng nói ngập ngừng, đọc lặp đầu số hoặc đọc lại từ đầu "
+    "(ví dụ: 'số điện thoại là 098 à không 0983 456 789', kết quả đúng: 0983456789): "
+    "Hãy thông minh hiểu đây là người dùng đọc lại/sửa lại, "
+    "tự động trích xuất đúng số điện thoại 10 chữ số hoàn chỉnh, "
     "tuyệt đối không ghép nối các đoạn lặp lại thành dãy số thừa (12, 13 chữ số). "
-    "- Các chữ số giống nhau đứng liền kề (ví dụ: '77', '88', '11', '00', 'bảy bảy', 'tám tám', 'một một', 'không không') là các chữ số thực sự hợp lệ của số điện thoại, tuyệt đối không được coi là lặp từ để xóa bỏ. "
-    "- Nếu chuỗi số điện thoại người dùng cung cấp không đủ 10 số hoặc không rõ ràng, hãy nhắc lại lịch sự và hỏi lại để người dùng xác nhận. "
+    "- Các chữ số giống nhau đứng liền kề ('77', '88', 'bảy bảy', 'tám tám') là chữ số thực sự hợp lệ, "
+    "tuyệt đối không coi là lặp từ để xóa bỏ. "
+    "- Nếu SĐT không đủ 10 số hoặc không rõ ràng, đọc lại từng chữ số theo nhóm 3-4 số và hỏi xác nhận. "
+    "QUY TẮC ĐỊNH DẠNG MÃ VÀ SỐ (BẮT BUỘC HIỂN THỊ DẠNG MÃ CHUẨN TRÊN MÀN HÌNH, KHÔNG VIẾT CHỮ PHIÊN ÂM): "
+    "- Mã bưu gửi, mã vận đơn: BẮT BUỘC viết hoa dạng mã chuẩn (Ví dụ: VN123456789VN, EB123456789VN, EMS123456789). "
+    "Tuyệt đối KHÔNG viết phiên âm chữ như 'vê nờ một hai ba...' hay 'vi en một hai ba...'. "
+    "- Số điện thoại, CCCD: BẮT BUỘC viết dạng số chuẩn (Ví dụ: 0912345678, 0934543226). "
+    "Tuyệt đối KHÔNG viết phiên âm chữ như 'không chín một hai...'. "
+    "- Số tiền, khối lượng, kích thước: Viết dạng số kèm ký hiệu đơn vị chuẩn (Ví dụ: 150.000đ, 2,5kg, 30cm, 50%). "
+    "Hệ thống âm thanh (TTS) sẽ tự động chuyển các mã và số này thành giọng đọc tương ứng ra loa, "
+    "bạn chỉ cần viết đúng định dạng chuẩn để người dùng nhìn thấy rõ ràng trên màn hình. "
+    "- Hiểu cách đọc mã của người dùng: Người dùng có thể đọc mã theo phát âm tiếng Anh (như 'vi en' cho VN, 'i bi' cho EB, 'i em ét' cho EMS) "
+    "hoặc tiếng Việt (như 'vê nờ', 'e bê', 'e mờ ét'); hãy thông minh hiểu đó là các ký tự viết hoa chuẩn tương ứng. "
+    "XỬ LÝ NGƯỜI DÙNG NGẬP NGỪNG: "
+    "Nếu câu của người dùng bị ngắt giữa chừng khi đang đọc dở số hoặc chỉ mới nói từ đệm, "
+    "tuyệt đối không suy đoán hay báo lỗi, hãy nhẹ nhàng khích lệ đọc tiếp "
+    "(Ví dụ: 'Dạ vâng, em đang nghe ạ, anh chị đọc tiếp giúp em nhé.'). "
     "BẮT BUỘC: Khi tạo bảng, mã nguồn hoặc biểu đồ, luôn phải nói trước 1 đến 2 câu tóm tắt ý chính "
     "hoặc kết luận quan trọng bằng lời văn tự nhiên (đặc biệt khi dùng bảng thì phải tóm tắt nội dung so sánh trước khi vẽ bảng, "
     "vì hệ thống âm thanh chỉ đọc câu tóm tắt này và bỏ qua nội dung chi tiết dạng bảng hay mã); "
-    "tuyệt đối không tự viết các câu như 'Nội dung đã được hiển thị trên màn hình', 'Bảng đã được hiển thị trên màn hình' hay 'Mã nguồn đã được hiển thị trên màn hình'. "
+    "tuyệt đối không tự viết các câu như 'Nội dung đã được hiển thị trên màn hình', "
+    "'Bảng đã được hiển thị trên màn hình' hay 'Mã nguồn đã được hiển thị trên màn hình'. "
     "Không đọc tên hàm hay biểu thức code trong câu nói, chỉ mô tả bằng lời. "
     "Quy cách vẽ bảng và biểu đồ: "
     "- Bảng dùng định dạng bảng markdown. "
@@ -307,6 +327,53 @@ DEFAULT_PARAMS = {
 
 MAX_TTS_CHARS = 450
 
+DIGITS_VI = {"0": "không", "1": "một", "2": "hai", "3": "ba", "4": "bốn", "5": "năm", "6": "sáu", "7": "bảy", "8": "tám", "9": "chín"}
+LETTERS_VI = {
+    "A": "a", "B": "bê", "C": "xê", "D": "đê", "E": "e", "F": "ép", "G": "gờ", "H": "hát", "I": "i",
+    "J": "giây", "K": "ca", "L": "lờ", "M": "mờ", "N": "nờ", "O": "o", "P": "pê", "Q": "quy", "R": "rờ",
+    "S": "ét", "T": "tê", "U": "u", "V": "vê", "W": "vê kép", "X": "ích", "Y": "y", "Z": "dét"
+}
+UNITS_VI = {
+    "kg": "ki lô gam", "g": "gam", "km": "ki lô mét", "m": "mét", "cm": "xen ti mét", "mm": "mi li mét",
+    "đ": "đồng", "vnd": "đồng", "vnđ": "đồng", "k": "nghìn", "%": "phần trăm"
+}
+
+
+def normalize_text_for_tts(text: str) -> str:
+    """Chuẩn hóa văn bản thành chuỗi từ thuần tiếng Việt để Zero-TTS đọc trôi chảy (Số, Đơn vị, Mã Alphanumeric)."""
+    text = re.sub(r"\b(0\d{2,3})[\s.-](\d{3})[\s.-](\d{3,4})\b", r"\1\2\3", text)
+
+    def _replace_token(match: re.Match) -> str:
+        tok = match.group(0)
+        clean_tok = tok.rstrip(".,;!?")
+        punct = tok[len(clean_tok):]
+        tok = clean_tok
+
+        unit = ""
+        m_unit = re.match(r"^([0-9.,/]+)\s*([a-zA-ZđĐ%]+)$", tok)
+        if m_unit and m_unit.group(2).lower() in UNITS_VI:
+            tok = m_unit.group(1)
+            unit = " " + UNITS_VI[m_unit.group(2).lower()]
+
+        if re.search(r"[A-Za-z]", tok) and re.search(r"\d", tok):
+            return " ".join(DIGITS_VI.get(c, LETTERS_VI.get(c, c)) for c in tok.upper() if c in DIGITS_VI or c in LETTERS_VI) + unit + punct
+
+        if tok.isdigit():
+            if (tok.startswith("0") and len(tok) > 1) or len(tok) >= 8:
+                return " ".join(DIGITS_VI[c] for c in tok) + unit + punct
+            return num2words(int(tok), lang="vi") + unit + punct
+
+        if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", tok):
+            return num2words(int(tok.replace(".", "")), lang="vi") + unit + punct
+
+        if re.fullmatch(r"\d+[.,]\d+", tok):
+            parts = re.split(r"[.,]", tok)
+            return num2words(int(parts[0]), lang="vi") + " phẩy " + num2words(int(parts[1]), lang="vi") + unit + punct
+
+        return match.group(0)
+
+    return re.sub(r"\b[A-Za-z0-9.,/]+(?:%|đ|Đ|kg|g|km|m|cm|mm|vnd|vnđ)?", _replace_token, text)
+
 
 def split_for_tts(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
     """Tách câu văn bản dài tại dấu phẩy hoặc khoảng trắng gần nhất để vừa giới hạn ký tự của TTS."""
@@ -441,7 +508,8 @@ async def run_turn(
     async def consumer() -> None:
         """Lấy từng câu từ hàng đợi, gửi qua Zero-TTS stream và đẩy chunk PCM tới client."""
         while (sent := await q.get()) is not _END:
-            for piece in split_for_tts(sent):
+            norm_sent = normalize_text_for_tts(sent)
+            for piece in split_for_tts(norm_sent):
                 async for pcm in synth_stream(piece, base_url=tts_url, voice=voice, client=client):
                     mark("first_audio")
                     await send_audio(pcm)

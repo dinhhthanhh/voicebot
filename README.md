@@ -1,13 +1,12 @@
 # Voicebot (STT → LLM → SpeechFilter → TTS)
 
-Hệ thống trợ lý giọng nói đàm thoại thời gian thực (Full-duplex / Half-duplex với cơ chế ngắt lời Barge-in), tối ưu độ trễ thấp và tích hợp bộ lọc văn bản thông minh.
+Hệ thống trợ lý giọng nói đàm thoại thời gian thực (Half-duplex), tối ưu độ trễ thấp và tích hợp bộ lọc văn bản thông minh.
 
 ## 🌟 Tính năng nổi bật
 
 - **Kiến trúc luồng kép (Dual-channel Streaming):**
   - **Kênh hiển thị (Màn hình):** Hiển thị tức thì toàn văn câu trả lời từ LLM (kể cả bảng Markdown, mã nguồn, danh sách).
   - **Kênh âm thanh (Thoại):** Xử lý song song qua hàng đợi Producer-Consumer, nhả âm thanh ngay khi câu đầu tiên sẵn sàng, đạt **Time-to-First-Audio ~0.7s**.
-- **Cơ chế ngắt lời (Barge-in):** Cho phép người dùng chen ngang ngắt lời bot bất cứ lúc nào; hệ thống lập tức hủy luồng LLM và TTS đang phát dở trên cả server và trình duyệt.
 - **Bộ lọc văn bản thông minh (`SpeechFilter`):**
   - Tách câu hoàn chỉnh thời gian thực theo dấu câu.
   - Bỏ qua khối code và bảng biểu chi tiết, thay thế bằng câu thông báo điều hướng ngắn gọn.
@@ -28,7 +27,7 @@ voice-bot/
 ├── app/
 │   ├── __init__.py
 │   ├── llm.py             # Prompt V2 & SSE Stream từ LLM (vLLM)
-│   ├── pipeline.py        # Producer-Consumer điều phối luồng thoại và Barge-in
+│   ├── pipeline.py        # Producer-Consumer điều phối luồng thoại
 │   ├── stt.py             # Resample 16kHz & WebSocket streaming tới Qwen3-ASR
 │   ├── text_clean.py      # SpeechFilter làm sạch và tách câu cho TTS
 │   └── tts.py             # Split text & streaming PCM từ Zero-TTS
