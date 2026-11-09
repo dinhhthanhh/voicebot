@@ -56,6 +56,7 @@
     }
 
     #btnStop {
+      display: none;
       font-weight: bold;
       background: #d32f2f;
       color: #fff;
@@ -108,12 +109,6 @@
       font-weight: 500;
       min-height: 20px;
     }
-
-    #log {
-      font-family: ui-monospace, Consolas, monospace;
-      font-size: 13px;
-      white-space: pre-wrap;
-    }
   </style>
 </head>
 
@@ -127,8 +122,8 @@
 
   <div class="row">
     <button id="btnTalk">Bắt đầu nói</button>
-    <button id="btnFinish">Xong, trả lời</button>
-    <button id="btnStop">Hủy lượt</button>
+    <button id="btnFinish">Gửi</button>
+    <button id="btnStop">Dừng nói</button>
     <button id="btnReset">Hội thoại mới</button>
   </div>
 
@@ -144,11 +139,6 @@
 
   <div class="row" id="err"></div>
 
-  <div class="row">
-    <b>Độ trễ từng lượt:</b>
-    <div id="log" class="box"></div>
-  </div>
-
   <script>
     (() => {
       const $ = id => document.getElementById(id);
@@ -156,16 +146,48 @@
       const LABEL = { idle: 'Rảnh', listening: 'Đang nghe...', thinking: 'Đang suy nghĩ', speaking: 'Đang nói' };
 
       let ws, ctx, micStream, micSource, processor;
-      let recording = false, callActive = false, srvState = 'idle', turnNo = 0;
-      let buf = new Float32Array(0);
+      let recording = false, callActive = false, srvState = 'idle';
+      const pendingAudio = new Float32Array(FRAME_SAMPLES);
+      let pendingLength = 0;
+      let resamplePhase = 0;
+      let resamplePrevSample = null;
       let playHead = 0, carry = new Uint8Array(0), discarding = false;
+      let ttsSr = TTS_SR;
+      let waitAudioEndTimer = null, autoListenTimer = null;
       const sources = new Set();
-      let tStop = 0, tPlayStart = null, finalInfo = null;
+
+      function clearAutoListenTimers() {
+        if (waitAudioEndTimer !== null) {
+          clearInterval(waitAudioEndTimer);
+          waitAudioEndTimer = null;
+        }
+        if (autoListenTimer !== null) {
+          clearTimeout(autoListenTimer);
+          autoListenTimer = null;
+        }
+      }
+
+      // Reset bộ đệm và trạng thái resample
+      function resetAudioInputState() {
+        pendingLength = 0;
+        resamplePhase = 0;
+        resamplePrevSample = null;
+      }
 
       const sendJson = obj => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); };
       const setErr = msg => { $('err').textContent = msg || ''; };
 
-      // 1. Kết nối WebSocket với máy chủ
+      function setButtonsState(isSpeaking) {
+        $('btnTalk').style.display = isSpeaking ? 'none' : 'inline-block';
+        $('btnFinish').style.display = isSpeaking ? 'inline-block' : 'none';
+        $('btnStop').style.display = isSpeaking ? 'inline-block' : 'none';
+        if (!isSpeaking) {
+          $('btnTalk').textContent = 'Bắt đầu nói';
+          $('btnTalk').style.background = '#0066cc';
+        }
+      }
+
+      // Kết nối WebSocket
       function connect() {
         const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
         ws = new WebSocket(proto + location.host + '/ws/voice');
@@ -175,11 +197,20 @@
           sendJson({ type: 'config', auto_turn: true });
           refreshState();
         };
-        ws.onclose = () => { $('state').textContent = 'Mất kết nối (Hãy tải lại trang)'; };
+        ws.onclose = () => {
+          clearAutoListenTimers();
+          recording = false;
+          callActive = false;
+          resetAudioInputState();
+          stopPlayback();
+          $('state').textContent = 'Mất kết nối (Hãy tải lại trang)';
+          setButtonsState(false);
+          setErr('Mất kết nối với máy chủ. Vui lòng tải lại trang.');
+        };
         ws.onmessage = onMessage;
       }
 
-      // 2. Cập nhật nhãn trạng thái giao diện
+      // Trạng thái phát âm thanh và giao diện
       const isPlaying = () => {
         if (!ctx) return false;
         if (sources.size > 0) return true;
@@ -193,36 +224,9 @@
       }
       setInterval(refreshState, 200);
 
-      // 3. Xử lý thu âm và Resample sang 16kHz (giữ liền mạch pha giữa các block)
-      let resamplePhase = 0;
-      function resample(input, srcSr, dstSr) {
-        if (srcSr === dstSr) return input;
-        const ratio = dstSr / srcSr;
-        const out = [];
-        let x = resamplePhase;
-        while (x < input.length) {
-          const x0 = Math.floor(x);
-          const x1 = Math.min(x0 + 1, input.length - 1);
-          const t = x - x0;
-          out.push(input[x0] * (1 - t) + input[x1] * t);
-          x += 1 / ratio;
-        }
-        resamplePhase = x - input.length;
-        return new Float32Array(out);
-      }
-
-      function toPcm16(f32) {
-        const pcm = new Int16Array(f32.length);
-        for (let i = 0; i < f32.length; i++) {
-          const s = Math.max(-1, Math.min(1, f32[i]));
-          pcm[i] = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
-        }
-        return pcm.buffer;
-      }
-
+      // Khởi tạo AudioContext, Micro và bộ lọc
       async function ensureAudio() {
         if (!ctx) {
-          // Dùng AudioContext với tần số gốc của phần cứng (thường là 48kHz) để phát TTS chất lượng cao nhất, mic được resample riêng
           ctx = new (window.AudioContext || window.webkitAudioContext)();
         }
         if (ctx.state === 'suspended') await ctx.resume();
@@ -232,16 +236,36 @@
               channelCount: 1,
               echoCancellation: true,
               noiseSuppression: true,
-              autoGainControl: false, // Bắt buộc tắt AGC để chống khuếch đại nhiễu nền khi phòng ồn
+              autoGainControl: false // Tắt AGC tránh khuếch đại nhiễu nền
             },
             video: false
           });
           micSource = ctx.createMediaStreamSource(micStream);
+          const track = micStream.getAudioTracks()[0];
+          if (track) {
+            console.log("Mic settings:", track.getSettings());
+            console.log("Mic constraints:", track.getConstraints());
+          }
+
+          // Lọc chống aliasing (Butterworth bậc 4, 7.2 kHz)
+          const lowpass1 = ctx.createBiquadFilter();
+          lowpass1.type = 'lowpass';
+          lowpass1.frequency.value = 7200;
+          lowpass1.Q.value = 0.5411961;
+
+          const lowpass2 = ctx.createBiquadFilter();
+          lowpass2.type = 'lowpass';
+          lowpass2.frequency.value = 7200;
+          lowpass2.Q.value = 1.306563;
+
+          micSource.connect(lowpass1);
+          lowpass1.connect(lowpass2);
+
           processor = ctx.createScriptProcessor(2048, 1, 1);
           processor.onaudioprocess = onMic;
-          micSource.connect(processor);
+          lowpass2.connect(processor);
 
-          // Chống dội âm (Anti-feedback): nối qua Gain(0) để kích hoạt processor mà không phát ra loa
+          // Nối qua Gain(0) để kích hoạt processor mà không phát ra loa
           const mute = ctx.createGain();
           mute.gain.value = 0;
           processor.connect(mute);
@@ -249,40 +273,97 @@
         }
       }
 
+      // Xử lý stream microphone (resample 16kHz -> đệm 1600 mẫu -> gửi WebSocket)
       function onMic(e) {
         if (!recording || !ws || ws.readyState !== WebSocket.OPEN) return;
-        // Chờ bot nói xong: tuyệt đối không gửi mic khi bot đang suy nghĩ hoặc phát âm thanh
         if (srvState === 'thinking' || srvState === 'speaking' || isPlaying()) return;
-        const x = resample(e.inputBuffer.getChannelData(0), ctx.sampleRate, TARGET_SR);
-        const merged = new Float32Array(buf.length + x.length);
-        merged.set(buf);
-        merged.set(x, buf.length);
+
+        const input = e.inputBuffer.getChannelData(0);
+        const samples = resample(input, ctx.sampleRate, TARGET_SR);
 
         let offset = 0;
-        while (merged.length - offset >= FRAME_SAMPLES) {
-          ws.send(toPcm16(merged.subarray(offset, offset + FRAME_SAMPLES)));
-          offset += FRAME_SAMPLES;
+        while (offset < samples.length) {
+          const available = FRAME_SAMPLES - pendingLength;
+          const count = Math.min(available, samples.length - offset);
+
+          pendingAudio.set(
+            samples.subarray(offset, offset + count),
+            pendingLength
+          );
+
+          pendingLength += count;
+          offset += count;
+
+          if (pendingLength === FRAME_SAMPLES) {
+            ws.send(toPcm16(pendingAudio));
+            pendingLength = 0;
+          }
         }
-        buf = merged.slice(offset);
       }
 
+      // Hạ tần số lấy mẫu (nội suy tuyến tính liên tục giữa các block)
+      function resample(input, srcSr, dstSr) {
+        if (input.length === 0) {
+          return new Float32Array(0);
+        }
+
+        if (srcSr === dstSr) {
+          return input;
+        }
+
+        const step = srcSr / dstSr;
+        const out = new Float32Array(
+          Math.ceil(input.length * dstSr / srcSr) + 2
+        );
+
+        let x = resamplePhase;
+        let count = 0;
+
+        while (x < input.length - 1) {
+          const x0 = Math.floor(x);
+          const x1 = x0 + 1;
+          const t = x - x0;
+
+          const a = x0 < 0
+            ? resamplePrevSample
+            : input[x0];
+
+          const b = input[x1];
+
+          out[count++] = a * (1 - t) + b * t;
+
+          x += step;
+        }
+
+        resamplePhase = x - input.length;
+        resamplePrevSample = input[input.length - 1];
+
+        return out.subarray(0, count);
+      }
+
+      // Chuyển Float32 [-1, 1] sang Int16 PCM
+      function toPcm16(f32) {
+        const pcm = new Int16Array(f32.length);
+        for (let i = 0; i < f32.length; i++) {
+          const s = Math.max(-1, Math.min(1, f32[i]));
+          pcm[i] = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
+        }
+        return pcm.buffer;
+      }
+
+      // Kết thúc lượt nói và gửi phần âm thanh còn dư
       function stopTalking() {
+        if (!recording) return;
+        clearAutoListenTimers();
         recording = false;
-        if (buf.length > 0) {
-          ws.send(toPcm16(buf));
-          buf = new Float32Array(0);
+        if (pendingLength > 0 && ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(toPcm16(pendingAudio.subarray(0, pendingLength)));
         }
-        tStop = performance.now();
-        tPlayStart = null;
-        finalInfo = null;
+        resetAudioInputState();
         sendJson({ type: 'stop_turn' });
-        $('btnTalk').style.display = 'inline-block';
-        $('btnTalk').textContent = 'Bắt đầu nói';
-        $('btnTalk').style.background = '#0066cc';
-        $('btnFinish').style.display = 'none';
       }
 
-      // 4. Phát luồng âm thanh PCM 48kHz nhận từ máy chủ
+      // Dừng phát âm thanh
       function stopPlayback() {
         for (const src of sources) {
           try { src.stop(); } catch (_) { }
@@ -294,10 +375,11 @@
         refreshState();
       }
 
+      // Phát luồng âm thanh PCM từ máy chủ
       function playPcm(arrayBuf) {
         if (!ctx || discarding) return;
 
-        // Giữ byte lẻ lại để ghép với chunk tiếp theo đảm bảo căn chỉnh 16-bit
+        // Ghép byte lẻ đảm bảo căn chỉnh 16-bit
         const bytes = new Uint8Array(carry.length + arrayBuf.byteLength);
         bytes.set(carry, 0);
         bytes.set(new Uint8Array(arrayBuf), carry.length);
@@ -310,7 +392,7 @@
         const f32 = new Float32Array(i16.length);
         for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
 
-        const audioBuf = ctx.createBuffer(1, f32.length, TTS_SR);
+        const audioBuf = ctx.createBuffer(1, f32.length, ttsSr);
         audioBuf.copyToChannel(f32, 0);
 
         const source = ctx.createBufferSource();
@@ -320,8 +402,6 @@
         const now = ctx.currentTime;
         if (playHead < now + 0.05) playHead = now + 0.08;
         source.start(playHead);
-
-        if (tPlayStart === null) tPlayStart = performance.now() + (playHead - now) * 1000;
         playHead += audioBuf.duration;
         sources.add(source);
         source.onended = () => {
@@ -330,43 +410,45 @@
         };
       }
 
-      // 5. Xử lý thông điệp từ WebSocket
+      // Xử lý thông điệp từ máy chủ
       function onMessage(ev) {
         if (typeof ev.data !== 'string') {
           playPcm(ev.data);
           return;
         }
-        const m = JSON.parse(ev.data);
+        let m;
+        try {
+          m = JSON.parse(ev.data);
+        } catch (err) {
+          console.error("WebSocket JSON không hợp lệ:", ev.data, err);
+          return;
+        }
         switch (m.type) {
+          case 'tts_format':
+            if (m.sample_rate) ttsSr = m.sample_rate;
+            break;
           case 'state':
             srvState = m.state;
             if (m.state === 'listening') discarding = false;
             if (m.state === 'thinking' || m.state === 'speaking') {
               recording = false;
-              buf = new Float32Array(0);
+              resetAudioInputState();
             }
             refreshState();
             break;
           case 'auto_stop':
             if (m.reason === 'filler_timeout') {
-              setErr('Tự động ngắt: Hết thời gian chờ từ đệm (im lặng >2.5s)');
-            } else if (m.reason === 'hesitation_timeout') {
-              setErr('Tự động ngắt: Hết thời gian chờ ngập ngừng / đọc chậm (im lặng >2.2s)');
+              setErr('Tự động ngắt: Hết thời gian chờ từ đệm (im lặng >2.0s)');
             } else if (m.reason === 'silence_timeout') {
-              setErr('Tự động ngắt: Hết thời gian im lặng (>2.2s)');
-            } else if (m.reason === 'short_answer_fast') {
-              setErr('Tự động ngắt: Câu trả lời ngắn (>0.8s)');
+              setErr('Tự động ngắt: Hết thời gian im lặng (>2.0s)');
             } else {
               setErr(`Tự động ngắt khi dứt câu (Độ tin cậy: ${(m.probability * 100).toFixed(1)}%)`);
             }
+            if (pendingLength > 0 && ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(toPcm16(pendingAudio.subarray(0, pendingLength)));
+            }
+            resetAudioInputState();
             recording = false;
-            buf = new Float32Array(0);
-            tStop = performance.now();
-            tPlayStart = null;
-            $('btnTalk').style.display = 'inline-block';
-            $('btnTalk').textContent = 'Bắt đầu nói';
-            $('btnTalk').style.background = '#0066cc';
-            $('btnFinish').style.display = 'none';
             break;
           case 'partial':
             $('you').textContent = m.text;
@@ -374,25 +456,26 @@
           case 'final':
             $('you').textContent = m.text;
             $('bot').textContent = '';
-            finalInfo = m;
             break;
           case 'bot_raw':
             $('bot').textContent += m.text;
             break;
           case 'bot_done':
-            // Khi bot xong dữ liệu thoại: tắt thu âm, chờ loa phát hết âm thanh + 600ms chống dội âm, rồi tự động mở lượt nghe mới
+            // Chờ phát hết âm thanh + 600ms chống dội âm rồi tự động nghe tiếp
             recording = false;
-            buf = new Float32Array(0);
-            const waitAudioEnd = setInterval(() => {
+            resetAudioInputState();
+            clearAutoListenTimers();
+            waitAudioEndTimer = setInterval(() => {
               if (!isPlaying()) {
-                clearInterval(waitAudioEnd);
-                setTimeout(() => {
+                clearInterval(waitAudioEndTimer);
+                waitAudioEndTimer = null;
+                autoListenTimer = setTimeout(() => {
+                  autoListenTimer = null;
                   if (callActive && !recording && srvState === 'idle') {
-                    buf = new Float32Array(0);
+                    resetAudioInputState();
                     recording = true;
                     sendJson({ type: 'start_turn' });
-                    $('btnTalk').style.display = 'none';
-                    $('btnFinish').style.display = 'inline-block';
+                    setButtonsState(true);
                     refreshState();
                   }
                 }, 600);
@@ -401,7 +484,6 @@
             break;
           case 'stop_audio':
             stopPlayback();
-            discarding = false;
             break;
           case 'busy':
             setErr('Bot đang nói. Vui lòng chờ bot nói xong.');
@@ -411,29 +493,24 @@
             break;
           case 'error':
             setErr(m.message);
-            if (recording) {
-              recording = false;
-              buf = new Float32Array(0);
-            }
+            clearAutoListenTimers();
+            callActive = false;
+            recording = false;
+            resetAudioInputState();
+            setButtonsState(false);
             break;
           case 'metrics':
-            logTurn(m);
             break;
         }
       }
 
-      function logTurn(m) {
-        turnNo++;
-        const f = v => (v === undefined || v === null) ? '-' : v.toFixed(2) + 's';
-        const toPlay = tPlayStart ? (tPlayStart - tStop) / 1000 : null;
-        $('log').textContent += `Lượt ${turnNo}: dừng→final ${f(finalInfo && finalInfo.stt_final_s)}`
-          + ` | LLM đầu ${f(m.first_content)} | câu đầu ${f(m.first_sentence)}`
-          + ` | byte TTS đầu ${f(m.first_audio)} | dừng→nghe tiếng ${f(toPlay)}\n`;
-      }
-
-      // 6. Gán sự kiện nút bấm
+      // Sự kiện nút bấm
       $('btnTalk').onclick = async () => {
-        // Bỏ barge-in: Phải chờ bot nói xong thì mới nhận lệnh bắt đầu nói
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          setErr('Chưa kết nối được máy chủ. Vui lòng thử lại sau giây lát.');
+          return;
+        }
+        clearAutoListenTimers();
         const busy = srvState === 'thinking' || srvState === 'speaking' || isPlaying();
         if (busy) {
           setErr('Bot đang nói. Vui lòng chờ bot nói xong.');
@@ -450,14 +527,11 @@
         setErr('');
         $('you').textContent = '';
         $('bot').textContent = '';
-        buf = new Float32Array(0);
-        resamplePhase = 0;
+        resetAudioInputState();
         callActive = true;
         recording = true;
         sendJson({ type: 'start_turn' });
-
-        $('btnTalk').style.display = 'none';
-        $('btnFinish').style.display = 'inline-block';
+        setButtonsState(true);
       };
 
       $('btnFinish').onclick = () => {
@@ -465,30 +539,26 @@
       };
 
       $('btnStop').onclick = () => {
+        clearAutoListenTimers();
         callActive = false;
         recording = false;
-        buf = new Float32Array(0);
+        resetAudioInputState();
         stopPlayback();
-        $('btnTalk').style.display = 'inline-block';
-        $('btnTalk').textContent = 'Bắt đầu nói';
-        $('btnTalk').style.background = '#0066cc';
-        $('btnFinish').style.display = 'none';
+        setButtonsState(false);
         sendJson({ type: 'interrupt' });
         refreshState();
       };
 
       $('btnReset').onclick = () => {
+        clearAutoListenTimers();
         callActive = false;
         recording = false;
-        buf = new Float32Array(0);
+        resetAudioInputState();
         stopPlayback();
         sendJson({ type: 'reset' });
         $('you').textContent = '';
         $('bot').textContent = '';
-        $('btnTalk').style.display = 'inline-block';
-        $('btnTalk').textContent = 'Bắt đầu nói';
-        $('btnTalk').style.background = '#0066cc';
-        $('btnFinish').style.display = 'none';
+        setButtonsState(false);
         setErr('');
         refreshState();
       };

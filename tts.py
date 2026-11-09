@@ -1,74 +1,53 @@
-"""tts.py - Hợp nhất xử lý tạo câu trả lời và tổng hợp giọng nói đầu ra.
-Bao gồm:
-1. LLM streaming (vLLM Qwen 2.5): SYSTEM_PROMPT, stream_reply.
-2. SpeechFilter: Lọc sạch markdown, emoji, bảng, code, tách câu cho TTS.
-3. Zero-TTS streaming: split_for_tts, synth, synth_stream (PCM16 48kHz mono).
-4. Điều phối luồng đàm thoại: run_turn (LLM Producer -> SpeechFilter -> Queue -> TTS Consumer).
-"""
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import struct
 import time
-from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
 from num2words import num2words
 
-# ==============================================================================
-# 1. Cấu hình LLM & Prompt
-# ==============================================================================
-SYSTEM_PROMPT = (
-    "Bạn là trợ lý giọng nói tiếng Việt. Câu trả lời của bạn vừa được đọc to thành tiếng, "
-    "vừa hiển thị trên màn hình. Viết ngắn gọn như văn nói, tối đa 3 câu trừ khi người dùng yêu cầu chi tiết. "
-    "Câu đầu tiên phải ngắn (dưới 12 từ) để hệ thống phát âm thanh ngay lập tức. "
-    "Không dùng emoji. "
-    "Tuân thủ đúng yêu cầu định dạng của người dùng: nếu họ yêu cầu gạch đầu dòng, bảng, "
-    "danh sách, mã nguồn hay biểu đồ thì phải làm đúng như vậy, không từ chối. "
-    "Xử lý nhận dạng giọng nói, số điện thoại và mã vận đơn: "
-    "- Người dùng nói qua micro nên văn bản có thể có từ ngữ ngập ngừng, lặp từ, hoặc tự sửa lời. "
-    "- Số điện thoại di động Việt Nam chuẩn gồm đúng 10 chữ số (bắt đầu bằng 03, 05, 07, 08, 09). "
-    "Khi người dùng đọc số điện thoại mà có hiện tượng nói ngập ngừng, đọc lặp đầu số hoặc đọc lại từ đầu "
-    "(ví dụ: 'số điện thoại là 098 à không 0983 456 789', kết quả đúng: 0983456789): "
-    "Hãy thông minh hiểu đây là người dùng đọc lại/sửa lại, "
-    "tự động trích xuất đúng số điện thoại 10 chữ số hoàn chỉnh, "
-    "tuyệt đối không ghép nối các đoạn lặp lại thành dãy số thừa (12, 13 chữ số). "
-    "- Các chữ số giống nhau đứng liền kề ('77', '88', 'bảy bảy', 'tám tám') là chữ số thực sự hợp lệ, "
-    "tuyệt đối không coi là lặp từ để xóa bỏ. "
-    "- Nếu SĐT không đủ 10 số hoặc không rõ ràng, đọc lại từng chữ số theo nhóm 3-4 số và hỏi xác nhận. "
-    "QUY TẮC ĐỊNH DẠNG MÃ VÀ SỐ (BẮT BUỘC HIỂN THỊ DẠNG MÃ CHUẨN TRÊN MÀN HÌNH, KHÔNG VIẾT CHỮ PHIÊN ÂM): "
-    "- Mã bưu gửi, mã vận đơn: BẮT BUỘC viết hoa dạng mã chuẩn (Ví dụ: VN123456789VN, EB123456789VN, EMS123456789). "
-    "Tuyệt đối KHÔNG viết phiên âm chữ như 'vê nờ một hai ba...' hay 'vi en một hai ba...'. "
-    "- Số điện thoại, CCCD: BẮT BUỘC viết dạng số chuẩn (Ví dụ: 0912345678, 0934543226). "
-    "Tuyệt đối KHÔNG viết phiên âm chữ như 'không chín một hai...'. "
-    "- Số tiền, khối lượng, kích thước: Viết dạng số kèm ký hiệu đơn vị chuẩn (Ví dụ: 150.000đ, 2,5kg, 30cm, 50%). "
-    "Hệ thống âm thanh (TTS) sẽ tự động chuyển các mã và số này thành giọng đọc tương ứng ra loa, "
-    "bạn chỉ cần viết đúng định dạng chuẩn để người dùng nhìn thấy rõ ràng trên màn hình. "
-    "- Hiểu cách đọc mã của người dùng: Người dùng có thể đọc mã theo phát âm tiếng Anh (như 'vi en' cho VN, 'i bi' cho EB, 'i em ét' cho EMS) "
-    "hoặc tiếng Việt (như 'vê nờ', 'e bê', 'e mờ ét'); hãy thông minh hiểu đó là các ký tự viết hoa chuẩn tương ứng. "
-    "XỬ LÝ NGƯỜI DÙNG NGẬP NGỪNG: "
-    "Nếu câu của người dùng bị ngắt giữa chừng khi đang đọc dở số hoặc chỉ mới nói từ đệm, "
-    "tuyệt đối không suy đoán hay báo lỗi, hãy nhẹ nhàng khích lệ đọc tiếp "
-    "(Ví dụ: 'Dạ vâng, em đang nghe ạ, anh chị đọc tiếp giúp em nhé.'). "
-    "BẮT BUỘC: Khi tạo bảng, mã nguồn hoặc biểu đồ, luôn phải nói trước 1 đến 2 câu tóm tắt ý chính "
-    "hoặc kết luận quan trọng bằng lời văn tự nhiên (đặc biệt khi dùng bảng thì phải tóm tắt nội dung so sánh trước khi vẽ bảng, "
-    "vì hệ thống âm thanh chỉ đọc câu tóm tắt này và bỏ qua nội dung chi tiết dạng bảng hay mã); "
-    "tuyệt đối không tự viết các câu như 'Nội dung đã được hiển thị trên màn hình', "
-    "'Bảng đã được hiển thị trên màn hình' hay 'Mã nguồn đã được hiển thị trên màn hình'. "
-    "Không đọc tên hàm hay biểu thức code trong câu nói, chỉ mô tả bằng lời. "
-    "Quy cách vẽ bảng và biểu đồ: "
-    "- Bảng dùng định dạng bảng markdown. "
-    "- Khi người dùng yêu cầu biểu đồ: vẽ biểu đồ thanh ngang ngắn gọn trong khối ``` theo dạng: "
-    "Tên mục: [===] (giá trị), dùng từ 3 đến 10 dấu '=' hoặc '#' trong cặp ngoặc vuông [], "
-    "tuyệt đối không in chuỗi ký tự đặc biệt quá dài và không vẽ cột dọc ASCII; "
-    "hoặc có thể trình bày thành bảng số liệu markdown. "
-    "Viết công thức bằng lời, không dùng ký hiệu LaTeX. "
-    "Chỉ dùng chữ cái tiếng Việt và tiếng Anh, không dùng chữ Hán, Nhật hay Hàn."
-)
+logger = logging.getLogger("tts")
 
+SYSTEM_PROMPT = """
+    Bạn là trợ lý giọng nói tiếng Việt của Tổng công ty Bưu điện Việt Nam (VNPost).
+    Câu trả lời của bạn vừa hiển thị trên màn hình vừa được đọc thành tiếng qua hệ thống TTS.
+
+    1. PHONG CÁCH TRẢ LỜI
+    - Xưng "tôi" (hoặc "em" nếu khách xưng anh/chị), gọi khách hàng là "bạn" (hoặc "anh/chị" tương ứng), thái độ lịch sự, tự nhiên, tận tâm.
+    - Mặc định trả lời tối đa 3 câu ngắn gọn, trừ khi khách hàng yêu cầu liệt kê chi tiết.
+    - Câu đầu tiên bắt buộc ngắn dưới 12 từ để hệ thống phát giọng nói tức thì.
+    - Khi khách chào hỏi ("alo", "chào bạn", "bạn là ai"): Phản hồi ngắn gọn, thân thiện và hỏi nhu cầu hỗ trợ (ví dụ: "Dạ, tôi là trợ lý ảo VNPost. Tôi có thể hỗ trợ gì cho bạn?").
+    - Không sử dụng emoji, không dùng ký hiệu LaTeX.
+    - Tuyệt đối không viết tắt các từ thông dụng hoặc địa danh (phải viết rõ "Thành phố Hồ Chí Minh" thay vì "TP. HCM", "Số điện thoại" thay vì "SĐT", "Bưu điện" thay vì "BĐ") để tránh ngắt câu sai khi đọc.
+
+    2. QUY TẮC NGHIỆP VỤ & GIỚI HẠN DỮ LIỆU (QUAN TRỌNG)
+    - Bạn có thể giải đáp các kiến thức chung về dịch vụ bưu chính (quy định hàng cấm gửi, cách đóng gói cơ bản, phân biệt chuyển phát nhanh EMS và bưu phẩm thường).
+    - Khi khách cung cấp đầy đủ Mã vận đơn hoặc Số điện thoại để tra cứu đơn hàng: Hãy đọc lại chính xác mã/số điện thoại đó để xác nhận đã ghi nhận đúng định dạng, sau đó thông báo lịch sự rằng tính năng kết nối hệ thống tra cứu vận đơn trực tiếp đang được bảo trì/nâng cấp và hướng dẫn khách tra cứu trên trang vnpost.vn hoặc gọi tổng đài 1900 54 54 81.
+
+    3. SỐ ĐIỆN THOẠI VÀ MÃ VẬN ĐƠN
+    - Số điện thoại (thường 10 chữ số), CCCD (12 chữ số), Mã bưu chính (5 chữ số) phải viết liền bằng chữ số.
+    - Mã bưu gửi, mã vận đơn phải giữ nguyên dạng mã chuẩn, viết liền và viết hoa (ví dụ: VN123456789VN, EB123456789VN, EMS123456789VN, CP123456789VN).
+    - Tự động chuyển các cách phát âm chữ cái tiếng Việt/Anh như "vi en", "vê nờ", "i bi", "e bê", "i em ét", "xê pê" thành tiền tố/hậu tố mã tương ứng (VN, EB, EMS, CP) khi đi kèm chuỗi số.
+    - Khi khách đọc nhầm rồi sửa lại (ví dụ: "không chín một... à nhầm không chín tám..."), chỉ lấy phiên bản sửa cuối cùng, không ghép đoạn đọc nhầm vào mã/số điện thoại.
+
+    4. ĐỊNH DẠNG NỘI DUNG
+    - Tuân thủ đúng định dạng người dùng yêu cầu (gạch đầu dòng, bảng biểu, biểu đồ).
+    - Khi người dùng yêu cầu vẽ biểu đồ (bar chart, biểu đồ cột, biểu đồ thanh ngang):
+      + Bắt buộc vẽ biểu đồ thanh ngang ASCII trực quan trong khối ```.
+      + Luôn nói trước 1-2 câu tóm tắt số liệu quan trọng bằng văn xuôi tự nhiên trước khi xuất khối biểu đồ.
+      + Mẫu biểu đồ thanh ngang ASCII chuẩn:
+        ```
+        Tên mục: [===       ] (giá trị)
+        ```
+    - Khi người dùng yêu cầu liệt kê hoặc gạch đầu dòng: Bắt buộc định dạng bằng dấu gạch đầu dòng ("- ") ở đầu mỗi dòng cho từng ý theo đúng số lượng yêu cầu.
+    - Khi cần trình bày bảng so sánh: Luôn nói trước 1-2 câu tóm tắt bằng văn xuôi tự nhiên trước khi kẻ bảng Markdown.
+    - Số tiền, khối lượng, kích thước viết bằng số kèm đơn vị chuẩn có khoảng trắng (ví dụ: 120 triệu đồng, 25.000 đồng, 2 ki lô gam).
+    """.strip()
 
 async def stream_reply(
     messages: list[dict[str, str]],
@@ -88,15 +67,20 @@ async def stream_reply(
     async def _stream_with_client(c: httpx.AsyncClient) -> AsyncIterator[str]:
         async with c.stream("POST", url, json=body) as r:
             if r.status_code != 200:
-                await r.aread()
-                raise RuntimeError(f"LLM HTTP {r.status_code}: {r.text[:200]}")
+                raw = await r.aread()
+                err_msg = raw.decode("utf-8", errors="replace")[:200]
+                raise RuntimeError(f"LLM HTTP {r.status_code}: {err_msg}")
             async for line in r.aiter_lines():
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
                     break
-                choices = json.loads(data).get("choices") or []
+                try:
+                    payload = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = payload.get("choices") or []
                 if not choices:
                     continue
                 piece = (choices[0].get("delta") or {}).get("content")
@@ -112,9 +96,6 @@ async def stream_reply(
                 yield piece
 
 
-# ==============================================================================
-# 2. Bộ lọc văn bản sang TTS (SpeechFilter)
-# ==============================================================================
 EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]")
 LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 PLACEHOLDER_RE = re.compile(r"\[[^\]]*\]")
@@ -124,43 +105,19 @@ PREFIX_RE = re.compile(r"^(#{1,6}\s+|[-*+•]\s+|\d+[.)]\s+|>\s*)")
 RULE_RE = re.compile(r"^[-*_=\s]{3,}$")
 SENT_RE = re.compile(r"(?<=[.!?…])(?<!\.\.)\s+")
 MATH_RE = re.compile(r"\$\$.+?\$\$|\$[^$\n]+\$")
-CJK_RE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u30FF\uAC00-\uD7AF]")
-CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\([^()\n]*\)")
 
-CJK_NOTE = "Một phần câu trả lời không đọc được, xem chi tiết trên màn hình."
-TABLE_NOTE = "Chi tiết dạng bảng đã được hiển thị trên màn hình."
-CODE_NOTE = "Phần mã đã được hiển thị trên màn hình."
 REMAINDER_NOTE = "Phần còn lại đã được hiển thị trên màn hình."
-
-CODE_LANGS = {
-    "python", "py", "javascript", "js", "typescript", "ts",
-    "java", "cpp", "c", "csharp", "cs", "go", "rust",
-    "php", "ruby", "sql", "bash", "sh", "powershell", "ps1",
-    "json", "yaml", "yml", "xml", "html", "css", "dockerfile", "toml",
-}
-
-
-DOUBLE_HAM_RE = re.compile(r"\bhàm\s+hàm\b", re.IGNORECASE)
-SPACES_RE = re.compile(r"\s+")
-
-
-def has_cjk(text: str) -> bool:
-    """Kiểm tra sự xuất hiện của ký tự CJK (Hán, Nhật, Triều Tiên)."""
-    return CJK_RE.search(text) is not None
 
 
 def clean_inline(text: str) -> str:
-    """Làm sạch ký hiệu Markdown, emoji, URL và biểu thức mã trong một câu."""
+    """Làm sạch ký hiệu Markdown, emoji, URL và công thức toán học trong một câu."""
     s = MATH_RE.sub("công thức trên màn hình", text)
-    s = CALL_RE.sub(r"hàm \1", s)
-    s = DOUBLE_HAM_RE.sub("hàm", s)
     s = LINK_RE.sub(r"\1", s)
     s = PLACEHOLDER_RE.sub("", s)
     s = URL_RE.sub("đường dẫn trên màn hình", s)
     s = EMOJI_RE.sub("", s)
     s = MARK_RE.sub("", s)
-    return SPACES_RE.sub(" ", s).strip()
-
+    return " ".join(s.split())
 
 class SpeechFilter:
     """Bộ đệm nhận từng delta từ LLM và nhả ra các câu sạch sẵn sàng đưa vào TTS."""
@@ -180,7 +137,6 @@ class SpeechFilter:
         self.sent_count = 0
         self.total_chars = 0
         self.capped = False
-        self.cjk_hits: list[str] = []
 
     def feed(self, delta: str) -> list[str]:
         """Tiếp nhận một phần văn bản mới từ luồng LLM."""
@@ -200,17 +156,10 @@ class SpeechFilter:
         self.buf, self.kind, self.fresh = "", None, True
 
         if self.hold:
-            self._push(self.hold, out, end=True, force=True)
+            remaining = self.hold
             self.hold = ""
+            self._push(remaining, out, end=True, force=True)
         return out
-
-    def _push_note(self, note: str, out: list[str]) -> None:
-        """Đẩy câu thông báo màn hình, tránh lặp lại nếu câu trước đã có nội dung tương tự."""
-        last = self.hold or (out[-1] if out else self.last_sent)
-        last_lower = last.lower()
-        if "màn hình" in last_lower or "hiển thị" in last_lower:
-            return
-        self._push(note, out, end=True, force=True)
 
     def _handle(self, text: str, complete: bool, out: list[str]) -> str:
         s = text.lstrip()
@@ -235,11 +184,7 @@ class SpeechFilter:
             if not complete:
                 return text
             if not self.in_code:
-                info = s[3:].strip().lower()
-                lang = info.split()[0] if info else ""
                 self.in_code = True
-                if lang in CODE_LANGS:
-                    self._push_note(CODE_NOTE, out)
             else:
                 self.in_code = False
                 rest = s[3:].strip()
@@ -254,7 +199,6 @@ class SpeechFilter:
         if self.kind == "table":
             if not self.in_table:
                 self.in_table = True
-                self._push_note(TABLE_NOTE, out)
             return ""
 
         self.in_table = False
@@ -276,11 +220,6 @@ class SpeechFilter:
     def _push(self, sent: str, out: list[str], end: bool = False, force: bool = False) -> None:
         """Kiểm tra và đưa câu vào danh sách xuất khẩu."""
         if self.capped:
-            return
-
-        if has_cjk(sent):
-            self.cjk_hits.append(sent)
-            self._push_note(CJK_NOTE, out)
             return
 
         sent = clean_inline(sent)
@@ -311,9 +250,6 @@ class SpeechFilter:
         out.append(sent)
 
 
-# ==============================================================================
-# 3. Tổng hợp giọng nói (Zero-TTS)
-# ==============================================================================
 DEFAULT_PARAMS = {
     "cfg_scale": 1.0,
     "audio_temperature": 0.8,
@@ -338,10 +274,15 @@ UNITS_VI = {
     "đ": "đồng", "vnd": "đồng", "vnđ": "đồng", "k": "nghìn", "%": "phần trăm"
 }
 
+PHONE_PAREN_RE = re.compile(r"\(0(\d{2,3})\)[\s.-]*(\d{3,4})[\s.-]*(\d{3,4})\b")
+PHONE_INTL_RE = re.compile(r"(?:\+84|(?<=\s)84)[\s.-]*(\d{2,3})[\s.-]*(\d{3,4})[\s.-]*(\d{3,4})\b")
+PHONE_RE = re.compile(r"\b(0\d{2,3})[\s.-]+(\d{3,4})[\s.-]+(\d{3,4})\b")
+
 
 def normalize_text_for_tts(text: str) -> str:
-    """Chuẩn hóa văn bản thành chuỗi từ thuần tiếng Việt để Zero-TTS đọc trôi chảy (Số, Đơn vị, Mã Alphanumeric)."""
-    text = re.sub(r"\b(0\d{2,3})[\s.-](\d{3})[\s.-](\d{3,4})\b", r"\1\2\3", text)
+    text = PHONE_PAREN_RE.sub(r"0\1\2\3", text)
+    text = PHONE_INTL_RE.sub(r"0\1\2\3", text)
+    text = PHONE_RE.sub(r"\1\2\3", text)
 
     def _replace_token(match: re.Match) -> str:
         tok = match.group(0)
@@ -350,25 +291,40 @@ def normalize_text_for_tts(text: str) -> str:
         tok = clean_tok
 
         unit = ""
-        m_unit = re.match(r"^([0-9.,/]+)\s*([a-zA-ZđĐ%]+)$", tok)
+        m_unit = re.match(r"^([0-9][0-9.,/]*)\s*([a-zA-ZđĐ%]+)$", tok)
         if m_unit and m_unit.group(2).lower() in UNITS_VI:
             tok = m_unit.group(1)
             unit = " " + UNITS_VI[m_unit.group(2).lower()]
 
         if re.search(r"[A-Za-z]", tok) and re.search(r"\d", tok):
-            return " ".join(DIGITS_VI.get(c, LETTERS_VI.get(c, c)) for c in tok.upper() if c in DIGITS_VI or c in LETTERS_VI) + unit + punct
+            spoken = " ".join(
+                DIGITS_VI.get(c, LETTERS_VI.get(c, c))
+                for c in tok.upper()
+                if c in DIGITS_VI or c in LETTERS_VI
+            )
+            return spoken + unit + punct
 
         if tok.isdigit():
             if (tok.startswith("0") and len(tok) > 1) or len(tok) >= 8:
-                return " ".join(DIGITS_VI[c] for c in tok) + unit + punct
-            return num2words(int(tok), lang="vi") + unit + punct
+                spoken = " ".join(DIGITS_VI[c] for c in tok)
+            else:
+                spoken = num2words(int(tok), lang="vi")
+            return spoken + unit + punct
 
-        if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", tok):
-            return num2words(int(tok.replace(".", "")), lang="vi") + unit + punct
+        if re.fullmatch(r"[1-9]\d{0,2}(?:[.,]\d{3})+", tok):
+            clean_digits = re.sub(r"[.,]", "", tok)
+            spoken = num2words(int(clean_digits), lang="vi")
+            return spoken + unit + punct
 
         if re.fullmatch(r"\d+[.,]\d+", tok):
             parts = re.split(r"[.,]", tok)
-            return num2words(int(parts[0]), lang="vi") + " phẩy " + num2words(int(parts[1]), lang="vi") + unit + punct
+            dec_part = parts[1]
+            zero_count = len(dec_part) - len(dec_part.lstrip("0"))
+            zero_prefix = "không " * zero_count
+            dec_val = dec_part.lstrip("0")
+            dec_spoken = (zero_prefix + num2words(int(dec_val), lang="vi")) if dec_val else zero_prefix.strip()
+            spoken = num2words(int(parts[0]), lang="vi") + " phẩy " + dec_spoken
+            return spoken + unit + punct
 
         return match.group(0)
 
@@ -389,72 +345,101 @@ def split_for_tts(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
     return parts
 
 
-@dataclass
-class TtsResult:
-    """Kết quả tổng hợp âm thanh dạng PCM thô kèm thông số audio và mốc thời gian."""
-    pcm: bytes = b""
-    sample_rate: int = 48000
-    channels: int = 1
-    bits: int = 16
-    first_byte_at: float | None = None
-    total_sec: float = 0.0
+class IncompleteHeaderError(ValueError):
+    """Header WAV chưa nhận đủ số byte để phân tích cấu trúc."""
 
 
-async def synth(text: str, *, base_url: str, voice: str, client: httpx.AsyncClient) -> TtsResult:
-    """Gửi yêu cầu tổng hợp giọng nói, bóc bỏ header WAV 44 byte và trả về toàn bộ mảng PCM."""
-    if len(text) > 500:
-        raise ValueError(f"Đoạn văn đưa vào TTS quá dài ({len(text)} ký tự); cần qua split_for_tts() trước.")
+def parse_wav_header(buf: bytes | bytearray) -> tuple[int, int, int, int]:
+    """Phân tích RIFF WAV header và trả về (sample_rate, channels, bits, data_offset).
+    Hỗ trợ cả standard 44-byte header và header có chunk phụ (JUNK, LIST, fact...).
+    Kiểm tra chặt chẽ WAV format code (phải là PCM tiêu chuẩn code 1).
+    """
+    if len(buf) < 12:
+        raise IncompleteHeaderError("Header chưa đủ 12 byte để kiểm tra định dạng RIFF WAVE.")
+    if buf[:4] != b"RIFF" or buf[8:12] != b"WAVE":
+        raise RuntimeError(f"Header dữ liệu không phải định dạng RIFF WAVE (nhận được {buf[:4]!r}..{buf[8:12]!r}).")
 
+    offset = 12
+    channels = 1
+    sample_rate = 48000
+    bits = 16
+    audio_fmt = -1
+    data_offset = -1
+
+    while offset + 8 <= len(buf):
+        chunk_id = bytes(buf[offset:offset + 4])
+        chunk_len = struct.unpack("<I", buf[offset + 4:offset + 8])[0]
+        offset += 8
+        if chunk_id == b"fmt ":
+            if offset + chunk_len > len(buf):
+                raise IncompleteHeaderError("Chunk 'fmt ' chưa nhận đủ dữ liệu.")
+            if chunk_len >= 14:
+                audio_fmt, channels, sample_rate = struct.unpack("<HHI", buf[offset:offset + 8])
+                if audio_fmt != 1:
+                    raise RuntimeError(f"WAV format code là {audio_fmt}, chỉ hỗ trợ PCM tiêu chuẩn (code 1).")
+                if chunk_len >= 16:
+                    bits = struct.unpack("<H", buf[offset + 14:offset + 16])[0]
+        elif chunk_id == b"data":
+            data_offset = offset
+            break
+        offset += chunk_len + (chunk_len % 2)
+
+    if data_offset == -1:
+        raise IncompleteHeaderError("Chưa nhận đủ chunk 'data' trong header WAV.")
+    if audio_fmt == -1:
+        raise RuntimeError("Không tìm thấy chunk 'fmt ' trong header WAV.")
+
+    return sample_rate, channels, bits, data_offset
+
+
+async def synth_stream(text: str, *, base_url: str, voice: str, client: httpx.AsyncClient) -> AsyncIterator[bytes]:
+    """Phát luồng trực tiếp các chunk PCM16 (48 kHz mono) nhận từ server TTS,
+    bóc header WAV động và đảm bảo mỗi chunk phát đi có số byte chẵn (căn chỉnh 16-bit).
+    """
     body = {**DEFAULT_PARAMS, "text": text, "voice": voice}
-    buf = bytearray()
-    t0 = time.perf_counter()
-    t_first = None
+    head = bytearray()
+    header_parsed = False
+    pending_odd_byte = b""
 
     async with client.stream("POST", base_url.rstrip("/") + "/tts/stream", json=body) as r:
         if r.status_code != 200:
             raw = await r.aread()
             raise RuntimeError(f"TTS HTTP {r.status_code}: {raw[:200]!r}")
         async for chunk in r.aiter_bytes():
-            buf += chunk
-            if t_first is None and len(buf) > 44:
-                t_first = time.perf_counter() - t0
-    total = time.perf_counter() - t0
+            if not header_parsed:
+                head.extend(chunk)
+                if len(head) >= 44 and b"data" in head:
+                    try:
+                        sample_rate, channels, bits, data_offset = parse_wav_header(head)
+                        if (sample_rate, channels, bits) != (48000, 1, 16):
+                            raise RuntimeError(
+                                f"Định dạng TTS không đúng yêu cầu: {sample_rate} Hz, {channels} channels, {bits} bit "
+                                "(kỳ vọng 48000 Hz, 1 channel, 16 bit PCM tiêu chuẩn)."
+                            )
+                        audio_data = bytes(head[data_offset:])
+                        head.clear()
+                        header_parsed = True
+                        if audio_data:
+                            if len(audio_data) % 2 != 0:
+                                pending_odd_byte = audio_data[-1:]
+                                audio_data = audio_data[:-1]
+                            if audio_data:
+                                yield audio_data
+                        continue
+                    except IncompleteHeaderError:
+                        continue
+                continue
 
-    if buf[:4] != b"RIFF" or buf[36:40] != b"data":
-        raise RuntimeError("Header WAV không đúng định dạng chuẩn 44 byte.")
-
-    channels, rate = struct.unpack("<HI", buf[22:28])
-    bits = struct.unpack("<H", buf[34:36])[0]
-    pcm = bytes(buf[44:])
-    pcm = pcm[: len(pcm) // 2 * 2]
-    return TtsResult(
-        pcm=pcm, sample_rate=rate, channels=channels, bits=bits,
-        first_byte_at=t_first, total_sec=total
-    )
-
-
-async def synth_stream(text: str, *, base_url: str, voice: str, client: httpx.AsyncClient) -> AsyncIterator[bytes]:
-    """Phát luồng trực tiếp các chunk PCM16 (48 kHz mono) nhận từ server TTS, bóc bỏ 44 byte header."""
-    body = {**DEFAULT_PARAMS, "text": text, "voice": voice}
-    head = bytearray()
-
-    async with client.stream("POST", base_url.rstrip("/") + "/tts/stream", json=body) as r:
-        if r.status_code != 200:
-            raise RuntimeError(f"TTS HTTP {r.status_code}")
-        async for chunk in r.aiter_bytes():
-            if len(head) < 44:
-                take = 44 - len(head)
-                head += chunk[:take]
-                chunk = chunk[take:]
-                if len(head) == 44 and (head[:4] != b"RIFF" or head[36:40] != b"data"):
-                    raise RuntimeError("Header WAV không đúng định dạng chuẩn.")
-            if chunk:
-                yield chunk
+            data = pending_odd_byte + chunk
+            if len(data) % 2 != 0:
+                pending_odd_byte = data[-1:]
+                data = data[:-1]
+            else:
+                pending_odd_byte = b""
+            if data:
+                yield data
 
 
-# ==============================================================================
-# 4. Điều phối quy trình lượt thoại (Pipeline Producer - Consumer)
-# ==============================================================================
 _END = object()
 
 
@@ -477,15 +462,18 @@ async def run_turn(
     """
     t0 = time.perf_counter()
     metrics.clear()
-    q: asyncio.Queue = asyncio.Queue()
+    q: asyncio.Queue = asyncio.Queue(maxsize=8)
     flt = SpeechFilter()
     raw_parts: list[str] = []
 
     def mark(name: str) -> None:
         metrics.setdefault(name, time.perf_counter() - t0)
 
+    end_sent = False
+
     async def producer() -> None:
         """Đọc stream từ LLM, gửi raw text lên giao diện và đẩy các câu đã lọc vào hàng đợi."""
+        nonlocal end_sent
         try:
             msgs = [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -502,17 +490,34 @@ async def run_turn(
             for s in flt.flush():
                 mark("first_sentence")
                 await q.put(s)
-        finally:
             await q.put(_END)
+            end_sent = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Lỗi trong quá trình sinh câu trả lời LLM: %s", exc)
+            raise
+        finally:
+            if not end_sent and not q.full():
+                try:
+                    q.put_nowait(_END)
+                except asyncio.QueueFull:
+                    pass
 
     async def consumer() -> None:
         """Lấy từng câu từ hàng đợi, gửi qua Zero-TTS stream và đẩy chunk PCM tới client."""
-        while (sent := await q.get()) is not _END:
-            norm_sent = normalize_text_for_tts(sent)
-            for piece in split_for_tts(norm_sent):
-                async for pcm in synth_stream(piece, base_url=tts_url, voice=voice, client=client):
-                    mark("first_audio")
-                    await send_audio(pcm)
+        try:
+            while (sent := await q.get()) is not _END:
+                norm_sent = normalize_text_for_tts(sent)
+                for piece in split_for_tts(norm_sent):
+                    async for pcm in synth_stream(piece, base_url=tts_url, voice=voice, client=client):
+                        mark("first_audio")
+                        await send_audio(pcm)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Lỗi trong quá trình tổng hợp hoặc gửi âm thanh TTS: %s", exc)
+            raise
 
     prod = asyncio.create_task(producer())
     cons = asyncio.create_task(consumer())
