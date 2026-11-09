@@ -216,6 +216,7 @@
         if (sources.size > 0) return true;
         return playHead > ctx.currentTime + 0.05;
       };
+
       function refreshState() {
         let s = srvState;
         if (recording) s = 'listening';
@@ -236,7 +237,7 @@
               channelCount: 1,
               echoCancellation: true,
               noiseSuppression: true,
-              autoGainControl: false // Tắt AGC tránh khuếch đại nhiễu nền
+              autoGainControl: false
             },
             video: false
           });
