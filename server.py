@@ -277,11 +277,7 @@ class VoiceSession:
             if len(self.audio_buf) < 12000 or self.speech_frames < MIN_SPEECH_FRAMES:
                 return
 
-            audio_silence_s = self.silence_frames * (FRAME_DURATION_MS / 1000.0)
             wall_silence_s = time.monotonic() - self.last_speech_time
-            if abs(wall_silence_s - audio_silence_s) > 0.5:
-                print(f"[Audio Latency Warning] Lệch nhịp frame: audio={audio_silence_s:.2f}s, wall={wall_silence_s:.2f}s")
-
             norm_partial = normalize_text(self.last_partial_text) if self.last_partial_text else ""
             only_filler = is_only_filler(self.last_partial_text) if self.last_partial_text else False
 
@@ -311,12 +307,10 @@ class VoiceSession:
                 hesitating = is_hesitating(norm_partial) if norm_partial else False
 
                 if reading_seq or hesitating:
-                    # Đang đọc dở số hoặc ngập ngừng: bảo vệ bằng ngưỡng im lặng dài (>= 1.4s)
                     if prob >= 0.65 and self.silence_frames >= SMART_TURN_UNCERTAIN_FRAMES:
                         should_stop = True
                         reason = "smart_turn_done"
                 else:
-                    # Câu nói bình thường: ngắt siêu nhạy ở 700ms nếu tự tin cao
                     if prob >= 0.65 and self.silence_frames >= SMART_TURN_CONFIDENT_FRAMES:
                         should_stop = True
                         reason = "smart_turn_done"

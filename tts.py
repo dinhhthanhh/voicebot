@@ -278,7 +278,6 @@ PHONE_PAREN_RE = re.compile(r"\(0(\d{2,3})\)[\s.-]*(\d{3,4})[\s.-]*(\d{3,4})\b")
 PHONE_INTL_RE = re.compile(r"(?:\+84|(?<=\s)84)[\s.-]*(\d{2,3})[\s.-]*(\d{3,4})[\s.-]*(\d{3,4})\b")
 PHONE_RE = re.compile(r"\b(0\d{2,3})[\s.-]+(\d{3,4})[\s.-]+(\d{3,4})\b")
 
-
 def normalize_text_for_tts(text: str) -> str:
     text = PHONE_PAREN_RE.sub(r"0\1\2\3", text)
     text = PHONE_INTL_RE.sub(r"0\1\2\3", text)
@@ -330,7 +329,6 @@ def normalize_text_for_tts(text: str) -> str:
 
     return re.sub(r"\b[A-Za-z0-9.,/]+(?:%|đ|Đ|kg|g|km|m|cm|mm|vnd|vnđ)?", _replace_token, text)
 
-
 def split_for_tts(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
     """Tách câu văn bản dài tại dấu phẩy hoặc khoảng trắng gần nhất để vừa giới hạn ký tự của TTS."""
     parts: list[str] = []
@@ -344,16 +342,10 @@ def split_for_tts(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
         parts.append(text)
     return parts
 
-
 class IncompleteHeaderError(ValueError):
     """Header WAV chưa nhận đủ số byte để phân tích cấu trúc."""
 
-
 def parse_wav_header(buf: bytes | bytearray) -> tuple[int, int, int, int]:
-    """Phân tích RIFF WAV header và trả về (sample_rate, channels, bits, data_offset).
-    Hỗ trợ cả standard 44-byte header và header có chunk phụ (JUNK, LIST, fact...).
-    Kiểm tra chặt chẽ WAV format code (phải là PCM tiêu chuẩn code 1).
-    """
     if len(buf) < 12:
         raise IncompleteHeaderError("Header chưa đủ 12 byte để kiểm tra định dạng RIFF WAVE.")
     if buf[:4] != b"RIFF" or buf[8:12] != b"WAVE":
@@ -390,7 +382,6 @@ def parse_wav_header(buf: bytes | bytearray) -> tuple[int, int, int, int]:
         raise RuntimeError("Không tìm thấy chunk 'fmt ' trong header WAV.")
 
     return sample_rate, channels, bits, data_offset
-
 
 async def synth_stream(text: str, *, base_url: str, voice: str, client: httpx.AsyncClient) -> AsyncIterator[bytes]:
     """Phát luồng trực tiếp các chunk PCM16 (48 kHz mono) nhận từ server TTS,
@@ -438,7 +429,6 @@ async def synth_stream(text: str, *, base_url: str, voice: str, client: httpx.As
                 pending_odd_byte = b""
             if data:
                 yield data
-
 
 _END = object()
 
