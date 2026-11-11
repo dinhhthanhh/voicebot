@@ -63,43 +63,38 @@ class SessionState(StrEnum):
 
 
 # ---------------------------------------------------------------------------
-# Cấu hình định dạng âm thanh (PCM16 mono 16 kHz) & Ngưỡng VAD / Smart Turn
+# Cấu hình âm thanh & Ngưỡng VAD / Smart Turn
 # ---------------------------------------------------------------------------
-SAMPLE_RATE = STT_SAMPLE_RATE
-SAMPLE_WIDTH = 2
 FRAME_DURATION_MS = 100
-FRAME_SAMPLES = int(SAMPLE_RATE * (FRAME_DURATION_MS / 1000.0))
-FRAME_BYTES = FRAME_SAMPLES * SAMPLE_WIDTH
+# Mỗi frame 100ms = 1600 mẫu * 2 bytes = 3200 bytes
+FRAME_BYTES = int(STT_SAMPLE_RATE * (FRAME_DURATION_MS / 1000.0)) * 2
+MIN_AUDIO_BYTES = 12_000  # Tối thiểu ~375ms âm thanh trước khi chạy Smart Turn
 
-AUDIO_BUF_MAX_BYTES = MAX_AUDIO_BYTES  # 256,000 bytes (~8 giây 16kHz PCM16)
-MIN_AUDIO_BUFFER_BYTES = 12_000  # Tối thiểu ~375ms âm thanh trước khi chạy Smart Turn
-
-# Ngưỡng phát hiện tiếng nói (VAD - Voice Activity Detection)
-VAD_RMS_THRESHOLD_DEFAULT = 0.003
-VAD_SPEECH_PROB_INITIAL = 0.50  # Ngưỡng bắt đầu nhận diện có lời nói
-VAD_SPEECH_PROB_CONTINUED = 0.30  # Ngưỡng duy trì trạng thái nói (hysteresis chống chập chờn)
-VAD_RMS_THRESHOLD_INITIAL = 0.003
-VAD_RMS_THRESHOLD_CONTINUED = 0.002
+# Ngưỡng VAD (Hysteresis: START để bắt đầu, KEEP để duy trì không đứt đoạn)
+VAD_PROB_START = 0.50
+VAD_PROB_KEEP = 0.30
+VAD_RMS_START = 0.003
+VAD_RMS_KEEP = 0.002
 
 # Ngưỡng xác suất Smart Turn
-SMART_TURN_PROB_CONFIDENT = 0.65  # Ngưỡng xác suất tự tin dứt câu
-SMART_TURN_PROB_UNCERTAIN = 0.50  # Ngưỡng xác suất trung bình (cần im lặng lâu hơn)
-WALL_SILENCE_TIMEOUT_S = 2.5  # Hết thời gian chờ im lặng theo đồng hồ thực tế
+PROB_HIGH = 0.65  # Tự tin dứt câu
+PROB_MID = 0.50  # Cần im lặng lâu hơn
+WALL_TIMEOUT_S = 2.5  # Hết thời gian chờ im lặng theo đồng hồ thực tế
 
 
-def ms_to_frames(milliseconds: int) -> int:
+def ms_to_frames(ms: int) -> int:
     """Quy đổi thời gian milliseconds sang số frame (mỗi frame 100ms)."""
-    return max(1, (milliseconds + FRAME_DURATION_MS - 1) // FRAME_DURATION_MS)
+    return max(1, (ms + FRAME_DURATION_MS - 1) // FRAME_DURATION_MS)
 
 
-# Số frame quy đổi từ thời lượng mili-giây
+# Các mốc frame kiểm tra (mỗi frame 100ms)
 MIN_SPEECH_FRAMES = ms_to_frames(300)
-INITIAL_SILENCE_FRAMES = ms_to_frames(300)
-SMART_TURN_CHECK_INTERVAL_FRAMES = ms_to_frames(200)
-SMART_TURN_CONFIDENT_FRAMES = ms_to_frames(700)
-SMART_TURN_UNCERTAIN_FRAMES = ms_to_frames(1400)
-FILLER_TIMEOUT_FRAMES = ms_to_frames(2000)
-SILENCE_TIMEOUT_FRAMES = ms_to_frames(2000)
+MIN_SILENCE_FRAMES = ms_to_frames(300)
+CHECK_INTERVAL = ms_to_frames(200)
+FRAMES_FAST = ms_to_frames(700)
+FRAMES_SLOW = ms_to_frames(1400)
+FILLER_TIMEOUT = ms_to_frames(2000)
+SILENCE_TIMEOUT = ms_to_frames(2000)
 
 
 def decide_turn_end(
@@ -114,15 +109,15 @@ def decide_turn_end(
     Trả về lý do dừng ('smart_turn_done', 'smart_turn_high', 'silence_timeout') hoặc None.
     """
     if is_hesitating_or_reading:
-        if prob >= SMART_TURN_PROB_CONFIDENT and silence_frames >= SMART_TURN_UNCERTAIN_FRAMES:
+        if prob >= PROB_HIGH and silence_frames >= FRAMES_SLOW:
             return "smart_turn_done"
         return None
 
-    if prob >= SMART_TURN_PROB_CONFIDENT and silence_frames >= SMART_TURN_CONFIDENT_FRAMES:
+    if prob >= PROB_HIGH and silence_frames >= FRAMES_FAST:
         return "smart_turn_done"
-    if prob >= SMART_TURN_PROB_UNCERTAIN and silence_frames >= SMART_TURN_UNCERTAIN_FRAMES:
+    if prob >= PROB_MID and silence_frames >= FRAMES_SLOW:
         return "smart_turn_high"
-    if silence_frames >= SILENCE_TIMEOUT_FRAMES or wall_silence_s >= WALL_SILENCE_TIMEOUT_S:
+    if silence_frames >= SILENCE_TIMEOUT or wall_silence_s >= WALL_TIMEOUT_S:
         return "silence_timeout"
 
     return None
@@ -305,17 +300,15 @@ class VoiceSession:
         rms = float(np.sqrt(np.mean(samples**2)))
 
         if not self.vad.model.is_available:
-            return rms >= VAD_RMS_THRESHOLD_DEFAULT
+            return rms >= VAD_RMS_START
 
         speech_prob = await asyncio.to_thread(self.vad.speech_prob, samples)
         if not self._is_turn_active(current_turn):
             return None
 
         # Cơ chế hysteresis: khi đã có tiếng nói thì hạ thấp ngưỡng để không bị đứt đoạn âm tiết nhẹ
-        prob_threshold = VAD_SPEECH_PROB_CONTINUED if self.has_speech else VAD_SPEECH_PROB_INITIAL
-        rms_threshold = (
-            VAD_RMS_THRESHOLD_CONTINUED if self.has_speech else VAD_RMS_THRESHOLD_INITIAL
-        )
+        prob_threshold = VAD_PROB_KEEP if self.has_speech else VAD_PROB_START
+        rms_threshold = VAD_RMS_KEEP if self.has_speech else VAD_RMS_START
         return speech_prob >= prob_threshold and rms >= rms_threshold
 
     def _update_vad(self, is_speaking: bool, now: float) -> None:
@@ -335,8 +328,8 @@ class VoiceSession:
         can_trigger = (
             self.has_speech
             and self.speech_frames >= MIN_SPEECH_FRAMES
-            and self.silence_frames >= INITIAL_SILENCE_FRAMES
-            and silence_passed >= SMART_TURN_CHECK_INTERVAL_FRAMES
+            and self.silence_frames >= MIN_SILENCE_FRAMES
+            and silence_passed >= CHECK_INTERVAL
             and not self._detecting
         )
         if can_trigger:
@@ -350,8 +343,8 @@ class VoiceSession:
             return
 
         self.audio_buf.extend(frame)
-        if len(self.audio_buf) > AUDIO_BUF_MAX_BYTES:
-            del self.audio_buf[:-AUDIO_BUF_MAX_BYTES]
+        if len(self.audio_buf) > MAX_AUDIO_BYTES:
+            del self.audio_buf[:-MAX_AUDIO_BYTES]
 
         is_speaking = await self._is_speaking(frame, self.turn_id)
         if is_speaking is None:
@@ -363,7 +356,7 @@ class VoiceSession:
 
     async def _on_filler_timeout(self, turn_id: int) -> bool:
         """Xử lý trường hợp người dùng chỉ nói từ đệm (ừ, à, ờ...) rồi im lặng quá 2 giây."""
-        if self.silence_frames >= FILLER_TIMEOUT_FRAMES and self._is_turn_active(turn_id):
+        if self.silence_frames >= FILLER_TIMEOUT and self._is_turn_active(turn_id):
             await self._send_ws(
                 {
                     "type": "auto_stop",
@@ -388,7 +381,7 @@ class VoiceSession:
         try:
             can_check = (
                 self._is_turn_active(turn_id)
-                and len(self.audio_buf) >= MIN_AUDIO_BUFFER_BYTES
+                and len(self.audio_buf) >= MIN_AUDIO_BYTES
                 and self.speech_frames >= MIN_SPEECH_FRAMES
             )
             if not can_check:
