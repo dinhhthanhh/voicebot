@@ -232,7 +232,7 @@ class VoiceSession:
         self._pending_audio.clear()
         await self._abort_stt()
         await self.set_state(SessionState.IDLE)
-        await self._send_json({"type": "error", "message": message})
+        await self._send_ws({"type": "error", "message": message})
 
     def _is_turn_active(self, turn_id: int | None = None) -> bool:
         """Kiểm tra lượt thoại hiện tại còn hợp lệ để tiếp tục xử lý hay không."""
@@ -244,16 +244,14 @@ class VoiceSession:
     ) -> None:
         """Cập nhật trạng thái máy trạng thái nội bộ và gửi gói tin đồng bộ về client UI."""
         self.state = SessionState(state)
-        await self._send_json(
-            {"type": "state", "state": ui_state if ui_state is not None else state}
-        )
+        await self._send_ws({"type": "state", "state": ui_state if ui_state is not None else state})
 
     async def cancel_turn(self) -> None:
         """Hủy bỏ lượt thoại đang chạy (ngắt bot khi người dùng chen ngang)."""
         self._reset_turn_audio()
         await self._cancel_running_tasks()
         await self._abort_stt()
-        await self._send_json({"type": "stop_audio"})
+        await self._send_ws({"type": "stop_audio"})
         await self.set_state(SessionState.IDLE)
 
     async def close(self) -> None:
@@ -268,7 +266,7 @@ class VoiceSession:
             return
 
         if len(data) > FRAME_BYTES * 2:
-            await self._send_json(
+            await self._send_ws(
                 {
                     "type": "error",
                     "message": "Khung âm thanh không hợp lệ (vượt quá kích thước tối đa).",
@@ -372,7 +370,7 @@ class VoiceSession:
     async def _handle_filler_timeout(self, turn_id: int) -> bool:
         """Xử lý trường hợp người dùng chỉ nói từ đệm (ừ, à, ờ...) rồi im lặng quá 2 giây."""
         if self.silence_frames >= FILLER_TIMEOUT_FRAMES and self._is_turn_active(turn_id):
-            await self._send_json(
+            await self._send_ws(
                 {
                     "type": "auto_stop",
                     "probability": 0.0,
@@ -431,7 +429,7 @@ class VoiceSession:
             )
 
             if reason and self._is_turn_active(turn_id):
-                await self._send_json(
+                await self._send_ws(
                     {
                         "type": "auto_stop",
                         "probability": round(prob, 3),
@@ -450,7 +448,7 @@ class VoiceSession:
     async def start_turn(self) -> None:
         """Bắt đầu một lượt nhận dạng giọng nói mới từ người dùng."""
         if self.state in (SessionState.THINKING, SessionState.SPEAKING):
-            await self._send_json({"type": "busy"})
+            await self._send_ws({"type": "busy"})
             return
 
         await self._abort_stt()
@@ -509,7 +507,7 @@ class VoiceSession:
                 if isinstance(exc, SttError)
                 else "Nhận dạng giọng nói thất bại, hãy thử lại."
             )
-            await self._send_json({"type": "error", "message": err_msg})
+            await self._send_ws({"type": "error", "message": err_msg})
             return ""
 
     async def _execute_dialogue_pipeline(self, text: str) -> None:
@@ -532,7 +530,7 @@ class VoiceSession:
         if len(self.history) > MAX_HISTORY:
             self.history = self.history[-MAX_HISTORY:]
 
-        await self._send_json(
+        await self._send_ws(
             {
                 "type": "metrics",
                 **{k: round(v, 2) for k, v in self.metrics.items()},
@@ -544,7 +542,7 @@ class VoiceSession:
         t_stop = time.perf_counter()
         try:
             text = await self._finalize_stt_transcript(stt, fallback_text)
-            await self._send_json(
+            await self._send_ws(
                 {
                     "type": "final",
                     "text": text,
@@ -557,20 +555,20 @@ class VoiceSession:
                     if text
                     else "Không nghe rõ, hãy nói lại."
                 )
-                await self._send_json({"type": "info", "message": msg})
-                await self._send_json({"type": "bot_done"})
+                await self._send_ws({"type": "info", "message": msg})
+                await self._send_ws({"type": "bot_done"})
                 return
 
             await self._execute_dialogue_pipeline(text)
-            await self._send_json({"type": "bot_done"})
+            await self._send_ws({"type": "bot_done"})
         except asyncio.CancelledError:
             await stt.abort()
             raise
         except Exception as exc:
-            await self._send_json(
+            await self._send_ws(
                 {"type": "error", "message": f"Lỗi khi tạo câu trả lời: {type(exc).__name__}"}
             )
-            await self._send_json({"type": "bot_done"})
+            await self._send_ws({"type": "bot_done"})
         finally:
             if self.turn_task is asyncio.current_task():
                 self.turn_task = None
@@ -584,15 +582,6 @@ class VoiceSession:
                     await self.ws.send_bytes(data)
                 else:
                     await self.ws.send_json(data)
-
-    async def _send_json(self, obj: dict[str, Any]) -> None:
-        await self._send_ws(obj)
-
-    async def _send_bytes(self, data: bytes) -> None:
-        await self._send_ws(data)
-
-    send_json = _send_json
-    send_bytes = _send_bytes
 
     async def on_control(self, msg: dict[str, Any]) -> None:
         """Xử lý các thông điệp điều khiển JSON từ client."""
@@ -613,16 +602,16 @@ class VoiceSession:
             self.history.clear()
 
     async def _send_raw(self, text: str) -> None:
-        await self._send_json({"type": "bot_raw", "text": text})
+        await self._send_ws({"type": "bot_raw", "text": text})
 
     async def _send_audio(self, pcm: bytes) -> None:
         """Gửi âm thanh TTS PCM16 về client kèm gói tin định dạng đầu tiên."""
         if self.state == SessionState.THINKING:
-            await self._send_json(
+            await self._send_ws(
                 {"type": "tts_format", "sample_rate": TTS_SAMPLE_RATE, "channels": 1}
             )
             await self.set_state(SessionState.SPEAKING)
-        await self._send_bytes(pcm)
+        await self._send_ws(pcm)
 
     async def _on_stt_event(self, kind: str, payload: Any) -> None:
         """Callback nhận kết quả tạm thời (partial) hoặc lỗi từ STT session."""
@@ -632,7 +621,7 @@ class VoiceSession:
                 self.last_partial_text = new_text
                 self.has_speech = True
                 self.speech_frames = max(self.speech_frames, MIN_SPEECH_FRAMES)
-            await self._send_json({"type": "partial", "text": payload})
+            await self._send_ws({"type": "partial", "text": payload})
         elif kind == "error":
             await self._handle_session_error(friendly_stt_error(payload))
 
