@@ -340,7 +340,7 @@
         refreshState();
       }
 
-      // Phát luồng âm thanh PCM từ máy chủ (O1: giảm tối đa cấp phát bộ nhớ và áp lực GC)
+      // Phát luồng âm thanh PCM từ máy chủ
       function playPcm(arrayBuf) {
         if (!ctx || discarding || !arrayBuf || arrayBuf.byteLength === 0) return;
 
