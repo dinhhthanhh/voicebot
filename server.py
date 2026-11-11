@@ -246,19 +246,17 @@ class VoiceSession:
         self.state = SessionState(state)
         await self._send_ws({"type": "state", "state": ui_state if ui_state is not None else state})
 
-    async def cancel_turn(self) -> None:
-        """Hủy bỏ lượt thoại đang chạy (ngắt bot khi người dùng chen ngang)."""
-        self._reset_turn_audio()
-        await self._cancel_running_tasks()
-        await self._abort_stt()
-        await self._send_ws({"type": "stop_audio"})
-        await self.set_state(SessionState.IDLE)
-
     async def close(self) -> None:
         """Dọn dẹp và giải phóng toàn bộ tác vụ nền khi đóng kết nối WebSocket."""
         self._reset_turn_audio()
         await self._cancel_running_tasks()
         await self._abort_stt()
+
+    async def cancel_turn(self) -> None:
+        """Hủy bỏ lượt thoại đang chạy (ngắt bot khi người dùng chen ngang)."""
+        await self.close()
+        await self._send_ws({"type": "stop_audio"})
+        await self.set_state(SessionState.IDLE)
 
     async def on_audio(self, data: bytes) -> None:
         """Tiếp nhận dữ liệu PCM thô từ trình duyệt và chuyển tiếp đến STT/VAD."""
@@ -285,7 +283,8 @@ class VoiceSession:
         if not self._is_turn_active() or self.stt is None:
             return
 
-        await self._feed_frame(frame)
+        async with self._vad_lock:
+            await self._send_and_process_frame(frame)
 
     async def _send_and_process_frame(self, frame: bytes) -> bool:
         """Chuyển tiếp khung âm thanh tới STT và cập nhật VAD."""
@@ -299,11 +298,6 @@ class VoiceSession:
 
         await self._process_frame_vad(frame)
         return True
-
-    async def _feed_frame(self, frame: bytes) -> None:
-        """Chuyển tiếp khung âm thanh trong critical section có khóa đồng bộ thứ tự."""
-        async with self._vad_lock:
-            await self._send_and_process_frame(frame)
 
     async def _compute_is_speaking(self, frame: bytes, current_turn: int) -> bool | None:
         """Đo năng lượng RMS và tính xác suất giọng người qua Silero VAD."""
@@ -381,15 +375,6 @@ class VoiceSession:
             return True
         return False
 
-    def _can_check_endpoint(self, turn_id: int) -> bool:
-        """Kiểm tra điều kiện tiên quyết về độ dài audio và thời gian nói trước khi chạy Smart-Turn."""
-        if not self._is_turn_active(turn_id):
-            return False
-        return (
-            len(self.audio_buf) >= MIN_AUDIO_BUFFER_BYTES
-            and self.speech_frames >= MIN_SPEECH_FRAMES
-        )
-
     async def _predict_smart_turn_prob(self) -> float:
         """Chạy dự đoán mô hình Smart-Turn trên luồng worker riêng."""
         if not self.detector.is_available:
@@ -401,7 +386,12 @@ class VoiceSession:
     async def _check_turn_endpoint(self, turn_id: int) -> None:
         """Định kỳ đánh giá xem người dùng đã hoàn thành câu nói hay chưa để chuyển lượt bot."""
         try:
-            if not self._can_check_endpoint(turn_id):
+            can_check = (
+                self._is_turn_active(turn_id)
+                and len(self.audio_buf) >= MIN_AUDIO_BUFFER_BYTES
+                and self.speech_frames >= MIN_SPEECH_FRAMES
+            )
+            if not can_check:
                 return
 
             is_only_filler_text = (
