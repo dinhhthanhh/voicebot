@@ -15,11 +15,11 @@ env/
 *.swp
 *.swo
 .ruff_cache/
+.mypy_cache/
+.pytest_cache/
 
 # Generated output wav files
 data/
 
 # ONNX model files
 *.onnx
-models/*.onnx
-

@@ -1,6 +1,6 @@
 # Voicebot (STT → LLM → SpeechFilter → TTS)
 
-Hệ thống trợ lý giọng nói đàm thoại thời gian thực, độ trễ thấp (Time-to-First-Audio ~0.7s) tích hợp bộ lọc văn bản thông minh và cơ chế phát hiện ngắt lượt nói hai tầng (Silero VAD + Smart Turn v3.2).
+Hệ thống trợ lý giọng nói đàm thoại thời gian thực độ trễ thấp, tích hợp bộ lọc văn bản thông minh tiếng Việt và cơ chế phát hiện ngắt lượt nói hai tầng (Silero VAD v5 + Smart Turn v3.2).
 
 ---
 
@@ -8,7 +8,7 @@ Hệ thống trợ lý giọng nói đàm thoại thời gian thực, độ tr�
 
 ### 1. Kiến trúc luồng kép (Dual-channel Streaming)
 - **Kênh hiển thị (Màn hình):** Stream toàn văn câu trả lời từ LLM tức thì (bao gồm đầy đủ Markdown, bảng biểu, mã nguồn, danh sách).
-- **Kênh âm thanh (Thoại):** Xử lý song song qua hàng đợi Producer-Consumer. Tổng hợp và phát âm thanh ngay khi câu đầu tiên sẵn sàng qua Zero-TTS (PCM 48 kHz, Mono, 16-bit), đảm bảo **Time-to-First-Audio ~0.7s**.
+- **Kênh âm thanh (Thoại):** Xử lý song song qua hàng đợi Producer-Consumer. Tách câu thời gian thực và đẩy ngay câu hoàn chỉnh đầu tiên qua Zero-TTS (PCM 48 kHz, Mono, 16-bit) để phát âm thanh lập tức tới người dùng.
 
 ### 2. Bộ lọc văn bản thông minh (`SpeechFilter`)
 - **Tách câu thời gian thực:** Nhận diện ranh giới câu tự nhiên theo dấu ngắt câu và ngữ cảnh hội thoại.
@@ -16,22 +16,26 @@ Hệ thống trợ lý giọng nói đàm thoại thời gian thực, độ tr�
 - **Chuẩn hóa văn bản Tiếng Việt nâng cao:**
   - **Số điện thoại & Mã bưu chính:** Nhận dạng số di động 10 số, số cố định dạng `(024) 3xxx`, mã quốc gia `+84` và mã bưu chính VNPost (5 số).
   - **Cách đọc số ghép tự nhiên:** Chuyển đổi mượt mà các cụm chục (*"mươi"*, *"mười"*), lẻ (*"linh"*, *"lẻ"*), và tròn nghìn/trăm (*"mười nghìn"*, *"mười hai nghìn năm trăm"*).
-  - **Số và tiền tệ:** Phân biệt chính xác phân cách hàng nghìn (`1.500`, `1,500`) và số thập phân (`0,007` → đọc là "không phẩy không không bảy"); hỗ trợ ký hiệu tiền tệ (`VNĐ`, `$`, `€`).
+  - **Số và tiền tệ:** Phân biệt chính xác phân cách hàng nghìn (`1.500`, `1,500`) và số thập phân (`0,007` → đọc là "không phẩy không không bảy"); hỗ trợ ký hiệu tiền tệ (`đồng`, `VNĐ`, `$`, `€`).
   - **Đơn vị & ký hiệu:** Đổi tự động các đơn vị thông dụng (`km`, `cm`, `kg`, `%`, `°C`...).
   - **Biểu thức & đường dẫn:** Chuẩn hóa biểu thức toán học, đường dẫn URL sang văn phong giao tiếp trực tiếp.
   - **Capping:** Giới hạn độ dài và số lượng câu đọc tối đa nhằm giữ câu trả lời thoại súc tích, mạch lạc.
 
 ### 3. Cơ chế kết thúc lượt nói thông minh (Smart Turn & VAD)
-- **Kiến trúc phát hiện 2 tầng:** Kết hợp **Silero VAD v5** (phát hiện giọng nói / khoảng lặng) và **Smart Turn v3.2 ONNX** (phân tích ngữ nghĩa âm học xem người dùng đã dứt ý hay chưa thay vì hardcode danh sách từ ngắn).
-- **Bộ lọc năng lượng RMS:** Ngăn chặn tiếng ồn nền và hơi thở gây kích hoạt giả (`RMS Energy Gate > 100`).
-- **Ngưỡng quyết định linh hoạt:** Tự tin cao ($\ge 0.65$) ngắt nhạy ngay sau $0.7\text{s}$; ngưỡng mở rộng ($\ge 0.50$) khi im lặng $\ge 1.4\text{s}$ đối với các câu không ngập ngừng. Chờ tối đa $2.0\text{s}$ đối với trường hợp im lặng tuyệt đối.
-- **Bảo vệ ngữ cảnh dở dang:** Tự động tăng thời gian chờ nếu người dùng đang đọc dở số điện thoại/dãy số (`\d{2,4}$`) hoặc kết thúc bằng các từ nối/ngập ngừng (*"và"*, *"hoặc"*, *"thì"*, *"nhưng"*, *"là"*...).
-- **Watchdog chống lệch nhịp:** Tự động thu hồi và reset phiên an toàn nếu quá trình nhận dạng hoặc kết nối bị gián đoạn.
+- **Kiến trúc phát hiện 2 tầng:** Kết hợp **Silero VAD v5** (phát hiện giọng nói / khoảng lặng) và **Smart Turn v3.2 ONNX** (phân tích ngữ nghĩa âm học xem người dùng đã dứt ý hay chưa).
+- **Bộ lọc năng lượng RMS & Ngưỡng trễ:** Ngăn tiếng ồn nền và hơi thở gây kích hoạt giả bằng cơ chế hysteresis trễ:
+  - Bắt đầu nói: Xác suất VAD $\ge 0.50$ và RMS $\ge 0.003$.
+  - Duy trì nói: Xác suất VAD $\ge 0.30$ hoặc RMS $\ge 0.002$.
+- **Ngưỡng quyết định ngắt câu linh hoạt:**
+  - Tự tin cao ($\ge 0.65$): Ngắt nhạy sau $0.7\text{s}$ im lặng.
+  - Tự tin mở rộng ($\ge 0.50$): Ngắt sau $1.4\text{s}$ im lặng đối với câu dứt khoát không ngập ngừng.
+  - Hết thời gian im lặng: Tự động ngắt khi im lặng tuyệt đối $\ge 2.0\text{s}$ hoặc $2.5\text{s}$ đồng hồ thực đối với các câu ngập ngừng / đọc dở dãy số.
+- **Bảo vệ ngữ cảnh dở dang:** Tự động tăng thời gian chờ nếu người dùng đang đọc dở số điện thoại/dãy số hoặc kết thúc bằng các từ nối/ngập ngừng (*"và"*, *"hoặc"*, *"thì"*, *"nhưng"*, *"là"*...).
 
 ### 4. Giao diện Web & Trải nghiệm đàm thoại liên tục
-- **Web Audio API:** Thu âm và Linear Resample về 16 kHz gửi STT; phát stream âm thanh PCM16 48 kHz mượt mà, không giật hạt.
-- **Mạch chống dội âm (Anti-feedback):** Sử dụng `GainNode(gain=0)` triệt tiêu hoàn toàn hiện tượng âm từ loa dội ngược vào micro.
-- **Đàm thoại tự nhiên:** Bấm **"Bắt đầu nói"** để kích hoạt chế độ đàm thoại liên tục (các nút chuyển sang **"Gửi"** để ngắt thủ công và **"Dừng nói"** để kết thúc phiên). Bot và người dùng trò chuyện qua lại tự động mà không cần bấm nút lại từng câu.
+- **Web Audio API:** Thu âm từ micro và Linear Resample về 16 kHz PCM16 gửi STT; phát stream âm thanh PCM16 48 kHz mượt mà với cơ chế zero-copy giảm tối đa áp lực Garbage Collector.
+- **Cơ chế chống dội âm (Anti-feedback):** Kết hợp `echoCancellation: true` phần cứng/trình duyệt của Web Audio API, ngắt micro trong khi bot đang phát âm thanh, và thêm khoảng trễ đệm 600ms (`scheduleAutoListen`) trước khi mở lại micro để đón lượt nói mới.
+- **Đàm thoại tự nhiên:** Bấm **"Bắt đầu nói"** để kích hoạt chế độ đàm thoại liên tục (các nút chuyển sang **"Gửi"** để ngắt thủ công và **"Dừng nói"** để hủy lượt thoại). Bot và người dùng trò chuyện qua lại tự động mà không cần bấm nút lại từng câu.
 
 ---
 
@@ -39,15 +43,14 @@ Hệ thống trợ lý giọng nói đàm thoại thời gian thực, độ tr�
 
 ```text
 voice-bot/
-├── data/                       # Dữ liệu âm thanh test và logs kiểm nghiệm
-├── models/                     # Các mô hình ONNX phục vụ VAD & Smart Turn
+├── models/                     # Thư mục chứa mô hình ONNX (VAD & Smart Turn)
 │   ├── silero_vad.onnx         # Silero VAD v5 (ONNX runtime CPU)
 │   └── smart-turn-v3.2-cpu.onnx# Smart Turn v3.2 (ONNX runtime CPU)
-├── index.html                  # Giao diện Web Voicebot (Web Audio API, visualizer)
+├── index.html                  # Giao diện Web Voicebot (Web Audio API, điều khiển hội thoại)
 ├── server.py                   # FastAPI WebSocket server chính (/ws/voice)
-├── stt.py                      # Qwen3-ASR client, Silero VAD, Smart Turn v3.2
+├── stt.py                      # Qwen3-ASR client, Silero VAD, Smart Turn v3.2 ONNX
 ├── tts.py                      # LLM Client, SpeechFilter, Zero-TTS stream client
-├── pyproject.toml              # Cấu hình dự án (uv / pip)
+├── pyproject.toml              # Cấu hình dự án & linter (uv / pip / ruff)
 ├── requirements.txt            # Danh sách thư viện phụ thuộc
 └── README.md                   # Tài liệu hướng dẫn dự án
 ```
@@ -56,17 +59,16 @@ voice-bot/
 
 ## ⚙️ Cấu hình biến môi trường
 
-Các tham số có thể cấu hình qua biến môi trường (hoặc đặt giá trị mặc định trong code):
+Các tham số có thể cấu hình qua biến môi trường (hoặc sử dụng giá trị mặc định trong code):
 
 | Biến môi trường | Mặc định | Mô tả |
 | :--- | :--- | :--- |
-| `STT_WS_URL` | `ws://127.0.0.1:8765/ws/asr` | WebSocket endpoint của Qwen3-ASR |
-| `LLM_URL` | `http://127.0.0.1:8001/v1/chat/completions` | OpenAI-compatible endpoint của LLM |
-| `TTS_BASE_URL` | `http://127.0.0.1:8002` | Endpoint dịch vụ Zero-TTS |
-| `TTS_VOICE` | `bich_ngoc` | Giọng đọc TTS |
-| `VAD_MODEL_PATH` | `models/silero_vad.onnx` | Đường dẫn mô hình Silero VAD ONNX |
-| `SMART_TURN_MODEL_PATH` | `models/smart-turn-v3.2-cpu.onnx` | Đường dẫn mô hình Smart Turn ONNX |
-| `VOICEBOT_HTML_PATH` | `index.html` | Đường dẫn file giao diện web |
+| `STT_WS_URL` | `wss://ai.vnpost.vn/qwen3-asr-1p7b/v1/stream` | WebSocket endpoint của Qwen3-ASR |
+| `LLM_URL` | `https://ai.vnpost.vn/vllm-qwen38-27b/v1/chat/completions` | OpenAI-compatible endpoint của LLM |
+| `TTS_BASE_URL` | `https://ai.vnpost.vn/zero-tts` | Endpoint dịch vụ Zero-TTS |
+| `TTS_VOICE` | `maichi` | Giọng đọc mặc định của Zero-TTS |
+
+*Lưu ý: Các mô hình ONNX và giao diện Web được nạp tự động theo đường dẫn tương đối trong thư mục dự án (`models/silero_vad.onnx`, `models/smart-turn-v3.2-cpu.onnx`, `index.html`).*
 
 ---
 
@@ -86,9 +88,11 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 2. Kiểm tra mô hình ONNX
+*Ghi chú phụ thuộc:* Thư viện `transformers` được giữ trong danh sách phụ thuộc nhằm cung cấp `WhisperFeatureExtractor` trích xuất đặc trưng âm học chuẩn hóa cho mô hình Smart Turn ONNX.
 
-Đảm bảo hai file mô hình đã nằm trong thư mục `models/`:
+### 2. Chuẩn bị mô hình ONNX
+
+Do quy tắc `.gitignore` loại trừ các file nhị phân lớn (`*.onnx`), bạn cần đảm bảo hai file mô hình sau đã nằm trong thư mục `models/` trước khi chạy:
 - `models/silero_vad.onnx`
 - `models/smart-turn-v3.2-cpu.onnx`
 

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
 from stt import (
+    MAX_AUDIO_BYTES,
+    STT_SAMPLE_RATE,
     SileroVadModel,
     SmartTurnDetector,
     SttError,
@@ -28,9 +32,17 @@ from stt import (
     normalize_speech_input,
     normalize_text,
 )
-from tts import run_turn
+from tts import TTS_SAMPLE_RATE, run_turn
 
-# Cấu hình dịch vụ
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("server")
+
+# ---------------------------------------------------------------------------
+# Cấu hình dịch vụ kết nối ngoài (STT, LLM, TTS)
+# ---------------------------------------------------------------------------
 STT_URL = os.environ.get("STT_WS_URL", "wss://ai.vnpost.vn/qwen3-asr-1p7b/v1/stream")
 LLM_URL = os.environ.get("LLM_URL", "https://ai.vnpost.vn/vllm-qwen38-27b/v1/chat/completions")
 TTS_URL = os.environ.get("TTS_BASE_URL", "https://ai.vnpost.vn/zero-tts")
@@ -39,38 +51,86 @@ VOICE = os.environ.get("TTS_VOICE", "maichi")
 INDEX_HTML = Path(__file__).resolve().parent / "index.html"
 MAX_HISTORY = 8
 
-# Định dạng âm thanh PCM16 mono 16 kHz
-SAMPLE_RATE = 16000
-CHANNELS = 1
+
+class SessionState(StrEnum):
+    """Trạng thái phiên thoại giữa bot và client."""
+
+    IDLE = "idle"
+    STARTING = "starting"
+    LISTENING = "listening"
+    THINKING = "thinking"
+    SPEAKING = "speaking"
+
+
+# ---------------------------------------------------------------------------
+# Cấu hình định dạng âm thanh (PCM16 mono 16 kHz) & Ngưỡng VAD / Smart Turn
+# ---------------------------------------------------------------------------
+SAMPLE_RATE = STT_SAMPLE_RATE
 SAMPLE_WIDTH = 2
 FRAME_DURATION_MS = 100
 FRAME_SAMPLES = int(SAMPLE_RATE * (FRAME_DURATION_MS / 1000.0))
 FRAME_BYTES = FRAME_SAMPLES * SAMPLE_WIDTH
 
+AUDIO_BUF_MAX_BYTES = MAX_AUDIO_BYTES  # 256,000 bytes (~8 giây 16kHz PCM16)
+MIN_AUDIO_BUFFER_BYTES = 12_000  # Tối thiểu ~375ms âm thanh trước khi chạy Smart Turn
+
+# Ngưỡng phát hiện tiếng nói (VAD - Voice Activity Detection)
+VAD_RMS_THRESHOLD_DEFAULT = 0.003
+VAD_SPEECH_PROB_INITIAL = 0.50  # Ngưỡng bắt đầu nhận diện có lời nói
+VAD_SPEECH_PROB_CONTINUED = 0.30  # Ngưỡng duy trì trạng thái nói (hysteresis chống chập chờn)
+VAD_RMS_THRESHOLD_INITIAL = 0.003
+VAD_RMS_THRESHOLD_CONTINUED = 0.002
+
+# Ngưỡng xác suất Smart Turn
+SMART_TURN_PROB_CONFIDENT = 0.65  # Ngưỡng xác suất tự tin dứt câu
+SMART_TURN_PROB_UNCERTAIN = 0.50  # Ngưỡng xác suất trung bình (cần im lặng lâu hơn)
+WALL_SILENCE_TIMEOUT_S = 2.5  # Hết thời gian chờ im lặng theo đồng hồ thực tế
+
 
 def ms_to_frames(milliseconds: int) -> int:
+    """Quy đổi thời gian milliseconds sang số frame (mỗi frame 100ms)."""
     return max(1, (milliseconds + FRAME_DURATION_MS - 1) // FRAME_DURATION_MS)
 
 
-MIN_SPEECH_MS = 300
-INITIAL_SILENCE_MS = 300
-SMART_TURN_CHECK_INTERVAL_MS = 200
-SMART_TURN_CONFIDENT_MS = 700
-SMART_TURN_UNCERTAIN_MS = 1400
-FILLER_TIMEOUT_MS = 2000
-SILENCE_TIMEOUT_MS = 2000
+# Số frame quy đổi từ thời lượng mili-giây
+MIN_SPEECH_FRAMES = ms_to_frames(300)
+INITIAL_SILENCE_FRAMES = ms_to_frames(300)
+SMART_TURN_CHECK_INTERVAL_FRAMES = ms_to_frames(200)
+SMART_TURN_CONFIDENT_FRAMES = ms_to_frames(700)
+SMART_TURN_UNCERTAIN_FRAMES = ms_to_frames(1400)
+FILLER_TIMEOUT_FRAMES = ms_to_frames(2000)
+SILENCE_TIMEOUT_FRAMES = ms_to_frames(2000)
 
-MIN_SPEECH_FRAMES = ms_to_frames(MIN_SPEECH_MS)
-INITIAL_SILENCE_FRAMES = ms_to_frames(INITIAL_SILENCE_MS)
-SMART_TURN_CHECK_INTERVAL_FRAMES = ms_to_frames(SMART_TURN_CHECK_INTERVAL_MS)
-SMART_TURN_CONFIDENT_FRAMES = ms_to_frames(SMART_TURN_CONFIDENT_MS)
-SMART_TURN_UNCERTAIN_FRAMES = ms_to_frames(SMART_TURN_UNCERTAIN_MS)
-FILLER_TIMEOUT_FRAMES = ms_to_frames(FILLER_TIMEOUT_MS)
-SILENCE_TIMEOUT_FRAMES = ms_to_frames(SILENCE_TIMEOUT_MS)
+
+def decide_turn_end(
+    prob: float,
+    silence_frames: int,
+    wall_silence_s: float,
+    *,
+    is_hesitating_or_reading: bool,
+) -> str | None:
+    """Hàm thuần túy quyết định thời điểm dứt câu dựa trên xác suất và thời gian im lặng.
+
+    Trả về lý do dừng ('smart_turn_done', 'smart_turn_high', 'silence_timeout') hoặc None.
+    """
+    if is_hesitating_or_reading:
+        if prob >= SMART_TURN_PROB_CONFIDENT and silence_frames >= SMART_TURN_UNCERTAIN_FRAMES:
+            return "smart_turn_done"
+        return None
+
+    if prob >= SMART_TURN_PROB_CONFIDENT and silence_frames >= SMART_TURN_CONFIDENT_FRAMES:
+        return "smart_turn_done"
+    if prob >= SMART_TURN_PROB_UNCERTAIN and silence_frames >= SMART_TURN_UNCERTAIN_FRAMES:
+        return "smart_turn_high"
+    if silence_frames >= SILENCE_TIMEOUT_FRAMES or wall_silence_s >= WALL_SILENCE_TIMEOUT_S:
+        return "silence_timeout"
+
+    return None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Khởi tạo tài nguyên toàn cục (HTTP client pool, model Silero VAD và Smart-Turn)."""
     app.state.http = httpx.AsyncClient(
         timeout=httpx.Timeout(
             connect=10.0,
@@ -91,11 +151,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(INDEX_HTML)
 
+
 def friendly_stt_error(payload: dict[str, Any]) -> str:
+    """Chuyển đổi mã lỗi kỹ thuật từ backend STT thành thông báo thân thiện với người dùng."""
     code = payload.get("error_code", "")
     if code in ("OVERLOADED", "QUEUE_TIMEOUT"):
         return "Dịch vụ nhận dạng giọng nói đang quá tải, vui lòng thử lại sau ít giây."
@@ -103,7 +166,9 @@ def friendly_stt_error(payload: dict[str, Any]) -> str:
         return "Câu nói quá dài (tối đa 600 giây)."
     return f"Lỗi nhận dạng giọng nói ({code or payload.get('status_code', '?')})."
 
+
 class VoiceSession:
+    """Quản lý trạng thái và luồng dữ liệu hai chiều của một phiên thoại WebSocket."""
 
     def __init__(
         self,
@@ -114,11 +179,11 @@ class VoiceSession:
     ) -> None:
         self.ws = ws
         self.http = http
-        self.state = "idle"
+        self.state = SessionState.IDLE
         self.auto_turn = True
         self.history: list[dict[str, str]] = []
         self.stt: SttSession | None = None
-        self.turn: asyncio.Task | None = None
+        self.turn_task: asyncio.Task | None = None
         self._start_task: asyncio.Task | None = None
         self.metrics: dict[str, float] = {}
         self._send_lock = asyncio.Lock()
@@ -131,29 +196,19 @@ class VoiceSession:
         self.turn_id = 0
         self._detect_task: asyncio.Task | None = None
         self.audio_buf = bytearray()
-        self.silence_frames = 0
-        self.speech_frames = 0
-        self.has_speech = False
-        self._detecting = False
-        self._last_detect_frame = 0
-        self.last_partial_text = ""
-        self.last_speech_time = time.monotonic()
-        self.last_frame_time = time.monotonic()
+        self._reset_turn_audio(increment_turn=False)
 
-    def _reset_turn_audio(self) -> None:
-        self.turn_id += 1
+    def _reset_turn_audio(self, *, increment_turn: bool = True) -> None:
+        """Đặt lại bộ đệm âm thanh và trạng thái đếm frame khi kết thúc hoặc hủy lượt thoại."""
+        if increment_turn:
+            self.turn_id += 1
         current = asyncio.current_task()
-        if (
-            self._detect_task
-            and self._detect_task is not current
-            and not self._detect_task.done()
-        ):
+        if self._detect_task and self._detect_task is not current and not self._detect_task.done():
             self._detect_task.cancel()
         self._detect_task = None
         self.vad.reset()
         self.audio_buf.clear()
         self._pending_audio.clear()
-        self.metrics.clear()
         self.silence_frames = 0
         self.speech_frames = 0
         self.has_speech = False
@@ -161,369 +216,438 @@ class VoiceSession:
         self._last_detect_frame = 0
         self.last_partial_text = ""
         self.last_speech_time = time.monotonic()
-        self.last_frame_time = time.monotonic()
 
-    async def set_state(self, s: str, ui_state: str | None = None) -> None:
-        self.state = s
-        await self.send_json({"type": "state", "state": ui_state if ui_state is not None else s})
+    async def _cancel_running_tasks(self) -> None:
+        """Hủy và đợi hoàn tất các tác vụ nền đang chạy (_start_task, turn_task)."""
+        tasks = [t for t in (self._start_task, self.turn_task) if t and not t.done()]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._start_task = None
+        self.turn_task = None
+
+    async def _handle_session_error(self, message: str) -> None:
+        """Dọn dẹp tài nguyên phiên và thông báo lỗi về client."""
+        self._pending_audio.clear()
+        await self._abort_stt()
+        await self.set_state(SessionState.IDLE)
+        await self._send_json({"type": "error", "message": message})
+
+    def _is_turn_active(self, turn_id: int | None = None) -> bool:
+        """Kiểm tra lượt thoại hiện tại còn hợp lệ để tiếp tục xử lý hay không."""
+        match_turn = turn_id is None or turn_id == self.turn_id
+        return match_turn and self.state == SessionState.LISTENING and self.stt is not None
+
+    async def set_state(
+        self, state: SessionState | str, ui_state: SessionState | str | None = None
+    ) -> None:
+        """Cập nhật trạng thái máy trạng thái nội bộ và gửi gói tin đồng bộ về client UI."""
+        self.state = SessionState(state)
+        await self._send_json(
+            {"type": "state", "state": ui_state if ui_state is not None else state}
+        )
 
     async def cancel_turn(self) -> None:
+        """Hủy bỏ lượt thoại đang chạy (ngắt bot khi người dùng chen ngang)."""
         self._reset_turn_audio()
-        if self._start_task and not self._start_task.done():
-            self._start_task.cancel()
-        self._start_task = None
-        task = self.turn
-        if task and not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        self.turn = None
+        await self._cancel_running_tasks()
         await self._abort_stt()
-        await self.send_json({"type": "stop_audio"})
-        await self.set_state("idle")
+        await self._send_json({"type": "stop_audio"})
+        await self.set_state(SessionState.IDLE)
 
     async def close(self) -> None:
+        """Dọn dẹp và giải phóng toàn bộ tác vụ nền khi đóng kết nối WebSocket."""
         self._reset_turn_audio()
-        if self._start_task and not self._start_task.done():
-            self._start_task.cancel()
-            await asyncio.gather(self._start_task, return_exceptions=True)
-        if self.turn and not self.turn.done():
-            self.turn.cancel()
-            await asyncio.gather(self.turn, return_exceptions=True)
+        await self._cancel_running_tasks()
         await self._abort_stt()
 
     async def on_audio(self, data: bytes) -> None:
+        """Tiếp nhận dữ liệu PCM thô từ trình duyệt và chuyển tiếp đến STT/VAD."""
         if not data:
             return
 
         if len(data) > FRAME_BYTES * 2:
-            await self.send_json({
-                "type": "error",
-                "message": "Khung âm thanh không hợp lệ (vượt quá kích thước tối đa)."
-            })
+            await self._send_json(
+                {
+                    "type": "error",
+                    "message": "Khung âm thanh không hợp lệ (vượt quá kích thước tối đa).",
+                }
+            )
             return
 
         frame = data[: len(data) // 2 * 2]
         if not frame:
             return
 
-        if self.state == "starting":
+        if self.state == SessionState.STARTING:
             self._pending_audio.append(frame)
             return
 
-        if self.state != "listening" or self.stt is None:
+        if not self._is_turn_active() or self.stt is None:
             return
 
+        await self._feed_frame(frame)
+
+    async def _send_and_process_frame(self, frame: bytes) -> bool:
+        """Chuyển tiếp khung âm thanh tới STT và cập nhật VAD."""
+        if not self._is_turn_active() or self.stt is None:
+            return False
         try:
             await self.stt.send_frame(frame)
         except Exception:
-            await self._abort_stt()
-            await self.send_json({"type": "error", "message": "Mất kết nối dịch vụ nhận dạng giọng nói."})
-            await self.set_state("idle")
-            return
+            await self._handle_session_error("Mất kết nối dịch vụ nhận dạng giọng nói.")
+            return False
 
+        await self._process_frame_vad(frame)
+        return True
+
+    async def _feed_frame(self, frame: bytes) -> None:
+        """Chuyển tiếp khung âm thanh trong critical section có khóa đồng bộ thứ tự."""
         async with self._vad_lock:
-            await self._process_frame_vad(frame, self.turn_id)
+            await self._send_and_process_frame(frame)
 
-    async def _process_frame_vad(self, frame: bytes, turn_id: int | None = None) -> None:
-        current_turn = self.turn_id if turn_id is None else turn_id
-        if not self.auto_turn:
-            return
-
-        self.audio_buf.extend(frame)
-        if len(self.audio_buf) > 256000:
-            del self.audio_buf[:-256000]
-
+    async def _compute_is_speaking(self, frame: bytes, current_turn: int) -> bool | None:
+        """Đo năng lượng RMS và tính xác suất giọng người qua Silero VAD."""
         samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(samples**2)))
 
-        if self.vad.model.is_available:
-            speech_prob = await asyncio.to_thread(self.vad.speech_prob, samples)
-            if current_turn != self.turn_id or self.state != "listening":
-                return
-            is_speaking = (speech_prob >= 0.50 and rms >= 0.003) if not self.has_speech else (speech_prob >= 0.30 and rms >= 0.002)
-        else:
-            is_speaking = rms >= 0.003
+        if not self.vad.model.is_available:
+            return rms >= VAD_RMS_THRESHOLD_DEFAULT
 
-        now = time.monotonic()
-        self.last_frame_time = now
+        speech_prob = await asyncio.to_thread(self.vad.speech_prob, samples)
+        if not self._is_turn_active(current_turn):
+            return None
 
+        # Cơ chế hysteresis: khi đã có tiếng nói thì hạ thấp ngưỡng để không bị đứt đoạn âm tiết nhẹ
+        prob_threshold = VAD_SPEECH_PROB_CONTINUED if self.has_speech else VAD_SPEECH_PROB_INITIAL
+        rms_threshold = (
+            VAD_RMS_THRESHOLD_CONTINUED if self.has_speech else VAD_RMS_THRESHOLD_INITIAL
+        )
+        return speech_prob >= prob_threshold and rms >= rms_threshold
+
+    def _update_vad_counters(self, is_speaking: bool, now: float) -> None:
+        """Cập nhật bộ đếm frame tiếng nói / im lặng dựa trên kết quả phát hiện."""
         if is_speaking:
             self.has_speech = True
             self.speech_frames += 1
             self.silence_frames = 0
             self.last_speech_time = now
             self._last_detect_frame = 0
-        else:
-            if self.has_speech:
-                self.silence_frames += 1
+        elif self.has_speech:
+            self.silence_frames += 1
 
+    def _maybe_schedule_detect(self) -> None:
+        """Kiểm tra điều kiện kích hoạt tác vụ Smart-Turn ngắt câu tự động."""
         silence_passed = self.silence_frames - self._last_detect_frame
-        if (
+        can_trigger = (
             self.has_speech
             and self.speech_frames >= MIN_SPEECH_FRAMES
             and self.silence_frames >= INITIAL_SILENCE_FRAMES
             and silence_passed >= SMART_TURN_CHECK_INTERVAL_FRAMES
             and not self._detecting
-        ):
+        )
+        if can_trigger:
             self._detecting = True
             self._last_detect_frame = self.silence_frames
             self._detect_task = asyncio.create_task(self._check_turn_endpoint(self.turn_id))
 
+    async def _process_frame_vad(self, frame: bytes) -> None:
+        """Xử lý từng khung âm thanh qua bộ phân loại VAD và bộ đệm trượt."""
+        if not self.auto_turn:
+            return
+
+        self.audio_buf.extend(frame)
+        if len(self.audio_buf) > AUDIO_BUF_MAX_BYTES:
+            del self.audio_buf[:-AUDIO_BUF_MAX_BYTES]
+
+        is_speaking = await self._compute_is_speaking(frame, self.turn_id)
+        if is_speaking is None:
+            return
+
+        now = time.monotonic()
+        self._update_vad_counters(is_speaking, now)
+        self._maybe_schedule_detect()
+
+    async def _handle_filler_timeout(self, turn_id: int) -> bool:
+        """Xử lý trường hợp người dùng chỉ nói từ đệm (ừ, à, ờ...) rồi im lặng quá 2 giây."""
+        if self.silence_frames >= FILLER_TIMEOUT_FRAMES and self._is_turn_active(turn_id):
+            await self._send_json(
+                {
+                    "type": "auto_stop",
+                    "probability": 0.0,
+                    "reason": "filler_timeout",
+                }
+            )
+            await self.stop_turn()
+            return True
+        return False
+
+    def _can_check_endpoint(self, turn_id: int) -> bool:
+        """Kiểm tra điều kiện tiên quyết về độ dài audio và thời gian nói trước khi chạy Smart-Turn."""
+        if not self._is_turn_active(turn_id):
+            return False
+        return (
+            len(self.audio_buf) >= MIN_AUDIO_BUFFER_BYTES
+            and self.speech_frames >= MIN_SPEECH_FRAMES
+        )
+
+    async def _predict_smart_turn_prob(self) -> float:
+        """Chạy dự đoán mô hình Smart-Turn trên luồng worker riêng."""
+        if not self.detector.is_available:
+            return 0.0
+        audio_f32 = np.frombuffer(self.audio_buf, dtype=np.int16).astype(np.float32) / 32768.0
+        res = await asyncio.to_thread(self.detector.predict, audio_f32)
+        return float(res.get("probability", 0.0))
+
     async def _check_turn_endpoint(self, turn_id: int) -> None:
+        """Định kỳ đánh giá xem người dùng đã hoàn thành câu nói hay chưa để chuyển lượt bot."""
         try:
-            if turn_id != self.turn_id or self.state != "listening" or not self.stt:
+            if not self._can_check_endpoint(turn_id):
                 return
 
-            if len(self.audio_buf) < 12000 or self.speech_frames < MIN_SPEECH_FRAMES:
+            is_only_filler_text = (
+                is_only_filler(self.last_partial_text) if self.last_partial_text else False
+            )
+            if is_only_filler_text:
+                await self._handle_filler_timeout(turn_id)
+                return
+
+            prob = await self._predict_smart_turn_prob()
+            if not self._is_turn_active(turn_id):
                 return
 
             wall_silence_s = time.monotonic() - self.last_speech_time
             norm_partial = normalize_text(self.last_partial_text) if self.last_partial_text else ""
-            only_filler = is_only_filler(self.last_partial_text) if self.last_partial_text else False
+            is_hesitating_or_reading = bool(
+                norm_partial and (is_reading_sequence(norm_partial) or is_hesitating(norm_partial))
+            )
 
-            if only_filler:
-                if self.silence_frames >= FILLER_TIMEOUT_FRAMES and turn_id == self.turn_id:
-                    await self.send_json({
+            reason = decide_turn_end(
+                prob,
+                self.silence_frames,
+                wall_silence_s,
+                is_hesitating_or_reading=is_hesitating_or_reading,
+            )
+
+            if reason and self._is_turn_active(turn_id):
+                await self._send_json(
+                    {
                         "type": "auto_stop",
-                        "probability": 0.0,
-                        "reason": "filler_timeout",
-                    })
-                    await self.stop_turn()
-                return
-
-            should_stop = False
-            reason = ""
-            prob = 0.0
-
-            if self.detector.is_available:
-                audio_f32 = np.frombuffer(self.audio_buf, dtype=np.int16).astype(np.float32) / 32768.0
-                res = await asyncio.to_thread(self.detector.predict, audio_f32, 0.70)
-
-                if turn_id != self.turn_id or self.state != "listening" or not self.stt:
-                    return
-
-                prob = res.get("probability", 0.0)
-                reading_seq = is_reading_sequence(norm_partial) if norm_partial else False
-                hesitating = is_hesitating(norm_partial) if norm_partial else False
-
-                if reading_seq or hesitating:
-                    if prob >= 0.65 and self.silence_frames >= SMART_TURN_UNCERTAIN_FRAMES:
-                        should_stop = True
-                        reason = "smart_turn_done"
-                else:
-                    if prob >= 0.65 and self.silence_frames >= SMART_TURN_CONFIDENT_FRAMES:
-                        should_stop = True
-                        reason = "smart_turn_done"
-                    elif prob >= 0.50 and self.silence_frames >= SMART_TURN_UNCERTAIN_FRAMES:
-                        should_stop = True
-                        reason = "smart_turn_high"
-
-            if not should_stop and (self.silence_frames >= SILENCE_TIMEOUT_FRAMES or wall_silence_s >= 2.5):
-                should_stop = True
-                reason = "silence_timeout"
-
-            if should_stop and turn_id == self.turn_id and self.state == "listening" and self.stt is not None:
-                await self.send_json({
-                    "type": "auto_stop",
-                    "probability": round(prob, 3),
-                    "reason": reason,
-                })
+                        "probability": round(prob, 3),
+                        "reason": reason,
+                    }
+                )
                 await self.stop_turn()
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            print(f"[Smart Turn Error] {exc}")
+            logger.exception("[Smart Turn Error] %s", exc)
         finally:
             if turn_id == self.turn_id:
                 self._detecting = False
 
     async def start_turn(self) -> None:
-        if self.state in ("thinking", "speaking"):
-            await self.send_json({"type": "busy"})
+        """Bắt đầu một lượt nhận dạng giọng nói mới từ người dùng."""
+        if self.state in (SessionState.THINKING, SessionState.SPEAKING):
+            await self._send_json({"type": "busy"})
             return
 
         await self._abort_stt()
-        self._reset_turn_audio()
-        await self.set_state("starting", ui_state="listening")
+        async with self._vad_lock:
+            self._reset_turn_audio()
+        await self.set_state(SessionState.STARTING, ui_state=SessionState.LISTENING)
 
         stt = SttSession(STT_URL, self._on_stt_event)
+        self.stt = stt
         try:
             await stt.open()
         except SttError as exc:
-            self._pending_audio.clear()
-            await self.set_state("idle")
-            await self.send_json({"type": "error", "message": friendly_stt_error(exc.payload)})
+            self.stt = None
+            await self._handle_session_error(friendly_stt_error(exc.payload))
             return
         except Exception:
-            self._pending_audio.clear()
-            await self.set_state("idle")
-            await self.send_json({"type": "error", "message": "Không kết nối được dịch vụ nhận dạng giọng nói."})
+            self.stt = None
+            await self._handle_session_error("Không kết nối được dịch vụ nhận dạng giọng nói.")
             return
 
-        self.stt = stt
-        self.state = "listening"
+        self.state = SessionState.LISTENING
 
         if self._pending_audio:
-            pending_frames = list(self._pending_audio)
-            self._pending_audio.clear()
-            try:
-                for pending_frame in pending_frames:
-                    await self.stt.send_frame(pending_frame)
-                    async with self._vad_lock:
-                        await self._process_frame_vad(pending_frame, self.turn_id)
-            except Exception:
-                await self._abort_stt()
-                await self.set_state("idle")
-                await self.send_json({"type": "error", "message": "Lỗi kết nối khi gửi âm thanh đến dịch vụ STT."})
-                return
+            async with self._vad_lock:
+                while self._pending_audio:
+                    pending_frame = self._pending_audio.popleft()
+                    if not await self._send_and_process_frame(pending_frame):
+                        break
 
     async def stop_turn(self) -> None:
+        """Dừng nhận dạng và chuyển trạng thái sang suy nghĩ / tổng hợp câu trả lời."""
         if self._start_task and not self._start_task.done():
             await asyncio.gather(self._start_task, return_exceptions=True)
-        if self.state != "listening" or self.stt is None:
+        if not self._is_turn_active() or self.stt is None:
             return
 
+        stt = self.stt
+        self.stt = None
         fallback_text = self.last_partial_text.strip()
-        stt, self.stt = self.stt, None
         self._reset_turn_audio()
-        await self.set_state("thinking")
-        self.turn = asyncio.create_task(self._turn(stt, fallback_text))
+        await self.set_state(SessionState.THINKING)
+        self.turn_task = asyncio.create_task(self._turn(stt, fallback_text))
+
+    async def _finalize_stt_transcript(self, stt: SttSession, fallback_text: str) -> str:
+        """Đợi kết quả STT cuối cùng và chuẩn hóa văn bản trước khi đưa vào LLM."""
+        try:
+            raw_text = (await stt.finish()).strip()
+            if not raw_text and fallback_text:
+                raw_text = fallback_text
+            return normalize_speech_input(raw_text)
+        except (SttError, Exception) as exc:
+            if fallback_text:
+                return normalize_speech_input(fallback_text)
+            err_msg = (
+                friendly_stt_error(exc.payload)
+                if isinstance(exc, SttError)
+                else "Nhận dạng giọng nói thất bại, hãy thử lại."
+            )
+            await self._send_json({"type": "error", "message": err_msg})
+            return ""
+
+    async def _execute_dialogue_pipeline(self, text: str) -> None:
+        """Chạy luồng sinh câu trả lời LLM và đồng thời tổng hợp giọng nói phát về client."""
+        reply = await run_turn(
+            text,
+            history=self.history,
+            llm_url=LLM_URL,
+            tts_url=TTS_URL,
+            voice=VOICE,
+            client=self.http,
+            send_raw=self._send_raw,
+            send_audio=self._send_audio,
+            metrics=self.metrics,
+        )
+        self.history += [
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": reply},
+        ]
+        if len(self.history) > MAX_HISTORY:
+            self.history = self.history[-MAX_HISTORY:]
+
+        await self._send_json(
+            {
+                "type": "metrics",
+                **{k: round(v, 2) for k, v in self.metrics.items()},
+            }
+        )
 
     async def _turn(self, stt: SttSession, fallback_text: str = "") -> None:
+        """Điều phối một lượt thoại hoàn chỉnh: kết thúc STT -> xử lý LLM -> phát TTS."""
         t_stop = time.perf_counter()
         try:
-            try:
-                raw_text = (await stt.finish()).strip()
-                if not raw_text and fallback_text:
-                    raw_text = fallback_text
-                text = normalize_speech_input(raw_text)
-            except SttError as exc:
-                if fallback_text:
-                    text = normalize_speech_input(fallback_text)
-                else:
-                    await self.send_json({"type": "error", "message": friendly_stt_error(exc.payload)})
-                    await self.send_json({"type": "bot_done"})
-                    return
-            except Exception:
-                if fallback_text:
-                    text = normalize_speech_input(fallback_text)
-                else:
-                    await self.send_json({"type": "error", "message": "Nhận dạng giọng nói thất bại, hãy thử lại."})
-                    await self.send_json({"type": "bot_done"})
-                    return
-
-            await self.send_json({
-                "type": "final",
-                "text": text,
-                "stt_final_s": round(time.perf_counter() - t_stop, 2),
-            })
+            text = await self._finalize_stt_transcript(stt, fallback_text)
+            await self._send_json(
+                {
+                    "type": "final",
+                    "text": text,
+                    "stt_final_s": round(time.perf_counter() - t_stop, 2),
+                }
+            )
             if not text or is_only_filler(text):
                 msg = (
                     "Tôi đang lắng nghe, bạn hãy nói rõ câu hỏi hoặc yêu cầu nhé."
                     if text
                     else "Không nghe rõ, hãy nói lại."
                 )
-                await self.send_json({"type": "info", "message": msg})
-                await self.send_json({"type": "bot_done"})
+                await self._send_json({"type": "info", "message": msg})
+                await self._send_json({"type": "bot_done"})
                 return
 
-            self.metrics.clear()
-            reply = await run_turn(
-                text,
-                history=self.history[-MAX_HISTORY:],
-                llm_url=LLM_URL,
-                tts_url=TTS_URL,
-                voice=VOICE,
-                client=self.http,
-                send_raw=self._send_raw,
-                send_audio=self._send_audio,
-                metrics=self.metrics,
-            )
-            self.history += [
-                {"role": "user", "content": text},
-                {"role": "assistant", "content": reply},
-            ]
-            if len(self.history) > MAX_HISTORY:
-                self.history = self.history[-MAX_HISTORY:]
-            await self.send_json({
-                "type": "metrics",
-                **{k: round(v, 2) for k, v in self.metrics.items()},
-            })
-            await self.send_json({"type": "bot_done"})
+            await self._execute_dialogue_pipeline(text)
+            await self._send_json({"type": "bot_done"})
         except asyncio.CancelledError:
             await stt.abort()
             raise
         except Exception as exc:
-            await self.send_json({"type": "error", "message": f"Lỗi khi tạo câu trả lời: {type(exc).__name__}"})
-            await self.send_json({"type": "bot_done"})
+            await self._send_json(
+                {"type": "error", "message": f"Lỗi khi tạo câu trả lời: {type(exc).__name__}"}
+            )
+            await self._send_json({"type": "bot_done"})
         finally:
-            if self.turn is asyncio.current_task():
-                self.turn = None
-            await self.set_state("idle")
+            if self.turn_task is asyncio.current_task():
+                self.turn_task = None
+            await self.set_state(SessionState.IDLE)
 
-    async def send_json(self, obj: dict[str, Any]) -> None:
+    async def _send_ws(self, data: dict[str, Any] | bytes) -> None:
+        """Gửi dữ liệu (JSON hoặc PCM audio) an toàn qua WebSocket có khóa phân luồng."""
         async with self._send_lock:
-            try:
-                await self.ws.send_json(obj)
-            except (WebSocketDisconnect, RuntimeError):
-                pass
+            with suppress(WebSocketDisconnect, RuntimeError):
+                if isinstance(data, bytes):
+                    await self.ws.send_bytes(data)
+                else:
+                    await self.ws.send_json(data)
 
-    async def send_bytes(self, data: bytes) -> None:
-        async with self._send_lock:
-            try:
-                await self.ws.send_bytes(data)
-            except (WebSocketDisconnect, RuntimeError):
-                pass
+    async def _send_json(self, obj: dict[str, Any]) -> None:
+        await self._send_ws(obj)
+
+    async def _send_bytes(self, data: bytes) -> None:
+        await self._send_ws(data)
+
+    send_json = _send_json
+    send_bytes = _send_bytes
 
     async def on_control(self, msg: dict[str, Any]) -> None:
-        t = msg.get("type")
-        if t == "config":
+        """Xử lý các thông điệp điều khiển JSON từ client."""
+        msg_type = msg.get("type")
+        if msg_type == "config":
             if "auto_turn" in msg:
                 self.auto_turn = bool(msg["auto_turn"])
-        elif t == "start_turn":
+        elif msg_type == "start_turn":
             if self._start_task and not self._start_task.done():
                 return
             self._start_task = asyncio.create_task(self.start_turn())
-        elif t == "stop_turn":
+        elif msg_type == "stop_turn":
             await self.stop_turn()
-        elif t == "interrupt":
+        elif msg_type == "interrupt":
             await self.cancel_turn()
-        elif t == "reset":
+        elif msg_type == "reset":
             await self.cancel_turn()
             self.history.clear()
 
     async def _send_raw(self, text: str) -> None:
-        await self.send_json({"type": "bot_raw", "text": text})
+        await self._send_json({"type": "bot_raw", "text": text})
 
     async def _send_audio(self, pcm: bytes) -> None:
-        if self.state == "thinking":
-            await self.send_json({"type": "tts_format", "sample_rate": 48000, "channels": 1})
-            await self.set_state("speaking")
-        await self.send_bytes(pcm)
+        """Gửi âm thanh TTS PCM16 về client kèm gói tin định dạng đầu tiên."""
+        if self.state == SessionState.THINKING:
+            await self._send_json(
+                {"type": "tts_format", "sample_rate": TTS_SAMPLE_RATE, "channels": 1}
+            )
+            await self.set_state(SessionState.SPEAKING)
+        await self._send_bytes(pcm)
 
     async def _on_stt_event(self, kind: str, payload: Any) -> None:
+        """Callback nhận kết quả tạm thời (partial) hoặc lỗi từ STT session."""
         if kind == "partial":
             new_text = str(payload or "").strip()
             if new_text:
                 self.last_partial_text = new_text
                 self.has_speech = True
                 self.speech_frames = max(self.speech_frames, MIN_SPEECH_FRAMES)
-            await self.send_json({"type": "partial", "text": payload})
+            await self._send_json({"type": "partial", "text": payload})
         elif kind == "error":
-            await self.send_json({"type": "error", "message": friendly_stt_error(payload)})
-            if self.state in ("listening", "starting"):
-                await self._abort_stt()
-                await self.set_state("idle")
+            await self._handle_session_error(friendly_stt_error(payload))
 
     async def _abort_stt(self) -> None:
+        """Ngắt kết nối phiên STT ngay lập tức nếu đang hoạt động."""
         if self.stt:
             stt, self.stt = self.stt, None
             await stt.abort()
 
+
 @app.websocket("/ws/voice")
 async def ws_voice(ws: WebSocket) -> None:
+    """Endpoint WebSocket chính kết nối với trình duyệt người dùng."""
     await ws.accept()
-    sess = VoiceSession(
+    session = VoiceSession(
         ws,
         app.state.http,
         detector=getattr(app.state, "detector", None),
@@ -535,15 +659,23 @@ async def ws_voice(ws: WebSocket) -> None:
             if msg["type"] == "websocket.disconnect":
                 break
             if msg.get("bytes") is not None:
-                await sess.on_audio(msg["bytes"])
+                await session.on_audio(msg["bytes"])
             elif msg.get("text") is not None:
                 try:
-                    await sess.on_control(json.loads(msg["text"]))
+                    payload = json.loads(msg["text"])
                 except json.JSONDecodeError as exc:
-                    print(f"[WebSocket] Lỗi JSON: {exc}")
+                    logger.warning("[WebSocket] Lỗi JSON: %s", exc)
+                else:
+                    if isinstance(payload, dict):
+                        await session.on_control(payload)
+                    else:
+                        logger.warning(
+                            "[WebSocket] Gói tin không phải JSON object: %s",
+                            type(payload).__name__,
+                        )
     except WebSocketDisconnect:
         pass
     except Exception as exc:
-        print(f"[WebSocket Error] {type(exc).__name__}: {exc}")
+        logger.exception("[WebSocket Error] %s", exc)
     finally:
-        await sess.close()
+        await session.close()
