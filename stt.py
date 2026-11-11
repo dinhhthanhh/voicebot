@@ -219,11 +219,6 @@ ADDRESS_AND_NUM_SUFFIXES = (
 
 # Từ nối ngập ngừng tối giản (giao phần lớn phán đoán ngữ điệu cho Smart Turn)
 HESITATION_SUFFIXES = ("và", "hoặc", "nhưng", "mà", "thì", "vì", "là", "về")
-
-# Bí danh tương thích ngược
-DANGLING_SUFFIXES = HESITATION_SUFFIXES
-VALID_SHORT_UTTERANCES = SHORT_ANSWERS
-NUMBER_AND_ADDRESS_SUFFIXES = ADDRESS_AND_NUM_SUFFIXES
 # fmt: on
 
 _TENS = "|".join(TEN_WORDS)
@@ -250,7 +245,6 @@ PATTERNS = {
     "nghin": re.compile(r"\b(\d{2})\s*(?:nghìn|ngàn)\b", re.IGNORECASE),
     "muoi": re.compile(r"\bmười\b", re.IGNORECASE),
 }
-TextRules = PATTERNS
 
 
 def normalize_compound_numbers(text: str) -> str:
