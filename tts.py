@@ -115,18 +115,20 @@ async def stream_reply(
                 yield piece
 
 
+# fmt: off
 # Biểu thức chính quy làm sạch ký hiệu trước khi đưa vào TTS
-EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]")
-LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
-PLACEHOLDER_RE = re.compile(r"\[[^\]]*\]")
-URL_RE = re.compile(r"https?://[^\s<>()]+")
-MARK_RE = re.compile(r"(\*\*|__|\*|`|~~)")
-PREFIX_RE = re.compile(r"^(#{1,6}\s+|[-*+•]\s+|\d+[.)]\s+|>\s*)")
-RULE_RE = re.compile(r"^[-*_=\s]{3,}$")
-SENT_RE = re.compile(r"(?<=[.!?…])(?<!\.\.)\s+")
-MATH_RE = re.compile(r"\$\$.+?\$\$|\$[^$\n]+\$")
-WORD_CHAR_RE = re.compile(r"\w")
+EMOJI_RE          = re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]")
+LINK_RE           = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+PLACEHOLDER_RE    = re.compile(r"\[[^\]]*\]")
+URL_RE            = re.compile(r"https?://[^\s<>()]+")
+MARK_RE           = re.compile(r"(\*\*|__|\*|`|~~)")
+PREFIX_RE         = re.compile(r"^(#{1,6}\s+|[-*+•]\s+|\d+[.)]\s+|>\s*)")
+RULE_RE           = re.compile(r"^[-*_=\s]{3,}$")
+SENT_RE           = re.compile(r"(?<=[.!?…])(?<!\.\.)\s+")
+MATH_RE           = re.compile(r"\$\$.+?\$\$|\$[^$\n]+\$")
+WORD_CHAR_RE      = re.compile(r"\w")
 SENT_END_PUNCT_RE = re.compile(r"[.!?…:;,]$")
+# fmt: on
 
 REMAINDER_NOTE = "Phần còn lại đã được hiển thị trên màn hình."
 
@@ -143,12 +145,19 @@ class LineKind(StrEnum):
 
 def clean_inline(text: str) -> str:
     """Làm sạch ký hiệu Markdown, emoji, URL và công thức toán học trong một câu."""
-    s = MATH_RE.sub("công thức trên màn hình", text)
-    s = LINK_RE.sub(r"\1", s)
-    s = PLACEHOLDER_RE.sub("", s)
-    s = URL_RE.sub("đường dẫn trên màn hình", s)
+    if not text:
+        return ""
+    s = text
+    if "$" in s:
+        s = MATH_RE.sub("công thức trên màn hình", s)
+    if "[" in s:
+        s = LINK_RE.sub(r"\1", s)
+        s = PLACEHOLDER_RE.sub("", s)
+    if "http" in s:
+        s = URL_RE.sub("đường dẫn trên màn hình", s)
+    if any(c in s for c in ("*", "_", "`", "~")):
+        s = MARK_RE.sub("", s)
     s = EMOJI_RE.sub("", s)
-    s = MARK_RE.sub("", s)
     return " ".join(s.split())
 
 
@@ -304,71 +313,46 @@ DEFAULT_PARAMS = {
 
 MAX_TTS_CHARS = 450
 
+# fmt: off
 DIGITS_VI = {
-    "0": "không",
-    "1": "một",
-    "2": "hai",
-    "3": "ba",
-    "4": "bốn",
-    "5": "năm",
-    "6": "sáu",
-    "7": "bảy",
-    "8": "tám",
-    "9": "chín",
-}
-LETTERS_VI = {
-    "A": "a",
-    "B": "bê",
-    "C": "xê",
-    "D": "đê",
-    "E": "e",
-    "F": "ép",
-    "G": "gờ",
-    "H": "hát",
-    "I": "i",
-    "J": "giây",
-    "K": "ca",
-    "L": "lờ",
-    "M": "mờ",
-    "N": "nờ",
-    "O": "o",
-    "P": "pê",
-    "Q": "quy",
-    "R": "rờ",
-    "S": "ét",
-    "T": "tê",
-    "U": "u",
-    "V": "vê",
-    "W": "vê kép",
-    "X": "ích",
-    "Y": "y",
-    "Z": "dét",
-}
-UNITS_VI = {
-    "kg": "ki lô gam",
-    "g": "gam",
-    "km": "ki lô mét",
-    "m": "mét",
-    "cm": "xen ti mét",
-    "mm": "mi li mét",
-    "đ": "đồng",
-    "đồng": "đồng",
-    "vnd": "đồng",
-    "vnđ": "đồng",
-    "k": "nghìn",
-    "%": "phần trăm",
+    "0": "không", "1": "một", "2": "hai", "3": "ba", "4": "bốn",
+    "5": "năm", "6": "sáu", "7": "bảy", "8": "tám", "9": "chín",
 }
 
-PHONE_PAREN_RE = re.compile(r"\(0(\d{2,3})\)[\s.-]*(\d{3,4})[\s.-]*(\d{3,4})\b")
-PHONE_INTL_RE = re.compile(r"(?:\+84|(?<=\s)84)[\s.-]*(\d{2,3})[\s.-]*(\d{3,4})[\s.-]*(\d{3,4})\b")
-PHONE_RE = re.compile(r"\b(0\d{2,3})[\s.-]+(\d{3,4})[\s.-]+(\d{3,4})\b")
-DECIMAL_SEP_RE = re.compile(r"[.,]")
-UNIT_TOKEN_RE = re.compile(r"^([0-9][0-9.,/]*)([a-zA-ZđĐ%]+|đồng)$", re.IGNORECASE)
-HAS_ALPHA_RE = re.compile(r"[A-Za-z]")
-HAS_DIGIT_RE = re.compile(r"\d")
-GROUPED_NUMBER_RE = re.compile(r"[1-9]\d{0,2}(?:[.,]\d{3})+")
-DECIMAL_NUMBER_RE = re.compile(r"\d+[.,]\d+")
-TTS_TOKEN_RE = re.compile(r"\b[A-Za-z0-9.,/]+(?:%|[đĐ](?:ồng)?|vnd|vnđ)?", re.IGNORECASE)
+LETTERS_VI = {
+    "A": "a", "B": "bê", "C": "xê", "D": "đê", "E": "e", "F": "ép",
+    "G": "gờ", "H": "hát", "I": "i", "J": "giây", "K": "ca", "L": "lờ",
+    "M": "mờ", "N": "nờ", "O": "o", "P": "pê", "Q": "quy", "R": "rờ",
+    "S": "ét", "T": "tê", "U": "u", "V": "vê", "W": "vê kép", "X": "ích",
+    "Y": "y", "Z": "dét",
+}
+
+UNITS_VI = {
+    "kg": "ki lô gam", "g": "gam", "km": "ki lô mét", "m": "mét",
+    "cm": "xen ti mét", "mm": "mi li mét", "m2": "mét vuông", "m²": "mét vuông",
+    "m3": "mét khối", "m³": "mét khối", "ha": "héc ta", "đ": "đồng",
+    "đồng": "đồng", "vnd": "đồng", "vnđ": "đồng", "k": "nghìn", "%": "phần trăm",
+}
+
+_UNIT_PAT = "|".join(re.escape(u) for u in sorted(UNITS_VI.keys(), key=len, reverse=True))
+
+# Biểu thức chính quy chuẩn hóa số điện thoại, ngày tháng, tiền tệ và đơn vị đo lường
+PHONE_PAREN_RE     = re.compile(r"\(0(\d{2,3})\)[\s.-]*(\d{3,4})[\s.-]*(\d{3,4})\b")
+PHONE_INTL_RE      = re.compile(r"(?:\+84|(?<=\s)84)[\s.-]*(\d{2,3})[\s.-]*(\d{3,4})[\s.-]*(\d{3,4})\b")
+PHONE_RE           = re.compile(r"\b(0\d{2,3})[\s.-]+(\d{3,4})[\s.-]+(\d{3,4})\b")
+DATE_DMY_RE        = re.compile(r"(?:\bngày\s+)?(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})\b", re.IGNORECASE)
+MONTH_YEAR_RE      = re.compile(r"\btháng\s+(\d{1,2})[/.-](\d{4})\b", re.IGNORECASE)
+DATE_DM_RE         = re.compile(r"\bngày\s+(\d{1,2})[/.-](\d{1,2})\b", re.IGNORECASE)
+DECIMAL_SEP_RE     = re.compile(r"[.,]")
+UNIT_TOKEN_RE      = re.compile(r"^([0-9][0-9.,/]*)([a-zA-ZđĐ%²³]+[23]?|đồng)$", re.IGNORECASE)
+HAS_ALPHA_RE       = re.compile(r"[A-Za-z]")
+HAS_DIGIT_RE       = re.compile(r"\d")
+GROUPED_NUMBER_RE  = re.compile(r"[1-9]\d{0,2}(?:[.,]\d{3})+")
+DECIMAL_NUMBER_RE  = re.compile(r"\d+[.,]\d+")
+TTS_TOKEN_RE       = re.compile(r"\b[A-Za-z0-9.,/²]+(?:%|[đĐ](?:ồng)?|vnd|vnđ)?", re.IGNORECASE)
+SPACE_GROUPED_RE   = re.compile(rf"\b(\d{{1,3}}(?:\s\d{{3}})+)(?=\s*(?:{_UNIT_PAT})\b)", re.IGNORECASE)
+UNIT_WITH_SPACE_RE = re.compile(rf"\b([0-9][0-9.,]*)\s+({_UNIT_PAT})(?=[.,;!?]|\s|$)", re.IGNORECASE)
+# fmt: on
 
 
 def _read_mixed_alphanumeric(tok: str) -> str:
@@ -433,11 +417,23 @@ def _replace_token_for_tts(match: re.Match) -> str:
     return match.group(0)
 
 
+def _normalize_dates(text: str) -> str:
+    """Chuẩn hóa các định dạng ngày tháng (DD/MM/YYYY, tháng MM/YYYY, ngày DD/MM) thành lời nói tự nhiên."""
+    text = DATE_DMY_RE.sub(
+        lambda m: f"ngày {int(m.group(1))} tháng {int(m.group(2))} năm {m.group(3)}", text
+    )
+    text = MONTH_YEAR_RE.sub(lambda m: f"tháng {int(m.group(1))} năm {m.group(2)}", text)
+    return DATE_DM_RE.sub(lambda m: f"ngày {int(m.group(1))} tháng {int(m.group(2))}", text)
+
+
 def normalize_text_for_tts(text: str) -> str:
-    """Chuẩn hóa số điện thoại, đơn vị, tiền tệ và số liệu trong văn bản trước khi đọc thành tiếng."""
+    """Chuẩn hóa ngày tháng, số điện thoại, đơn vị, tiền tệ và số liệu trong văn bản trước khi đọc thành tiếng."""
+    text = _normalize_dates(text)
     text = PHONE_PAREN_RE.sub(r"0\1\2\3", text)
     text = PHONE_INTL_RE.sub(r"0\1\2\3", text)
     text = PHONE_RE.sub(r"\1\2\3", text)
+    text = SPACE_GROUPED_RE.sub(lambda m: m.group(1).replace(" ", ""), text)
+    text = UNIT_WITH_SPACE_RE.sub(r"\1\2", text)
     return TTS_TOKEN_RE.sub(_replace_token_for_tts, text)
 
 

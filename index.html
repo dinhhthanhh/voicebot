@@ -277,44 +277,67 @@
         return out;
       }
 
+      // Xử lý stream microphone (resample 16kHz -> đệm 1600 mẫu -> gửi WebSocket)
+      function onMic(e) {
+        if (!recording || !isWsOpen()) return;
+        if (isBotBusy()) return;
+
+        const inputData = e.inputBuffer.getChannelData(0);
+        const resampled = resampleChunk(inputData, ctx.sampleRate, TARGET_SR);
+        let offset = 0;
+        while (offset < resampled.length) {
+          const needed = FRAME_SAMPLES - frameFill;
+          const toCopy = Math.min(needed, resampled.length - offset);
+          frameBuf.set(resampled.subarray(offset, offset + toCopy), frameFill);
+          frameFill += toCopy;
+          offset += toCopy;
+          if (frameFill === FRAME_SAMPLES) {
+            ws.send(toPcm16(frameBuf));
+            frameFill = 0;
+          }
+        }
+      }
+
       async function ensureAudio() {
         if (!ctx) {
           ctx = new (window.AudioContext || window.webkitAudioContext)();
         }
-        if (ctx.state === 'suspended') {
-          await ctx.resume();
-        }
+        if (ctx.state === 'suspended') await ctx.resume();
         if (!micStream) {
           micStream = await navigator.mediaDevices.getUserMedia({
             audio: {
               channelCount: 1,
-              sampleRate: { ideal: TARGET_SR },
               echoCancellation: true,
               noiseSuppression: true,
-              autoGainControl: true
-            }
+              autoGainControl: false
+            },
+            video: false
           });
           micSource = ctx.createMediaStreamSource(micStream);
-          processor = ctx.createScriptProcessor(4096, 1, 1);
-          processor.onaudioprocess = e => {
-            if (!recording || !isWsOpen()) return;
-            const inputData = e.inputBuffer.getChannelData(0);
-            const resampled = resampleChunk(inputData, ctx.sampleRate, TARGET_SR);
-            let offset = 0;
-            while (offset < resampled.length) {
-              const needed = FRAME_SAMPLES - frameFill;
-              const toCopy = Math.min(needed, resampled.length - offset);
-              frameBuf.set(resampled.subarray(offset, offset + toCopy), frameFill);
-              frameFill += toCopy;
-              offset += toCopy;
-              if (frameFill === FRAME_SAMPLES) {
-                ws.send(toPcm16(frameBuf));
-                frameFill = 0;
-              }
-            }
-          };
-          micSource.connect(processor);
-          processor.connect(ctx.destination);
+
+          // Lọc chống aliasing (Butterworth bậc 4, 7.2 kHz)
+          const lowpass1 = ctx.createBiquadFilter();
+          lowpass1.type = 'lowpass';
+          lowpass1.frequency.value = 7200;
+          lowpass1.Q.value = 0.5411961;
+
+          const lowpass2 = ctx.createBiquadFilter();
+          lowpass2.type = 'lowpass';
+          lowpass2.frequency.value = 7200;
+          lowpass2.Q.value = 1.306563;
+
+          micSource.connect(lowpass1);
+          lowpass1.connect(lowpass2);
+
+          processor = ctx.createScriptProcessor(2048, 1, 1);
+          processor.onaudioprocess = onMic;
+          lowpass2.connect(processor);
+
+          // Nối qua Gain(0) để kích hoạt processor mà không phát ra loa
+          const mute = ctx.createGain();
+          mute.gain.value = 0;
+          processor.connect(mute);
+          mute.connect(ctx.destination);
         }
       }
 
@@ -325,7 +348,7 @@
           ws.send(toPcm16(frameBuf.subarray(0, frameFill)));
         }
         resetAudioInputState();
-        sendJson({ type: 'stop' });
+        sendJson({ type: 'stop_turn' });
         refreshState();
       }
 
@@ -396,7 +419,9 @@
         if (m.reason === 'filler_timeout') {
           setErr('Tự động ngắt: Hết thời gian chờ từ đệm (im lặng >2.0s)');
         } else if (m.reason === 'silence_timeout') {
-          setErr('Tự động ngắt: Hết thời gian im lặng (>2.0s)');
+          setErr('Tự động ngắt: Hết thời gian im lặng');
+        } else if (m.reason === 'sequence_done') {
+          setErr(`Tự động ngắt khi đọc xong mã/số (Độ tin cậy: ${(m.probability * 100).toFixed(1)}%)`);
         } else {
           setErr(`Tự động ngắt khi dứt câu (Độ tin cậy: ${(m.probability * 100).toFixed(1)}%)`);
         }

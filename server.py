@@ -79,7 +79,8 @@ VAD_RMS_KEEP = 0.002
 # Ngưỡng xác suất Smart Turn
 PROB_HIGH = 0.65  # Tự tin dứt câu
 PROB_MID = 0.50  # Cần im lặng lâu hơn
-WALL_TIMEOUT_S = 2.5  # Hết thời gian chờ im lặng theo đồng hồ thực tế
+WALL_TIMEOUT_S = 2.5  # Hết thời gian chờ im lặng theo đồng hồ thực tế (câu thường)
+WALL_EXTENDED_TIMEOUT_S = 4.0  # Hết thời gian chờ tối đa khi ngập ngừng hoặc đọc số
 
 
 def ms_to_frames(ms: int) -> int:
@@ -93,8 +94,10 @@ MIN_SILENCE_FRAMES = ms_to_frames(300)
 CHECK_INTERVAL = ms_to_frames(200)
 FRAMES_FAST = ms_to_frames(700)
 FRAMES_SLOW = ms_to_frames(1400)
+FRAMES_SEQUENCE = ms_to_frames(1800)
 FILLER_TIMEOUT = ms_to_frames(2000)
 SILENCE_TIMEOUT = ms_to_frames(2000)
+TIMEOUT_EXTENDED = ms_to_frames(4000)
 
 
 def decide_turn_end(
@@ -102,23 +105,38 @@ def decide_turn_end(
     silence_frames: int,
     wall_silence_s: float,
     *,
-    is_hesitating_or_reading: bool,
+    is_reading: bool,
+    is_hesitating: bool,
 ) -> str | None:
     """Hàm thuần túy quyết định thời điểm dứt câu dựa trên xác suất và thời gian im lặng.
 
-    Trả về lý do dừng ('smart_turn_done', 'smart_turn_high', 'silence_timeout') hoặc None.
+    Trả về lý do dừng ('smart_turn_done', 'smart_turn_high', 'sequence_done', 'silence_timeout') hoặc None.
     """
-    if is_hesitating_or_reading:
+    is_pending = is_reading or is_hesitating
+    max_frames = TIMEOUT_EXTENDED if is_pending else SILENCE_TIMEOUT
+    max_wall_s = WALL_EXTENDED_TIMEOUT_S if is_pending else WALL_TIMEOUT_S
+
+    # 1. Timeout luôn được ưu tiên, không phụ thuộc Smart Turn, chống treo vĩnh viễn
+    if silence_frames >= max_frames or wall_silence_s >= max_wall_s:
+        return "silence_timeout"
+
+    # 2. Đang đọc số, mã vận đơn hoặc địa chỉ (cần khoảng lặng tự nhiên dài hơn)
+    if is_reading:
+        if prob >= PROB_HIGH and silence_frames >= FRAMES_SEQUENCE:
+            return "sequence_done"
+        return None
+
+    # 3. Đang ngập ngừng hoặc nói câu chưa hoàn chỉnh
+    if is_hesitating:
         if prob >= PROB_HIGH and silence_frames >= FRAMES_SLOW:
             return "smart_turn_done"
         return None
 
+    # 4. Câu nói bình thường
     if prob >= PROB_HIGH and silence_frames >= FRAMES_FAST:
         return "smart_turn_done"
     if prob >= PROB_MID and silence_frames >= FRAMES_SLOW:
         return "smart_turn_high"
-    if silence_frames >= SILENCE_TIMEOUT or wall_silence_s >= WALL_TIMEOUT_S:
-        return "silence_timeout"
 
     return None
 
@@ -150,16 +168,6 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(INDEX_HTML)
-
-
-def friendly_stt_error(payload: dict[str, Any]) -> str:
-    """Chuyển đổi mã lỗi kỹ thuật từ backend STT thành thông báo thân thiện với người dùng."""
-    code = payload.get("error_code", "")
-    if code in ("OVERLOADED", "QUEUE_TIMEOUT"):
-        return "Dịch vụ nhận dạng giọng nói đang quá tải, vui lòng thử lại sau ít giây."
-    if code == "AUDIO_TOO_LONG":
-        return "Câu nói quá dài (tối đa 600 giây)."
-    return f"Lỗi nhận dạng giọng nói ({code or payload.get('status_code', '?')})."
 
 
 class VoiceSession:
@@ -213,19 +221,24 @@ class VoiceSession:
         self.last_speech_time = time.monotonic()
 
     async def _cancel_tasks(self) -> None:
-        """Hủy và đợi hoàn tất các tác vụ nền đang chạy (_start_task, turn_task)."""
-        tasks = [t for t in (self._start_task, self.turn_task) if t and not t.done()]
+        """Hủy và đợi hoàn tất các tác vụ nền đang chạy (_start_task, turn_task, _detect_task)."""
+        current = asyncio.current_task()
+        tasks = [
+            t
+            for t in (self._start_task, self.turn_task, self._detect_task)
+            if t and t is not current and not t.done()
+        ]
         for t in tasks:
             t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._start_task = None
         self.turn_task = None
+        self._detect_task = None
 
     async def _handle_error(self, message: str) -> None:
         """Dọn dẹp tài nguyên phiên và thông báo lỗi về client."""
-        self._pending_audio.clear()
-        await self._abort_stt()
+        await self.close()
         await self.set_state(SessionState.IDLE)
         await self._send_ws({"type": "error", "message": message})
 
@@ -400,15 +413,15 @@ class VoiceSession:
 
             wall_silence_s = time.monotonic() - self.last_speech_time
             norm_partial = normalize_text(self.last_partial_text) if self.last_partial_text else ""
-            is_hesitating_or_reading = bool(
-                norm_partial and (is_reading_sequence(norm_partial) or is_hesitating(norm_partial))
-            )
+            is_reading = is_reading_sequence(norm_partial) if norm_partial else False
+            is_hesitating_flag = is_hesitating(norm_partial) if norm_partial else False
 
             reason = decide_turn_end(
                 prob,
                 self.silence_frames,
                 wall_silence_s,
-                is_hesitating_or_reading=is_hesitating_or_reading,
+                is_reading=is_reading,
+                is_hesitating=is_hesitating_flag,
             )
 
             if reason and self._is_turn_active(turn_id):
@@ -445,7 +458,7 @@ class VoiceSession:
             await stt.open()
         except SttError as exc:
             self.stt = None
-            await self._handle_error(friendly_stt_error(exc.payload))
+            await self._handle_error(exc.message)
             return
         except Exception:
             self.stt = None
@@ -486,7 +499,7 @@ class VoiceSession:
             if fallback_text:
                 return normalize_speech_input(fallback_text)
             err_msg = (
-                friendly_stt_error(exc.payload)
+                exc.message
                 if isinstance(exc, SttError)
                 else "Nhận dạng giọng nói thất bại, hãy thử lại."
             )
@@ -576,7 +589,7 @@ class VoiceSession:
             if self._start_task and not self._start_task.done():
                 return
             self._start_task = asyncio.create_task(self.start_turn())
-        elif msg_type == "stop_turn":
+        elif msg_type in ("stop_turn", "stop"):
             await self.stop_turn()
         elif msg_type == "interrupt":
             await self.cancel_turn()
@@ -606,7 +619,7 @@ class VoiceSession:
                 self.speech_frames = max(self.speech_frames, MIN_SPEECH_FRAMES)
             await self._send_ws({"type": "partial", "text": payload})
         elif kind == "error":
-            await self._handle_error(friendly_stt_error(payload))
+            await self._handle_error(SttError(payload).message)
 
     async def _abort_stt(self) -> None:
         """Ngắt kết nối phiên STT ngay lập tức nếu đang hoạt động."""
