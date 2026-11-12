@@ -635,7 +635,10 @@ async def _produce_tts_sentences(
         logger.error("Lỗi trong quá trình sinh câu trả lời LLM: %s", exc)
         raise
     finally:
-        if not end_sent and not sentence_queue.full():
+        if not end_sent:
+            while sentence_queue.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    sentence_queue.get_nowait()
             with contextlib.suppress(asyncio.QueueFull):
                 sentence_queue.put_nowait(_END)
 
@@ -661,6 +664,10 @@ async def _consume_tts_audio(
         raise
     except Exception as exc:
         logger.error("Lỗi trong quá trình tổng hợp hoặc gửi âm thanh TTS: %s", exc)
+        # Xả sạch hàng đợi để giải phóng producer nếu đang bị kẹt ở sentence_queue.put()
+        while not sentence_queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                sentence_queue.get_nowait()
         raise
 
 
@@ -722,6 +729,9 @@ async def run_turn(
         for t in (producer_task, consumer_task):
             if not t.done():
                 t.cancel()
+        while not sentence_queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                sentence_queue.get_nowait()
         await asyncio.gather(producer_task, consumer_task, return_exceptions=True)
 
     return "".join(raw_parts)

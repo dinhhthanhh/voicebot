@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import re
 import uuid
 from collections.abc import Awaitable, Callable
@@ -20,17 +21,30 @@ from websockets.asyncio.client import ClientConnection
 logger = logging.getLogger("stt")
 
 # ---------------------------------------------------------------------------
-# 1. Cấu hình định dạng âm thanh & Đường dẫn mô hình
+# 1. Cấu hình định dạng âm thanh & Phân định giới hạn Smart Turn vs ASR
 # ---------------------------------------------------------------------------
 STT_SAMPLE_RATE = 16000
 VAD_WINDOW_SAMPLES = 512
+
+# [PHÂN ĐỊNH HAI GIỚI HẠN THỜI LƯỢNG]:
+# 1. Cửa sổ âm thanh Smart Turn (MAX_SECONDS = 8):
+#    Độ dài tối đa của cửa sổ âm thanh trượt (audio_buf) cấp cho mô hình Smart Turn v3.2 ONNX
+#    (dựa trên Whisper Tiny encoder) để phân tích ngữ điệu âm học dự đoán kết thúc lượt nói.
+# 2. Giới hạn phiên nhận dạng ASR (ASR Streaming):
+#    Toàn bộ luồng thoại vẫn được gửi liên tục qua WebSocket tới server Qwen ASR,
+#    cho phép nhận dạng câu nói dài tối đa 600 giây (tương ứng mã lỗi AUDIO_TOO_LONG).
 MAX_SECONDS = 8
 MAX_SAMPLES = MAX_SECONDS * STT_SAMPLE_RATE
 MAX_AUDIO_BYTES = MAX_SAMPLES * 2  # 256,000 bytes (PCM16 mono 16 kHz)
 
+# [PHÂN BIỆT RẠCH RÒI VAI TRÒ]:
+# - Silero VAD (v5): Phát hiện người dùng có đang nói hay không (speech vs silence/noise).
+# - Smart Turn (v3.2): Dự đoán người dùng đã nói xong lượt hay chưa (turn-taking completion).
 MODEL_DIR = Path(__file__).resolve().parent / "models"
-DEFAULT_MODEL_PATH = MODEL_DIR / "smart-turn-v3.2-cpu.onnx"
-VAD_MODEL_PATH = MODEL_DIR / "silero_vad.onnx"
+DEFAULT_MODEL_PATH = Path(
+    os.environ.get("SMART_TURN_MODEL_PATH", str(MODEL_DIR / "smart-turn-v3.2-cpu.onnx"))
+)
+VAD_MODEL_PATH = Path(os.environ.get("VAD_MODEL_PATH", str(MODEL_DIR / "silero_vad.onnx")))
 
 
 def _ort_session_options() -> ort.SessionOptions:

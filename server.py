@@ -68,18 +68,20 @@ FRAME_DURATION_MS = 100
 # Mỗi frame 100ms = 1600 mẫu * 2 bytes = 3200 bytes
 FRAME_BYTES = int(STT_SAMPLE_RATE * (FRAME_DURATION_MS / 1000.0)) * 2
 MIN_AUDIO_BYTES = 12_000  # Tối thiểu ~375ms âm thanh trước khi chạy Smart Turn
+MAX_PENDING_FRAMES = 150  # Tối đa 15 giây âm thanh đệm chờ khi STT kết nối hoặc thử lại (retry)
 
 # Ngưỡng VAD (Hysteresis: START để bắt đầu, KEEP để duy trì không đứt đoạn)
 VAD_PROB_START = 0.50
 VAD_PROB_KEEP = 0.30
-VAD_RMS_START = 0.003
-VAD_RMS_KEEP = 0.002
-
+VAD_RMS_START = 0.001
+VAD_RMS_KEEP = 0.0008
+    
 # Ngưỡng xác suất Smart Turn
-PROB_HIGH = 0.65  # Tự tin dứt câu
-PROB_MID = 0.50  # Cần im lặng lâu hơn
+PROB_VERY_HIGH = 0.80  # Rất tự tin dứt câu (ngắt siêu nhanh ~400ms)
+PROB_HIGH = 0.65  # Tự tin dứt câu (~600ms)
+PROB_MID = 0.50  # Tự tin trung bình (~1.2s)
 WALL_TIMEOUT_S = 2.5  # Hết thời gian chờ im lặng theo đồng hồ thực tế (câu thường)
-WALL_EXTENDED_TIMEOUT_S = 4.0  # Hết thời gian chờ tối đa khi ngập ngừng hoặc đọc số
+WALL_EXTENDED_TIMEOUT_S = 3.5  # Hết thời gian chờ tối đa khi ngập ngừng hoặc đọc số
 
 
 def ms_to_frames(ms: int) -> int:
@@ -90,13 +92,14 @@ def ms_to_frames(ms: int) -> int:
 # Các mốc frame kiểm tra (mỗi frame 100ms)
 MIN_SPEECH_FRAMES = ms_to_frames(300)
 MIN_SILENCE_FRAMES = ms_to_frames(300)
-CHECK_INTERVAL = ms_to_frames(200)
-FRAMES_FAST = ms_to_frames(700)
-FRAMES_SLOW = ms_to_frames(1400)
-FRAMES_SEQUENCE = ms_to_frames(1800)
+CHECK_INTERVAL = ms_to_frames(100)  # Kiểm tra mỗi 100ms để bắt tức thì khoảnh khắc dứt câu
+FRAMES_ULTRA_FAST = ms_to_frames(400)  # 400ms khi prob >= 0.80
+FRAMES_FAST = ms_to_frames(600)  # 600ms khi prob >= 0.65
+FRAMES_SLOW = ms_to_frames(1200)  # 1.2s khi prob >= 0.50
+FRAMES_SEQUENCE = ms_to_frames(1200)  # 1.2s khi đang đọc số (giảm từ 1.8s)
 FILLER_TIMEOUT = ms_to_frames(2000)
 SILENCE_TIMEOUT = ms_to_frames(2000)
-TIMEOUT_EXTENDED = ms_to_frames(4000)
+TIMEOUT_EXTENDED = ms_to_frames(3500)
 
 
 def decide_turn_end(
@@ -121,6 +124,8 @@ def decide_turn_end(
 
     # 2. Đang đọc số, mã vận đơn hoặc địa chỉ (cần khoảng lặng tự nhiên dài hơn)
     if reading:
+        if prob >= PROB_VERY_HIGH and silence_frames >= ms_to_frames(1000):
+            return "sequence_done"
         if prob >= PROB_HIGH and silence_frames >= FRAMES_SEQUENCE:
             return "sequence_done"
         return None
@@ -131,7 +136,9 @@ def decide_turn_end(
             return "smart_turn_done"
         return None
 
-    # 4. Câu nói bình thường
+    # 4. Câu nói bình thường: phân tầng theo độ tự tin
+    if prob >= PROB_VERY_HIGH and silence_frames >= FRAMES_ULTRA_FAST:
+        return "smart_turn_done"
     if prob >= PROB_HIGH and silence_frames >= FRAMES_FAST:
         return "smart_turn_done"
     if prob >= PROB_MID and silence_frames >= FRAMES_SLOW:
@@ -191,7 +198,7 @@ class VoiceSession:
         self._send_lock = asyncio.Lock()
         self._vad_lock = asyncio.Lock()
 
-        self._pending_audio: deque[bytes] = deque(maxlen=50)
+        self._pending_audio: deque[bytes] = deque(maxlen=MAX_PENDING_FRAMES)
         self._is_processing_audio = False
 
         self.detector = detector or get_detector()
@@ -291,6 +298,11 @@ class VoiceSession:
             return
 
         if self.state == SessionState.STARTING:
+            if len(self._pending_audio) >= MAX_PENDING_FRAMES:
+                logger.warning(
+                    "[Audio Queue] Hàng đợi pending_audio đầy (%d frames), frame cũ nhất bị loại bỏ.",
+                    MAX_PENDING_FRAMES,
+                )
             self._pending_audio.append(frame)
             return
 
@@ -342,6 +354,11 @@ class VoiceSession:
         # Cơ chế hysteresis: khi đã có tiếng nói thì hạ thấp ngưỡng để không bị đứt đoạn âm tiết nhẹ
         prob_threshold = VAD_PROB_KEEP if self.has_speech else VAD_PROB_START
         rms_threshold = VAD_RMS_KEEP if self.has_speech else VAD_RMS_START
+
+        # Khi Silero VAD tự tin là tiếng người, ưu tiên nhận diện kể cả khi nói thì thầm/nói nhỏ
+        if speech_prob >= 0.70:
+            return rms >= (VAD_RMS_KEEP * 0.5)
+
         return speech_prob >= prob_threshold and rms >= rms_threshold
 
     def _update_vad(self, is_speaking: bool, now: float) -> None:

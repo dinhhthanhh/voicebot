@@ -22,10 +22,13 @@ Hệ thống trợ lý giọng nói đàm thoại thời gian thực độ trễ
   - **Capping:** Giới hạn độ dài và số lượng câu đọc tối đa nhằm giữ câu trả lời thoại súc tích, mạch lạc.
 
 ### 3. Cơ chế kết thúc lượt nói thông minh (Smart Turn & VAD)
-- **Kiến trúc phát hiện 2 tầng:** Kết hợp **Silero VAD v5** (phát hiện giọng nói / khoảng lặng) và **Smart Turn v3.2 ONNX** (phân tích ngữ nghĩa âm học xem người dùng đã dứt ý hay chưa).
-- **Bộ lọc năng lượng RMS & Ngưỡng trễ:** Ngăn tiếng ồn nền và hơi thở gây kích hoạt giả bằng cơ chế hysteresis trễ:
-  - Bắt đầu nói: Xác suất VAD $\ge 0.50$ và RMS $\ge 0.003$.
-  - Duy trì nói: Xác suất VAD $\ge 0.30$ và RMS $\ge 0.002$.
+- **Kiến trúc phát hiện 2 tầng tách bạch:**
+  - **Silero VAD v5 (Voice Activity Detection):** Chuyên trách phát hiện theo thời gian thực xem người dùng **có đang nói hay không** (phân biệt giọng nói với khoảng lặng và tạp âm môi trường).
+  - **Smart Turn v3.2 ONNX (Turn-Taking Prediction):** Chuyên trách dự đoán xem người dùng **đã nói xong lượt hay chưa** bằng cách phân tích ngữ nghĩa âm học (cao độ rơi, ngữ điệu, khoảng lặng dứt câu) trên cửa sổ trượt tối đa 8 giây âm thanh gần nhất.
+- **Bộ lọc năng lượng RMS & Ngưỡng trễ:** Ngăn tiếng ồn nền và hơi thở gây kích hoạt giả bằng cơ chế hysteresis trễ (tối ưu bắt nhạy cả giọng nói nhỏ / thì thầm gần mic):
+  - Bắt đầu nói: Xác suất VAD $\ge 0.50$ và RMS $\ge 0.001$.
+  - Duy trì nói: Xác suất VAD $\ge 0.30$ và RMS $\ge 0.0006$.
+  - Ưu tiên giọng nói nhỏ: Khi Silero VAD nhận diện chắc chắn là tiếng người ($\ge 0.70$), chấp nhận RMS siêu nhỏ $\ge 0.0003$.
 - **Ngưỡng quyết định ngắt câu linh hoạt:**
   - Tự tin cao ($\ge 0.65$): Ngắt nhạy sau $0.7\text{s}$ im lặng (câu thường) hoặc $1.4\text{s}$ (khi ngập ngừng) hoặc $1.8\text{s}$ (khi đọc xong dãy số).
   - Tự tin trung bình ($\ge 0.50$): Ngắt sau $1.4\text{s}$ im lặng đối với câu dứt khoát không ngập ngừng.

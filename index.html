@@ -291,48 +291,52 @@
       function resampleChunk(chunk, inRate, outRate) {
         if (inRate === outRate) return chunk;
         const ratio = inRate / outRate;
-        const outLen = Math.floor((chunk.length - resamplePhase) / ratio);
-        if (outLen <= 0) {
-          resamplePhase -= chunk.length;
-          return new Float32Array(0);
+          const out = [];
+          let pos = resamplePhase;
+          while (pos < chunk.length - 1) {
+            let s;
+            if (pos < 0) {
+              const p0 = (resamplePrevSample !== null) ? resamplePrevSample : chunk[0];
+              const p1 = chunk[0];
+              const frac = pos + 1;
+              s = p0 + (p1 - p0) * frac;
+            } else {
+              const i0 = Math.floor(pos);
+              const frac = pos - i0;
+              const p0 = chunk[i0];
+              const p1 = chunk[i0 + 1];
+              s = p0 + (p1 - p0) * frac;
+            }
+            out.push(s);
+            pos += ratio;
+          }
+          resamplePhase = pos - chunk.length;
+          resamplePrevSample = chunk[chunk.length - 1];
+          return new Float32Array(out);
         }
-        const out = new Float32Array(outLen);
-        for (let i = 0; i < outLen; i++) {
-          const pos = resamplePhase + i * ratio;
-          const i0 = Math.floor(pos);
-          const i1 = i0 + 1;
-          const frac = pos - i0;
-          const p0 = (i0 < 0) ? (resamplePrevSample ?? chunk[0]) : chunk[i0];
-          const p1 = (i1 < chunk.length) ? chunk[i1] : chunk[chunk.length - 1];
-          out[i] = p0 + (p1 - p0) * frac;
-        }
-        resamplePhase = (resamplePhase + outLen * ratio) - chunk.length;
-        resamplePrevSample = chunk[chunk.length - 1];
-        return out;
-      }
 
-      // Xử lý stream microphone (resample 16kHz -> đệm 1600 mẫu -> gửi WebSocket)
-      function onMic(e) {
-        if (!recording || !isWsOpen()) return;
-        if (isBotBusy()) return;
+        // Xử lý stream microphone (resample 16kHz -> đệm 1600 mẫu -> gửi WebSocket)
+        function onMic(e) {
+          if (!recording || !isWsOpen()) return;
+          if (isBotBusy()) return;
 
-        const inputData = e.inputBuffer.getChannelData(0);
-        const resampled = resampleChunk(inputData, ctx.sampleRate, TARGET_SR);
-        let offset = 0;
-        while (offset < resampled.length) {
-          const needed = FRAME_SAMPLES - frameFill;
-          const toCopy = Math.min(needed, resampled.length - offset);
-          frameBuf.set(resampled.subarray(offset, offset + toCopy), frameFill);
-          frameFill += toCopy;
-          offset += toCopy;
-          if (frameFill === FRAME_SAMPLES) {
-            ws.send(toPcm16(frameBuf));
-            frameFill = 0;
+          const inputData = e.inputBuffer.getChannelData(0);
+          const resampled = resampleChunk(inputData, ctx.sampleRate, TARGET_SR);
+          let offset = 0;
+          while (offset < resampled.length) {
+            const needed = FRAME_SAMPLES - frameFill;
+            const toCopy = Math.min(needed, resampled.length - offset);
+            frameBuf.set(resampled.subarray(offset, offset + toCopy), frameFill);
+            frameFill += toCopy;
+            offset += toCopy;
+            if (frameFill === FRAME_SAMPLES) {
+              ws.send(toPcm16(frameBuf));
+              frameFill = 0;
+            }
           }
         }
-      }
 
-      const WORKLET_CODE = `
+        const WORKLET_CODE = `
 class MicProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -376,356 +380,358 @@ class MicProcessor extends AudioWorkletProcessor {
     const inRate = sampleRate;
     const outRate = this.targetSr;
     const ratio = inRate / outRate;
-    const outLen = Math.floor((chunk.length - this.resamplePhase) / ratio);
-    if (outLen <= 0) {
-      this.resamplePhase -= chunk.length;
-      return true;
-    }
-    const out = new Float32Array(outLen);
-    for (let i = 0; i < outLen; i++) {
-      const pos = this.resamplePhase + i * ratio;
-      const i0 = Math.floor(pos);
-      const frac = pos - i0;
-      const p0 = (i0 < 0) ? (this.resamplePrevSample ?? chunk[0]) : chunk[i0];
-      const p1 = (i0 + 1 < chunk.length) ? chunk[i0 + 1] : chunk[chunk.length - 1];
-      out[i] = p0 + (p1 - p0) * frac;
-    }
-    this.resamplePhase = (this.resamplePhase + outLen * ratio) - chunk.length;
-    this.resamplePrevSample = chunk[chunk.length - 1];
 
-    let offset = 0;
-    while (offset < out.length) {
-      const needed = this.frameSamples - this.fill;
-      const toCopy = Math.min(needed, out.length - offset);
-      this.buf.set(out.subarray(offset, offset + toCopy), this.fill);
-      this.fill += toCopy;
-      offset += toCopy;
+    let pos = this.resamplePhase;
+    while (pos < chunk.length - 1) {
+      let s;
+      if (pos < 0) {
+        const p0 = (this.resamplePrevSample !== null) ? this.resamplePrevSample : chunk[0];
+        const p1 = chunk[0];
+        const frac = pos + 1;
+        s = p0 + (p1 - p0) * frac;
+      } else {
+        const i0 = Math.floor(pos);
+        const frac = pos - i0;
+        const p0 = chunk[i0];
+        const p1 = chunk[i0 + 1];
+        s = p0 + (p1 - p0) * frac;
+      }
+      this.buf[this.fill++] = s;
       if (this.fill === this.frameSamples) {
         const pcm = new ArrayBuffer(this.frameSamples * 2);
         const view = new DataView(pcm);
-        for (let i = 0; i < this.frameSamples; i++) {
-          const s = Math.max(-1, Math.min(1, this.buf[i]));
-          view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        for (let j = 0; j < this.frameSamples; j++) {
+          const val = Math.max(-1, Math.min(1, this.buf[j]));
+          view.setInt16(j * 2, val < 0 ? val * 0x8000 : val * 0x7fff, true);
         }
         this.port.postMessage({ flushed: false, pcm }, [pcm]);
         this.fill = 0;
       }
+      pos += ratio;
     }
+    this.resamplePhase = pos - chunk.length;
+    this.resamplePrevSample = chunk[chunk.length - 1];
     return true;
   }
 }
 registerProcessor('mic-processor', MicProcessor);
 `;
 
-      async function ensureAudio() {
-        if (!ctx) {
-          ctx = new (window.AudioContext || window.webkitAudioContext)();
-        }
-        if (ctx.state === 'suspended') await ctx.resume();
-        if (!micStream) {
-          micStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              channelCount: 1,
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: false
-            },
-            video: false
-          });
-          micSource = ctx.createMediaStreamSource(micStream);
+        async function ensureAudio() {
+          if (!ctx) {
+            ctx = new (window.AudioContext || window.webkitAudioContext)();
+          }
+          if (ctx.state === 'suspended') await ctx.resume();
+          if (!micStream) {
+            micStream = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                channelCount: 1,
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+              },
+              video: false
+            });
+            micSource = ctx.createMediaStreamSource(micStream);
 
-          // Lọc chống aliasing (Butterworth bậc 4, 7.2 kHz)
-          const lowpass1 = ctx.createBiquadFilter();
-          lowpass1.type = 'lowpass';
-          lowpass1.frequency.value = 7200;
-          lowpass1.Q.value = 0.5411961;
+            // Lọc chống aliasing (Butterworth bậc 4, 7.2 kHz)
+            const lowpass1 = ctx.createBiquadFilter();
+            lowpass1.type = 'lowpass';
+            lowpass1.frequency.value = 7200;
+            lowpass1.Q.value = 0.5411961;
 
-          const lowpass2 = ctx.createBiquadFilter();
-          lowpass2.type = 'lowpass';
-          lowpass2.frequency.value = 7200;
-          lowpass2.Q.value = 1.306563;
+            const lowpass2 = ctx.createBiquadFilter();
+            lowpass2.type = 'lowpass';
+            lowpass2.frequency.value = 7200;
+            lowpass2.Q.value = 1.306563;
 
-          micSource.connect(lowpass1);
-          lowpass1.connect(lowpass2);
+            micSource.connect(lowpass1);
+            lowpass1.connect(lowpass2);
 
-          let useWorklet = false;
-          if (ctx.audioWorklet && typeof ctx.audioWorklet.addModule === 'function') {
-            try {
-              if (!workletRegistered) {
-                const workletBlob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
-                const workletUrl = URL.createObjectURL(workletBlob);
-                await ctx.audioWorklet.addModule(workletUrl);
-                URL.revokeObjectURL(workletUrl);
-                workletRegistered = true;
+            let useWorklet = false;
+            if (ctx.audioWorklet && typeof ctx.audioWorklet.addModule === 'function') {
+              try {
+                if (!workletRegistered) {
+                  const workletBlob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+                  const workletUrl = URL.createObjectURL(workletBlob);
+                  await ctx.audioWorklet.addModule(workletUrl);
+                  URL.revokeObjectURL(workletUrl);
+                  workletRegistered = true;
+                }
+
+                const workletNode = new AudioWorkletNode(ctx, 'mic-processor');
+                workletNode.port.onmessage = (e) => {
+                  const { flushed, pcm } = e.data || {};
+                  if (pcm && (recording || flushed) && isWsOpen() && !isBotBusy()) {
+                    ws.send(pcm);
+                  }
+                  if (flushed && typeof onWorkletFlushed === 'function') {
+                    const cb = onWorkletFlushed;
+                    onWorkletFlushed = null;
+                    cb();
+                  }
+                };
+                lowpass2.connect(workletNode);
+
+                const mute = ctx.createGain();
+                mute.gain.value = 0;
+                workletNode.connect(mute);
+                mute.connect(ctx.destination);
+
+                processor = workletNode;
+                useWorklet = true;
+              } catch (err) {
+                console.warn("AudioWorklet không khởi tạo được, dùng ScriptProcessor fallback:", err);
               }
+            }
 
-              const workletNode = new AudioWorkletNode(ctx, 'mic-processor');
-              workletNode.port.onmessage = (e) => {
-                const { flushed, pcm } = e.data || {};
-                if (pcm && (recording || flushed) && isWsOpen() && !isBotBusy()) {
-                  ws.send(pcm);
-                }
-                if (flushed && typeof onWorkletFlushed === 'function') {
-                  const cb = onWorkletFlushed;
-                  onWorkletFlushed = null;
-                  cb();
-                }
-              };
-              lowpass2.connect(workletNode);
+            if (!useWorklet) {
+              processor = ctx.createScriptProcessor(2048, 1, 1);
+              processor.onaudioprocess = onMic;
+              lowpass2.connect(processor);
 
+              // Nối qua Gain(0) để kích hoạt processor mà không phát ra loa
               const mute = ctx.createGain();
               mute.gain.value = 0;
-              workletNode.connect(mute);
+              processor.connect(mute);
               mute.connect(ctx.destination);
-
-              processor = workletNode;
-              useWorklet = true;
-            } catch (err) {
-              console.warn("AudioWorklet không khởi tạo được, dùng ScriptProcessor fallback:", err);
             }
           }
-
-          if (!useWorklet) {
-            processor = ctx.createScriptProcessor(2048, 1, 1);
-            processor.onaudioprocess = onMic;
-            lowpass2.connect(processor);
-
-            // Nối qua Gain(0) để kích hoạt processor mà không phát ra loa
-            const mute = ctx.createGain();
-            mute.gain.value = 0;
-            processor.connect(mute);
-            mute.connect(ctx.destination);
-          }
         }
-      }
 
-      function stopTalking() {
-        if (!recording) return;
-        recording = false;
-        refreshState();
+        function stopTalking() {
+          if (!recording) return;
+          recording = false;
+          refreshState();
 
-        if (processor && processor.port) {
-          let sent = false;
-          const finishTurn = () => {
-            if (sent) return;
-            sent = true;
-            onWorkletFlushed = null;
+          if (processor && processor.port) {
+            let sent = false;
+            let fallbackTimer = null;
+            const finishTurn = () => {
+              if (sent) return;
+              sent = true;
+              if (fallbackTimer) {
+                clearTimeout(fallbackTimer);
+                fallbackTimer = null;
+              }
+              onWorkletFlushed = null;
+              resetAudioInputState();
+              sendJson({ type: 'stop_turn' });
+            };
+            onWorkletFlushed = finishTurn;
+            processor.port.postMessage({ type: 'flush' });
+            // Timeout 500ms chỉ là phương án dự phòng nếu AudioWorklet không phản hồi
+            fallbackTimer = setTimeout(finishTurn, 500);
+          } else {
+            if (frameFill > 0 && isWsOpen()) {
+              ws.send(toPcm16(frameBuf.subarray(0, frameFill)));
+            }
             resetAudioInputState();
             sendJson({ type: 'stop_turn' });
+          }
+        }
+
+        function stopPlayback() {
+          for (const src of playingSources) {
+            try { src.stop(); } catch (_) { }
+          }
+          playingSources.clear();
+          playHead = 0;
+          oddByte = new Uint8Array(0);
+          discarding = true;
+          refreshState();
+        }
+
+        // Phát luồng âm thanh PCM từ máy chủ
+        function playPcm(arrayBuf) {
+          if (!ctx || discarding || !arrayBuf || arrayBuf.byteLength === 0) return;
+
+          let i16;
+          if (oddByte.length === 0) {
+            const byteLen = arrayBuf.byteLength;
+            if (byteLen % 2 === 0) {
+              i16 = new Int16Array(arrayBuf);
+            } else {
+              const evenLen = byteLen - 1;
+              i16 = new Int16Array(arrayBuf, 0, evenLen / 2);
+              oddByte = new Uint8Array(arrayBuf, evenLen, 1).slice();
+            }
+          } else {
+            const totalLen = oddByte.length + arrayBuf.byteLength;
+            const evenLen = totalLen - (totalLen % 2);
+            const combined = new Uint8Array(evenLen);
+            combined.set(oddByte, 0);
+            const chunkTake = evenLen - oddByte.length;
+            combined.set(new Uint8Array(arrayBuf, 0, chunkTake), oddByte.length);
+            if (totalLen > evenLen) {
+              oddByte = new Uint8Array(arrayBuf, chunkTake, 1).slice();
+            } else {
+              oddByte = new Uint8Array(0);
+            }
+            i16 = new Int16Array(combined.buffer);
+          }
+
+          if (i16.length === 0) return;
+
+          const audioBuf = ctx.createBuffer(1, i16.length, ttsSr);
+          const channelData = audioBuf.getChannelData(0);
+          for (let i = 0; i < i16.length; i++) {
+            channelData[i] = i16[i] / 32768;
+          }
+
+          const source = ctx.createBufferSource();
+          source.buffer = audioBuf;
+          source.connect(ctx.destination);
+
+          const now = ctx.currentTime;
+          if (playHead < now + 0.05) playHead = now + 0.08;
+          source.start(playHead);
+          playHead += audioBuf.duration;
+          playingSources.add(source);
+          source.onended = () => {
+            playingSources.delete(source);
+            refreshState();
           };
-          onWorkletFlushed = finishTurn;
-          processor.port.postMessage({ type: 'flush' });
-          setTimeout(finishTurn, 100);
-        } else {
-          if (frameFill > 0 && isWsOpen()) {
-            ws.send(toPcm16(frameBuf.subarray(0, frameFill)));
+        }
+
+        function handleAutoStop(m) {
+          if (m.reason === 'filler_timeout') {
+            setErr('Tự động ngắt: Hết thời gian chờ từ đệm (im lặng >2.0s)');
+          } else if (m.reason === 'silence_timeout') {
+            setErr('Tự động ngắt: Hết thời gian im lặng');
+          } else if (m.reason === 'sequence_done') {
+            setErr(`Tự động ngắt khi đọc xong mã/số (Độ tin cậy: ${(m.probability * 100).toFixed(1)}%)`);
+          } else {
+            setErr(`Tự động ngắt khi dứt câu (Độ tin cậy: ${(m.probability * 100).toFixed(1)}%)`);
           }
           resetAudioInputState();
-          sendJson({ type: 'stop_turn' });
+          recording = false;
         }
-      }
 
-      function stopPlayback() {
-        for (const src of playingSources) {
-          try { src.stop(); } catch (_) { }
+        function scheduleAutoListen() {
+          // Chờ phát hết âm thanh + 600ms chống dội âm rồi tự động nghe tiếp
+          recording = false;
+          resetAudioInputState();
+          clearAutoListenTimers();
+          waitAudioEndTimer = setInterval(() => {
+            if (!isPlaying()) {
+              clearInterval(waitAudioEndTimer);
+              waitAudioEndTimer = null;
+              autoListenTimer = setTimeout(() => {
+                autoListenTimer = null;
+                if (callActive && !recording && serverState === 'idle') {
+                  startListeningTurn();
+                }
+              }, 600);
+            }
+          }, 100);
         }
-        playingSources.clear();
-        playHead = 0;
-        oddByte = new Uint8Array(0);
-        discarding = true;
-        refreshState();
-      }
 
-      // Phát luồng âm thanh PCM từ máy chủ
-      function playPcm(arrayBuf) {
-        if (!ctx || discarding || !arrayBuf || arrayBuf.byteLength === 0) return;
+        const messageHandlers = {
+          tts_format(m) {
+            if (m.sample_rate) ttsSr = m.sample_rate;
+          },
+          state(m) {
+            serverState = m.state;
+            if (m.state === 'listening') discarding = false;
+            if (m.state === 'thinking' || m.state === 'speaking') {
+              recording = false;
+              resetAudioInputState();
+            }
+            refreshState();
+          },
+          auto_stop: handleAutoStop,
+          partial(m) {
+            $('you').textContent = m.text;
+          },
+          final(m) {
+            $('you').textContent = m.text;
+            $('bot').textContent = '';
+          },
+          bot_raw(m) {
+            $('bot').textContent += m.text;
+          },
+          bot_done: scheduleAutoListen,
+          stop_audio: stopPlayback,
+          busy() {
+            setErr('Bot đang nói. Vui lòng chờ bot nói xong.');
+          },
+          info(m) {
+            setErr(m.message);
+          },
+          error(m) {
+            setErr(m.message);
+            teardownCallState();
+          },
+          metrics() { },
+        };
 
-        let i16;
-        if (oddByte.length === 0) {
-          const byteLen = arrayBuf.byteLength;
-          if (byteLen % 2 === 0) {
-            i16 = new Int16Array(arrayBuf);
-          } else {
-            const evenLen = byteLen - 1;
-            i16 = new Int16Array(arrayBuf, 0, evenLen / 2);
-            oddByte = new Uint8Array(arrayBuf, evenLen, 1).slice();
+        function onMessage(ev) {
+          if (typeof ev.data !== 'string') {
+            playPcm(ev.data);
+            return;
           }
-        } else {
-          const totalLen = oddByte.length + arrayBuf.byteLength;
-          const evenLen = totalLen - (totalLen % 2);
-          const combined = new Uint8Array(evenLen);
-          combined.set(oddByte, 0);
-          const chunkTake = evenLen - oddByte.length;
-          combined.set(new Uint8Array(arrayBuf, 0, chunkTake), oddByte.length);
-          if (totalLen > evenLen) {
-            oddByte = new Uint8Array(arrayBuf, chunkTake, 1).slice();
-          } else {
-            oddByte = new Uint8Array(0);
+          try {
+            const m = JSON.parse(ev.data);
+            const handler = messageHandlers[m.type];
+            if (handler) {
+              handler(m);
+            }
+          } catch (err) {
+            console.error("WebSocket JSON không hợp lệ:", ev.data, err);
           }
-          i16 = new Int16Array(combined.buffer);
         }
 
-        if (i16.length === 0) return;
+        // Sự kiện nút bấm
+        $('btnTalk').onclick = async () => {
+          if (!isWsOpen()) {
+            setErr('Chưa kết nối được máy chủ. Vui lòng thử lại sau giây lát.');
+            return;
+          }
+          clearAutoListenTimers();
+          if (isBotBusy()) {
+            setErr('Bot đang nói. Vui lòng chờ bot nói xong.');
+            return;
+          }
 
-        const audioBuf = ctx.createBuffer(1, i16.length, ttsSr);
-        const channelData = audioBuf.getChannelData(0);
-        for (let i = 0; i < i16.length; i++) {
-          channelData[i] = i16[i] / 32768;
-        }
+          // Dọn dẹp trạng thái cũ TRƯỚC khi mở micro
+          teardownCallState();
 
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuf;
-        source.connect(ctx.destination);
+          try {
+            await ensureAudio();
+          } catch (e) {
+            setErr('Không mở được micro: ' + e.message);
+            return;
+          }
 
-        const now = ctx.currentTime;
-        if (playHead < now + 0.05) playHead = now + 0.08;
-        source.start(playHead);
-        playHead += audioBuf.duration;
-        playingSources.add(source);
-        source.onended = () => {
-          playingSources.delete(source);
+          setErr('');
+          $('you').textContent = '';
+          $('bot').textContent = '';
+          callActive = true;
+          startListeningTurn();
+        };
+
+        $('btnFinish').onclick = () => {
+          stopTalking();
+        };
+
+        $('btnStop').onclick = () => {
+          teardownCallState();
+          sendJson({ type: 'interrupt' });
           refreshState();
         };
-      }
 
-      function handleAutoStop(m) {
-        if (m.reason === 'filler_timeout') {
-          setErr('Tự động ngắt: Hết thời gian chờ từ đệm (im lặng >2.0s)');
-        } else if (m.reason === 'silence_timeout') {
-          setErr('Tự động ngắt: Hết thời gian im lặng');
-        } else if (m.reason === 'sequence_done') {
-          setErr(`Tự động ngắt khi đọc xong mã/số (Độ tin cậy: ${(m.probability * 100).toFixed(1)}%)`);
-        } else {
-          setErr(`Tự động ngắt khi dứt câu (Độ tin cậy: ${(m.probability * 100).toFixed(1)}%)`);
-        }
-        resetAudioInputState();
-        recording = false;
-      }
-
-      function scheduleAutoListen() {
-        // Chờ phát hết âm thanh + 600ms chống dội âm rồi tự động nghe tiếp
-        recording = false;
-        resetAudioInputState();
-        clearAutoListenTimers();
-        waitAudioEndTimer = setInterval(() => {
-          if (!isPlaying()) {
-            clearInterval(waitAudioEndTimer);
-            waitAudioEndTimer = null;
-            autoListenTimer = setTimeout(() => {
-              autoListenTimer = null;
-              if (callActive && !recording && serverState === 'idle') {
-                startListeningTurn();
-              }
-            }, 600);
-          }
-        }, 100);
-      }
-
-      const messageHandlers = {
-        tts_format(m) {
-          if (m.sample_rate) ttsSr = m.sample_rate;
-        },
-        state(m) {
-          serverState = m.state;
-          if (m.state === 'listening') discarding = false;
-          if (m.state === 'thinking' || m.state === 'speaking') {
-            recording = false;
-            resetAudioInputState();
-          }
-          refreshState();
-        },
-        auto_stop: handleAutoStop,
-        partial(m) {
-          $('you').textContent = m.text;
-        },
-        final(m) {
-          $('you').textContent = m.text;
-          $('bot').textContent = '';
-        },
-        bot_raw(m) {
-          $('bot').textContent += m.text;
-        },
-        bot_done: scheduleAutoListen,
-        stop_audio: stopPlayback,
-        busy() {
-          setErr('Bot đang nói. Vui lòng chờ bot nói xong.');
-        },
-        info(m) {
-          setErr(m.message);
-        },
-        error(m) {
-          setErr(m.message);
+        $('btnReset').onclick = () => {
           teardownCallState();
-        },
-        metrics() { },
-      };
+          sendJson({ type: 'reset' });
+          $('you').textContent = '';
+          $('bot').textContent = '';
+          setErr('');
+          refreshState();
+        };
 
-      function onMessage(ev) {
-        if (typeof ev.data !== 'string') {
-          playPcm(ev.data);
-          return;
-        }
-        try {
-          const m = JSON.parse(ev.data);
-          const handler = messageHandlers[m.type];
-          if (handler) {
-            handler(m);
-          }
-        } catch (err) {
-          console.error("WebSocket JSON không hợp lệ:", ev.data, err);
-        }
-      }
-
-      // Sự kiện nút bấm
-      $('btnTalk').onclick = async () => {
-        if (!isWsOpen()) {
-          setErr('Chưa kết nối được máy chủ. Vui lòng thử lại sau giây lát.');
-          return;
-        }
-        clearAutoListenTimers();
-        if (isBotBusy()) {
-          setErr('Bot đang nói. Vui lòng chờ bot nói xong.');
-          return;
-        }
-
-        // Dọn dẹp trạng thái cũ TRƯỚC khi mở micro
-        teardownCallState();
-
-        try {
-          await ensureAudio();
-        } catch (e) {
-          setErr('Không mở được micro: ' + e.message);
-          return;
-        }
-
-        setErr('');
-        $('you').textContent = '';
-        $('bot').textContent = '';
-        callActive = true;
-        startListeningTurn();
-      };
-
-      $('btnFinish').onclick = () => {
-        stopTalking();
-      };
-
-      $('btnStop').onclick = () => {
-        teardownCallState();
-        sendJson({ type: 'interrupt' });
-        refreshState();
-      };
-
-      $('btnReset').onclick = () => {
-        teardownCallState();
-        sendJson({ type: 'reset' });
-        $('you').textContent = '';
-        $('bot').textContent = '';
-        setErr('');
-        refreshState();
-      };
-
-      connect();
-    })();
+        connect();
+      }) ();
   </script>
 </body>
 
