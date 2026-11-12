@@ -71,15 +71,15 @@ MIN_AUDIO_BYTES = 12_000  # Tối thiểu ~375ms âm thanh trước khi chạy S
 MAX_PENDING_FRAMES = 150  # Tối đa 15 giây âm thanh đệm chờ khi STT kết nối hoặc thử lại (retry)
 
 # Ngưỡng VAD (Hysteresis: START để bắt đầu, KEEP để duy trì không đứt đoạn)
-VAD_PROB_START = 0.50
-VAD_PROB_KEEP = 0.30
-VAD_RMS_START = 0.001
-VAD_RMS_KEEP = 0.0008
-    
+VAD_PROB_START = 0.60
+VAD_PROB_KEEP = 0.40
+VAD_RMS_START = 0.0025
+VAD_RMS_KEEP = 0.0015
+
 # Ngưỡng xác suất Smart Turn
-PROB_VERY_HIGH = 0.80  # Rất tự tin dứt câu (ngắt siêu nhanh ~400ms)
-PROB_HIGH = 0.65  # Tự tin dứt câu (~600ms)
-PROB_MID = 0.50  # Tự tin trung bình (~1.2s)
+PROB_VERY_HIGH = 0.85  # Rất tự tin dứt câu (ngắt siêu nhanh ~400ms)
+PROB_HIGH = 0.70  # Tự tin dứt câu (~600ms)
+PROB_MID = 0.55  # Tự tin trung bình (~1.2s)
 WALL_TIMEOUT_S = 2.5  # Hết thời gian chờ im lặng theo đồng hồ thực tế (câu thường)
 WALL_EXTENDED_TIMEOUT_S = 3.5  # Hết thời gian chờ tối đa khi ngập ngừng hoặc đọc số
 
@@ -93,10 +93,10 @@ def ms_to_frames(ms: int) -> int:
 MIN_SPEECH_FRAMES = ms_to_frames(300)
 MIN_SILENCE_FRAMES = ms_to_frames(300)
 CHECK_INTERVAL = ms_to_frames(100)  # Kiểm tra mỗi 100ms để bắt tức thì khoảnh khắc dứt câu
-FRAMES_ULTRA_FAST = ms_to_frames(400)  # 400ms khi prob >= 0.80
-FRAMES_FAST = ms_to_frames(600)  # 600ms khi prob >= 0.65
+FRAMES_ULTRA_FAST = ms_to_frames(500)  # 500ms khi prob >= 0.80
+FRAMES_FAST = ms_to_frames(700)  # 700ms khi prob >= 0.65
 FRAMES_SLOW = ms_to_frames(1200)  # 1.2s khi prob >= 0.50
-FRAMES_SEQUENCE = ms_to_frames(1200)  # 1.2s khi đang đọc số (giảm từ 1.8s)
+FRAMES_SEQUENCE = ms_to_frames(1500)  # 1.5s khi đang đọc số
 FILLER_TIMEOUT = ms_to_frames(2000)
 SILENCE_TIMEOUT = ms_to_frames(2000)
 TIMEOUT_EXTENDED = ms_to_frames(3500)
@@ -357,7 +357,7 @@ class VoiceSession:
 
         # Khi Silero VAD tự tin là tiếng người, ưu tiên nhận diện kể cả khi nói thì thầm/nói nhỏ
         if speech_prob >= 0.70:
-            return rms >= (VAD_RMS_KEEP * 0.5)
+            return rms >= VAD_RMS_KEEP
 
         return speech_prob >= prob_threshold and rms >= rms_threshold
 
