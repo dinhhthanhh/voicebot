@@ -145,6 +145,8 @@
       const STATE_LABELS = { idle: 'Rảnh', listening: 'Đang nghe...', thinking: 'Đang suy nghĩ', speaking: 'Đang nói' };
 
       let ws, ctx, micStream, micSource, processor;
+      let workletRegistered = false;
+      let onWorkletFlushed = null;
       let recording = false, callActive = false, serverState = 'idle';
       const frameBuf = new Float32Array(FRAME_SAMPLES);
       let frameFill = 0;
@@ -170,6 +172,9 @@
         frameFill = 0;
         resamplePhase = 0;
         resamplePrevSample = null;
+        if (processor && processor.port) {
+          processor.port.postMessage({ type: 'reset' });
+        }
       }
 
       const isWsOpen = () => ws && ws.readyState === WebSocket.OPEN;
@@ -186,13 +191,35 @@
         return serverState === 'thinking' || serverState === 'speaking' || isPlaying();
       }
 
+      function releaseMicrophone() {
+        if (processor) {
+          if (processor.port) {
+            processor.port.onmessage = null;
+          }
+          processor.onaudioprocess = null;
+          try { processor.disconnect(); } catch (_) { }
+          processor = null;
+        }
+        if (micSource) {
+          try { micSource.disconnect(); } catch (_) { }
+          micSource = null;
+        }
+        if (micStream) {
+          micStream.getTracks().forEach(t => t.stop());
+          micStream = null;
+        }
+      }
+
       function teardownCallState() {
         clearAutoListenTimers();
+        onWorkletFlushed = null;
         callActive = false;
         recording = false;
         resetAudioInputState();
         stopPlayback();
+        releaseMicrophone();
         setCallButtons(false);
+        refreshState();
       }
 
       function startListeningTurn() {
@@ -225,6 +252,13 @@
       }
 
       function refreshState() {
+        const finishBtn = $('btnFinish');
+        if (finishBtn) {
+          finishBtn.disabled = !recording;
+          finishBtn.style.opacity = recording ? '1' : '0.5';
+          finishBtn.style.cursor = recording ? 'pointer' : 'not-allowed';
+        }
+
         if (!ws || ws.readyState !== WebSocket.OPEN) {
           $('state').textContent = 'Mất kết nối';
           return;
@@ -298,6 +332,91 @@
         }
       }
 
+      const WORKLET_CODE = `
+class MicProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.resamplePhase = 0;
+    this.resamplePrevSample = null;
+    this.frameSamples = 1600;
+    this.targetSr = 16000;
+    this.buf = new Float32Array(this.frameSamples);
+    this.fill = 0;
+
+    this.port.onmessage = (e) => {
+      if (e.data && e.data.type === 'reset') {
+        this.fill = 0;
+        this.resamplePhase = 0;
+        this.resamplePrevSample = null;
+      } else if (e.data && e.data.type === 'flush') {
+        this.flush();
+      }
+    };
+  }
+
+  flush() {
+    if (this.fill > 0) {
+      const pcm = new ArrayBuffer(this.fill * 2);
+      const view = new DataView(pcm);
+      for (let i = 0; i < this.fill; i++) {
+        const s = Math.max(-1, Math.min(1, this.buf[i]));
+        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      }
+      this.port.postMessage({ flushed: true, pcm }, [pcm]);
+      this.fill = 0;
+    } else {
+      this.port.postMessage({ flushed: true, pcm: null });
+    }
+  }
+
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || !input[0] || input[0].length === 0) return true;
+    const chunk = input[0];
+    const inRate = sampleRate;
+    const outRate = this.targetSr;
+    const ratio = inRate / outRate;
+    const outLen = Math.floor((chunk.length - this.resamplePhase) / ratio);
+    if (outLen <= 0) {
+      this.resamplePhase -= chunk.length;
+      return true;
+    }
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const pos = this.resamplePhase + i * ratio;
+      const i0 = Math.floor(pos);
+      const frac = pos - i0;
+      const p0 = (i0 < 0) ? (this.resamplePrevSample ?? chunk[0]) : chunk[i0];
+      const p1 = (i0 + 1 < chunk.length) ? chunk[i0 + 1] : chunk[chunk.length - 1];
+      out[i] = p0 + (p1 - p0) * frac;
+    }
+    this.resamplePhase = (this.resamplePhase + outLen * ratio) - chunk.length;
+    this.resamplePrevSample = chunk[chunk.length - 1];
+
+    let offset = 0;
+    while (offset < out.length) {
+      const needed = this.frameSamples - this.fill;
+      const toCopy = Math.min(needed, out.length - offset);
+      this.buf.set(out.subarray(offset, offset + toCopy), this.fill);
+      this.fill += toCopy;
+      offset += toCopy;
+      if (this.fill === this.frameSamples) {
+        const pcm = new ArrayBuffer(this.frameSamples * 2);
+        const view = new DataView(pcm);
+        for (let i = 0; i < this.frameSamples; i++) {
+          const s = Math.max(-1, Math.min(1, this.buf[i]));
+          view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        }
+        this.port.postMessage({ flushed: false, pcm }, [pcm]);
+        this.fill = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('mic-processor', MicProcessor);
+`;
+
       async function ensureAudio() {
         if (!ctx) {
           ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -329,27 +448,81 @@
           micSource.connect(lowpass1);
           lowpass1.connect(lowpass2);
 
-          processor = ctx.createScriptProcessor(2048, 1, 1);
-          processor.onaudioprocess = onMic;
-          lowpass2.connect(processor);
+          let useWorklet = false;
+          if (ctx.audioWorklet && typeof ctx.audioWorklet.addModule === 'function') {
+            try {
+              if (!workletRegistered) {
+                const workletBlob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+                const workletUrl = URL.createObjectURL(workletBlob);
+                await ctx.audioWorklet.addModule(workletUrl);
+                URL.revokeObjectURL(workletUrl);
+                workletRegistered = true;
+              }
 
-          // Nối qua Gain(0) để kích hoạt processor mà không phát ra loa
-          const mute = ctx.createGain();
-          mute.gain.value = 0;
-          processor.connect(mute);
-          mute.connect(ctx.destination);
+              const workletNode = new AudioWorkletNode(ctx, 'mic-processor');
+              workletNode.port.onmessage = (e) => {
+                const { flushed, pcm } = e.data || {};
+                if (pcm && (recording || flushed) && isWsOpen() && !isBotBusy()) {
+                  ws.send(pcm);
+                }
+                if (flushed && typeof onWorkletFlushed === 'function') {
+                  const cb = onWorkletFlushed;
+                  onWorkletFlushed = null;
+                  cb();
+                }
+              };
+              lowpass2.connect(workletNode);
+
+              const mute = ctx.createGain();
+              mute.gain.value = 0;
+              workletNode.connect(mute);
+              mute.connect(ctx.destination);
+
+              processor = workletNode;
+              useWorklet = true;
+            } catch (err) {
+              console.warn("AudioWorklet không khởi tạo được, dùng ScriptProcessor fallback:", err);
+            }
+          }
+
+          if (!useWorklet) {
+            processor = ctx.createScriptProcessor(2048, 1, 1);
+            processor.onaudioprocess = onMic;
+            lowpass2.connect(processor);
+
+            // Nối qua Gain(0) để kích hoạt processor mà không phát ra loa
+            const mute = ctx.createGain();
+            mute.gain.value = 0;
+            processor.connect(mute);
+            mute.connect(ctx.destination);
+          }
         }
       }
 
       function stopTalking() {
         if (!recording) return;
         recording = false;
-        if (frameFill > 0 && isWsOpen()) {
-          ws.send(toPcm16(frameBuf.subarray(0, frameFill)));
-        }
-        resetAudioInputState();
-        sendJson({ type: 'stop_turn' });
         refreshState();
+
+        if (processor && processor.port) {
+          let sent = false;
+          const finishTurn = () => {
+            if (sent) return;
+            sent = true;
+            onWorkletFlushed = null;
+            resetAudioInputState();
+            sendJson({ type: 'stop_turn' });
+          };
+          onWorkletFlushed = finishTurn;
+          processor.port.postMessage({ type: 'flush' });
+          setTimeout(finishTurn, 100);
+        } else {
+          if (frameFill > 0 && isWsOpen()) {
+            ws.send(toPcm16(frameBuf.subarray(0, frameFill)));
+          }
+          resetAudioInputState();
+          sendJson({ type: 'stop_turn' });
+        }
       }
 
       function stopPlayback() {
@@ -424,9 +597,6 @@
           setErr(`Tự động ngắt khi đọc xong mã/số (Độ tin cậy: ${(m.probability * 100).toFixed(1)}%)`);
         } else {
           setErr(`Tự động ngắt khi dứt câu (Độ tin cậy: ${(m.probability * 100).toFixed(1)}%)`);
-        }
-        if (frameFill > 0 && isWsOpen()) {
-          ws.send(toPcm16(frameBuf.subarray(0, frameFill)));
         }
         resetAudioInputState();
         recording = false;
@@ -517,6 +687,10 @@
           setErr('Bot đang nói. Vui lòng chờ bot nói xong.');
           return;
         }
+
+        // Dọn dẹp trạng thái cũ TRƯỚC khi mở micro
+        teardownCallState();
+
         try {
           await ensureAudio();
         } catch (e) {
@@ -524,7 +698,6 @@
           return;
         }
 
-        teardownCallState();
         setErr('');
         $('you').textContent = '';
         $('bot').textContent = '';

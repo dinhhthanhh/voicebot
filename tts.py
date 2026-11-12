@@ -65,15 +65,15 @@ SYSTEM_PROMPT = """
 
 
 async def _stream_with_client(
-    c: httpx.AsyncClient, url: str, body: dict[str, Any]
+    client: httpx.AsyncClient, url: str, body: dict[str, Any]
 ) -> AsyncIterator[str]:
     """Kết nối HTTP streaming tới server OpenAI-compatible và đọc từng delta content."""
-    async with c.stream("POST", url, json=body) as r:
-        if r.status_code != HTTP_STATUS_OK:
-            raw = await r.aread()
+    async with client.stream("POST", url, json=body) as response:
+        if response.status_code != HTTP_STATUS_OK:
+            raw = await response.aread()
             err_msg = raw.decode("utf-8", errors="replace")[:ERR_MSG_MAX_LEN]
-            raise RuntimeError(f"LLM HTTP {r.status_code}: {err_msg}")
-        async for line in r.aiter_lines():
+            raise RuntimeError(f"LLM HTTP {response.status_code}: {err_msg}")
+        async for line in response.aiter_lines():
             if not line.startswith("data:"):
                 continue
             data = line[5:].strip()
@@ -124,7 +124,15 @@ URL_RE            = re.compile(r"https?://[^\s<>()]+")
 MARK_RE           = re.compile(r"(\*\*|__|\*|`|~~)")
 PREFIX_RE         = re.compile(r"^(#{1,6}\s+|[-*+•]\s+|\d+[.)]\s+|>\s*)")
 RULE_RE           = re.compile(r"^[-*_=\s]{3,}$")
-SENT_RE           = re.compile(r"(?<=[.!?…])(?<!\.\.)\s+")
+ABBREV_LOOKBEHINDS = (
+    r"(?<!\bTP\.)(?<!\bTp\.)(?<!\btp\.)"
+    r"(?<!\bMr\.)(?<!\bMrs\.)(?<!\bMs\.)(?<!\bDr\.)(?<!\bProf\.)(?<!\bSt\.)"
+    r"(?<!\bThS\.)(?<!\bTS\.)(?<!\bBS\.)(?<!\bGS\.)(?<!\bPGS\.)"
+    r"(?<!\b[A-Z]\.)"
+    r"(?<!\bv\.v\.)"
+    r"(?<!\.\.)"
+)
+SENT_RE           = re.compile(rf"{ABBREV_LOOKBEHINDS}(?<=[.!?…])\s+")
 MATH_RE           = re.compile(r"\$\$.+?\$\$|\$[^$\n]+\$")
 WORD_CHAR_RE      = re.compile(r"\w")
 SENT_END_PUNCT_RE = re.compile(r"[.!?…:;,]$")
@@ -201,59 +209,52 @@ class SpeechFilter:
             self._push(remaining, out, end=True, force=True)
         return out
 
-    def _detect_line_kind(self, s: str, complete: bool) -> LineKind | None:
+    def _detect_line_kind(self, stripped: str, complete: bool) -> LineKind | None:
         """Nhận diện loại dòng Markdown: code block fence, bảng biểu, quy tắc phân cách hoặc văn xuôi."""
-        if not s:
+        if not stripped:
             return None
-        if not complete and s.startswith("`") and len(s) < 3:
+        if not complete and stripped.startswith("`") and len(stripped) < 3:
             return LineKind.WAIT
-        if s.startswith("```"):
+        if stripped.startswith("```"):
             return LineKind.FENCE
         if self.in_code:
             return LineKind.SKIP
-        if s.startswith("|"):
+        if stripped.startswith("|"):
             return LineKind.TABLE
-        if complete and RULE_RE.match(s):
+        if complete and RULE_RE.match(stripped):
             return LineKind.SKIP
         return LineKind.PROSE
 
-    def _handle_fence(self, s: str, text: str, complete: bool, out: list[str]) -> str:
+    def _handle_fence(self, text: str, complete: bool) -> str:
         """Xử lý khối code Markdown ``` (bật/tắt trạng thái và bỏ qua nội dung code)."""
         if not complete:
             return text
-        if not self.in_code:
-            self.in_code = True
-        else:
-            self.in_code = False
-            rest = s[3:].strip()
-            if rest:
-                for p in SENT_RE.split(rest):
-                    self._push(p, out, end=complete)
+        self.in_code = not self.in_code
         return ""
 
-    def _handle_prose(self, text: str, s: str, complete: bool, out: list[str]) -> str:
+    def _handle_prose(self, text: str, stripped: str, complete: bool, out: list[str]) -> str:
         """Xử lý văn bản tự nhiên thông thường: loại bỏ tiền tố danh sách và tách thành từng câu."""
-        t = PREFIX_RE.sub("", s, count=1) if self.fresh else text
-        parts = SENT_RE.split(t)
+        line_text = PREFIX_RE.sub("", stripped, count=1) if self.fresh else text
+        parts = SENT_RE.split(line_text)
 
         if complete:
-            for p in parts:
-                self._push(p, out, end=True)
+            for part in parts:
+                self._push(part, out, end=True)
             return ""
 
         if len(parts) > 1:
-            for p in parts[:-1]:
-                self._push(p, out)
+            for part in parts[:-1]:
+                self._push(part, out)
             self.fresh = False
             return parts[-1]
         return text
 
     def _handle(self, text: str, complete: bool, out: list[str]) -> str:
         """Phân loại và điều phối xử lý từng dòng văn bản theo loại nội dung."""
-        s = text.lstrip()
+        stripped = text.lstrip()
 
         if self.kind is None:
-            detected = self._detect_line_kind(s, complete)
+            detected = self._detect_line_kind(stripped, complete)
             if detected is None:
                 return "" if complete else text
             if detected == LineKind.WAIT:
@@ -261,12 +262,12 @@ class SpeechFilter:
             self.kind = detected
 
         if self.kind == LineKind.FENCE:
-            return self._handle_fence(s, text, complete, out)
+            return self._handle_fence(text, complete)
 
         if self.kind in (LineKind.SKIP, LineKind.TABLE):
             return ""
 
-        return self._handle_prose(text, s, complete, out)
+        return self._handle_prose(text, stripped, complete, out)
 
     def _push(self, sent: str, out: list[str], end: bool = False, force: bool = False) -> None:
         """Kiểm tra và đưa câu vào danh sách xuất khẩu."""
@@ -334,6 +335,11 @@ UNITS_VI = {
     "đồng": "đồng", "vnd": "đồng", "vnđ": "đồng", "k": "nghìn", "%": "phần trăm",
 }
 
+DECIMAL_MEASURE_UNITS = {
+    "ki lô gam", "gam", "ki lô mét", "mét", "xen ti mét", "mi li mét",
+    "mét vuông", "mét khối", "héc ta", "phần trăm", "lít", "tấn",
+}
+
 _UNIT_PAT = "|".join(re.escape(u) for u in sorted(UNITS_VI.keys(), key=len, reverse=True))
 
 # Biểu thức chính quy chuẩn hóa số điện thoại, ngày tháng, tiền tệ và đơn vị đo lường
@@ -343,14 +349,22 @@ PHONE_RE           = re.compile(r"\b(0\d{2,3})[\s.-]+(\d{3,4})[\s.-]+(\d{3,4})\b
 DATE_DMY_RE        = re.compile(r"(?:\bngày\s+)?(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})\b", re.IGNORECASE)
 MONTH_YEAR_RE      = re.compile(r"\btháng\s+(\d{1,2})[/.-](\d{4})\b", re.IGNORECASE)
 DATE_DM_RE         = re.compile(r"\bngày\s+(\d{1,2})[/.-](\d{1,2})\b", re.IGNORECASE)
+SERVICE_247_RE     = re.compile(r"\b24\s*/\s*7\b")
+ADDRESS_SLASH_RE   = re.compile(r"\b(số|ngõ|ngách|hẻm|địa chỉ)\s+(\d+)\s*/\s*(\d+)\b", re.IGNORECASE)
+DATE_PREP_DM_RE    = re.compile(
+    r"\b(ngày|vào|từ|đến|hôm|hạn|lễ|đợt|trước|sau|giao|dự kiến)\s+([0-2]?\d|3[01])\s*[/.-]\s*(0?[1-9]|1[0-2])\b",
+    re.IGNORECASE,
+)
+STANDALONE_DATE_DM_RE = re.compile(r"\b(1[3-9]|2\d|3[01])\s*/\s*(0?[1-9]|1[0-2])\b")
 DECIMAL_SEP_RE     = re.compile(r"[.,]")
-UNIT_TOKEN_RE      = re.compile(r"^([0-9][0-9.,/]*)([a-zA-ZđĐ%²³]+[23]?|đồng)$", re.IGNORECASE)
+UNIT_TOKEN_RE      = re.compile(r"^([0-9][0-9.,]*)([a-zA-ZđĐ%²³]+[23]?|đồng)$", re.IGNORECASE)
 HAS_ALPHA_RE       = re.compile(r"[A-Za-z]")
 HAS_DIGIT_RE       = re.compile(r"\d")
-GROUPED_NUMBER_RE  = re.compile(r"[1-9]\d{0,2}(?:[.,]\d{3})+")
+GROUPED_NUMBER_RE  = re.compile(r"[1-9]\d{0,2}(?:\.\d{3})+|[1-9]\d{0,2}(?:,\d{3}){2,}")
 DECIMAL_NUMBER_RE  = re.compile(r"\d+[.,]\d+")
-TTS_TOKEN_RE       = re.compile(r"\b[A-Za-z0-9.,/²]+(?:%|[đĐ](?:ồng)?|vnd|vnđ)?", re.IGNORECASE)
-SPACE_GROUPED_RE   = re.compile(rf"\b(\d{{1,3}}(?:\s\d{{3}})+)(?=\s*(?:{_UNIT_PAT})\b)", re.IGNORECASE)
+TTS_TOKEN_RE       = re.compile(r"\b(?=[A-Za-z0-9.,²³]*\d)[A-Za-z0-9.,²³]+(?:%|[đĐ](?:ồng)?|vnd|vnđ)?", re.IGNORECASE)
+SLASH_NUM_RE       = re.compile(r"(?<=\d)\s*/\s*(?=\d)")
+SPACE_GROUPED_RE   = re.compile(rf"\b(\d{{1,3}}(?:\s\d{{3}})+)(?=\s*(?:{_UNIT_PAT})(?=[.,;!?]|\s|$))", re.IGNORECASE)
 UNIT_WITH_SPACE_RE = re.compile(rf"\b([0-9][0-9.,]*)\s+({_UNIT_PAT})(?=[.,;!?]|\s|$)", re.IGNORECASE)
 # fmt: on
 
@@ -405,6 +419,18 @@ def _replace_token_for_tts(match: re.Match) -> str:
         spoken = _read_numeric_token(tok)
         return spoken + unit + punct
 
+    clean_unit = unit.strip()
+    # Trong tiếng Việt, dấu phẩy (VD: 1,250 kg) là số thập phân;
+    # còn dấu chấm có 3 chữ số (VD: 1.500 g, 1.700 km) là phân cách hàng nghìn.
+    if clean_unit in DECIMAL_MEASURE_UNITS and tok.count(",") == 1 and tok.count(".") == 0:
+        spoken = _read_decimal_token(tok)
+        return spoken + unit + punct
+
+    if clean_unit in ("đồng", "nghìn") and re.fullmatch(r"[1-9]\d{0,2}[.,]\d{3}", tok):
+        clean_digits = DECIMAL_SEP_RE.sub("", tok)
+        spoken = num2words(int(clean_digits), lang="vi")
+        return spoken + unit + punct
+
     if GROUPED_NUMBER_RE.fullmatch(tok):
         clean_digits = DECIMAL_SEP_RE.sub("", tok)
         spoken = num2words(int(clean_digits), lang="vi")
@@ -418,17 +444,26 @@ def _replace_token_for_tts(match: re.Match) -> str:
 
 
 def _normalize_dates(text: str) -> str:
-    """Chuẩn hóa các định dạng ngày tháng (DD/MM/YYYY, tháng MM/YYYY, ngày DD/MM) thành lời nói tự nhiên."""
+    """Chuẩn hóa các định dạng ngày tháng (DD/MM/YYYY, tháng MM/YYYY, ngày DD/MM, 15/11) thành lời nói tự nhiên."""
+    text = SERVICE_247_RE.sub("hai tư trên bảy", text)
+    text = ADDRESS_SLASH_RE.sub(r"\1 \2 xuyệt \3", text)
     text = DATE_DMY_RE.sub(
         lambda m: f"ngày {int(m.group(1))} tháng {int(m.group(2))} năm {m.group(3)}", text
     )
     text = MONTH_YEAR_RE.sub(lambda m: f"tháng {int(m.group(1))} năm {m.group(2)}", text)
-    return DATE_DM_RE.sub(lambda m: f"ngày {int(m.group(1))} tháng {int(m.group(2))}", text)
+    text = DATE_DM_RE.sub(lambda m: f"ngày {int(m.group(1))} tháng {int(m.group(2))}", text)
+    text = DATE_PREP_DM_RE.sub(
+        lambda m: f"{m.group(1)} ngày {int(m.group(2))} tháng {int(m.group(3))}", text
+    )
+    return STANDALONE_DATE_DM_RE.sub(
+        lambda m: f"ngày {int(m.group(1))} tháng {int(m.group(2))}", text
+    )
 
 
 def normalize_text_for_tts(text: str) -> str:
     """Chuẩn hóa ngày tháng, số điện thoại, đơn vị, tiền tệ và số liệu trong văn bản trước khi đọc thành tiếng."""
     text = _normalize_dates(text)
+    text = SLASH_NUM_RE.sub(" trên ", text)
     text = PHONE_PAREN_RE.sub(r"0\1\2\3", text)
     text = PHONE_INTL_RE.sub(r"0\1\2\3", text)
     text = PHONE_RE.sub(r"\1\2\3", text)

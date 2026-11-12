@@ -1,3 +1,4 @@
+# Danh sách thư viện phụ thuộc (Đồng bộ từ pyproject.toml [project.dependencies])
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
 httpx>=0.28.1

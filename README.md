@@ -16,8 +16,8 @@ Hệ thống trợ lý giọng nói đàm thoại thời gian thực độ trễ
 - **Chuẩn hóa văn bản Tiếng Việt nâng cao:**
   - **Số điện thoại & Mã bưu chính:** Nhận dạng số di động 10 số, số cố định dạng `(024) 3xxx`, mã quốc gia `+84` và mã bưu chính VNPost (5 số).
   - **Cách đọc số ghép tự nhiên:** Chuyển đổi mượt mà các cụm chục (*"mươi"*, *"mười"*), lẻ (*"linh"*, *"lẻ"*), và tròn nghìn/trăm (*"mười nghìn"*, *"mười hai nghìn năm trăm"*).
-  - **Số và tiền tệ:** Phân biệt chính xác phân cách hàng nghìn (`1.500`, `1,500`) và số thập phân (`0,007` → đọc là "không phẩy không không bảy"); hỗ trợ ký hiệu tiền tệ (`đồng`, `VNĐ`, `$`, `€`).
-  - **Đơn vị & ký hiệu:** Đổi tự động các đơn vị thông dụng (`km`, `cm`, `kg`, `%`, `°C`...).
+  - **Số và tiền tệ:** Phân biệt chính xác phân cách hàng nghìn (`1.500`, `1,500`) và số thập phân (`0,007` → đọc là "không phẩy không không bảy"); hỗ trợ các ký hiệu tiền tệ thông dụng (`đồng`, `VNĐ`, `đ`, `k`).
+  - **Đơn vị & ký hiệu:** Đổi tự động các đơn vị đo lường thông dụng (`km`, `m`, `cm`, `mm`, `kg`, `g`, `ha`, `m²`, `m³`, `m2`, `m3`, `%`...).
   - **Biểu thức & đường dẫn:** Chuẩn hóa biểu thức toán học, đường dẫn URL sang văn phong giao tiếp trực tiếp.
   - **Capping:** Giới hạn độ dài và số lượng câu đọc tối đa nhằm giữ câu trả lời thoại súc tích, mạch lạc.
 
@@ -25,11 +25,14 @@ Hệ thống trợ lý giọng nói đàm thoại thời gian thực độ trễ
 - **Kiến trúc phát hiện 2 tầng:** Kết hợp **Silero VAD v5** (phát hiện giọng nói / khoảng lặng) và **Smart Turn v3.2 ONNX** (phân tích ngữ nghĩa âm học xem người dùng đã dứt ý hay chưa).
 - **Bộ lọc năng lượng RMS & Ngưỡng trễ:** Ngăn tiếng ồn nền và hơi thở gây kích hoạt giả bằng cơ chế hysteresis trễ:
   - Bắt đầu nói: Xác suất VAD $\ge 0.50$ và RMS $\ge 0.003$.
-  - Duy trì nói: Xác suất VAD $\ge 0.30$ hoặc RMS $\ge 0.002$.
+  - Duy trì nói: Xác suất VAD $\ge 0.30$ và RMS $\ge 0.002$.
 - **Ngưỡng quyết định ngắt câu linh hoạt:**
-  - Tự tin cao ($\ge 0.65$): Ngắt nhạy sau $0.7\text{s}$ im lặng.
-  - Tự tin mở rộng ($\ge 0.50$): Ngắt sau $1.4\text{s}$ im lặng đối với câu dứt khoát không ngập ngừng.
-  - Hết thời gian im lặng: Tự động ngắt khi im lặng tuyệt đối $\ge 2.0\text{s}$ hoặc $2.5\text{s}$ đồng hồ thực đối với các câu ngập ngừng / đọc dở dãy số.
+  - Tự tin cao ($\ge 0.65$): Ngắt nhạy sau $0.7\text{s}$ im lặng (câu thường) hoặc $1.4\text{s}$ (khi ngập ngừng) hoặc $1.8\text{s}$ (khi đọc xong dãy số).
+  - Tự tin trung bình ($\ge 0.50$): Ngắt sau $1.4\text{s}$ im lặng đối với câu dứt khoát không ngập ngừng.
+  - Hết thời gian im lặng (Timeout an toàn):
+    - Câu thường: Tự động ngắt khi im lặng $\ge 2.0\text{s}$ (hoặc $\ge 2.5\text{s}$ theo đồng hồ thực).
+    - Câu ngập ngừng / đọc dở dãy số: Tự động gia hạn tới $4.0\text{s}$ im lặng (hoặc $\ge 4.0\text{s}$ theo đồng hồ thực).
+    - Chỉ nói từ đệm (ừ, à, ờ...): Tự động ngắt sau $2.0\text{s}$ im lặng.
 - **Bảo vệ ngữ cảnh dở dang:** Tự động tăng thời gian chờ nếu người dùng đang đọc dở số điện thoại/dãy số hoặc kết thúc bằng các từ nối/ngập ngừng (*"và"*, *"hoặc"*, *"thì"*, *"nhưng"*, *"là"*...).
 
 ### 4. Giao diện Web & Trải nghiệm đàm thoại liên tục

@@ -49,7 +49,9 @@ def _ort_session_options() -> ort.SessionOptions:
 class SttError(RuntimeError):
     """Ngoại lệ STT tự động chuyển mã lỗi (OVERLOADED, QUEUE_TIMEOUT...) thành câu tiếng Việt thân thiện."""
 
-    def __init__(self, payload: dict[str, Any]) -> None:
+    def __init__(self, payload: dict[str, Any] | str) -> None:
+        if isinstance(payload, str):
+            payload = {"message": payload}
         self.payload = payload
         code = payload.get("error_code") or payload.get("code") or ""
         if code in ("OVERLOADED", "QUEUE_TIMEOUT"):
@@ -137,7 +139,15 @@ class SttSession:
             async for raw in ws:
                 if isinstance(raw, bytes):
                     continue
-                msg = json.loads(raw)
+                try:
+                    msg = json.loads(raw)
+                except Exception as json_err:
+                    logger.warning("STT server trả về dữ liệu không phải JSON: %s", json_err)
+                    self.error = {"type": "error", "message": f"Dữ liệu STT không hợp lệ: {json_err}"}
+                    with contextlib.suppress(Exception):
+                        await self.on_event("error", self.error)
+                    break
+
                 kind = msg.get("type")
                 if kind == "partial" and msg.get("text"):
                     await self.on_event("partial", msg["text"])
@@ -150,6 +160,11 @@ class SttSession:
                     break
         except websockets.ConnectionClosed:
             pass
+        except Exception as exc:
+            logger.exception("Lỗi kết nối trong SttSession._read: %s", exc)
+            self.error = {"type": "error", "message": f"Lỗi nhận dạng giọng nói: {exc}"}
+            with contextlib.suppress(Exception):
+                await self.on_event("error", self.error)
         finally:
             self._done.set()
 
@@ -161,6 +176,12 @@ class SttSession:
                 await asyncio.wait_for(self._done.wait(), timeout)
             except TimeoutError:
                 logger.warning("STT finish timeout sau %.1fs", timeout)
+                if not self.error:
+                    self.error = {"type": "error", "message": f"STT finish timeout sau {timeout:.1f}s"}
+            except Exception as exc:
+                logger.warning("Lỗi gửi finish tới STT: %s", exc)
+                if not self.error:
+                    self.error = {"type": "error", "message": str(exc)}
             finally:
                 await self._close_ws()
         if self.error and not self.final_text:
@@ -200,10 +221,9 @@ WORD_TO_DIGIT = {
     "bảy": "7", "tám": "8", "chín": "9",
 }
 
-TEN_WORDS = {
-    "hai": "2", "ba": "3", "bốn": "4", "tư": "4", "năm": "5",
-    "sáu": "6", "bảy": "7", "tám": "8", "chín": "9",
-}
+EXTRA_DIGITS = {"mười": "10", "linh": "0", "lẻ": "0"}
+
+TEN_WORDS = {k: v for k, v in WORD_TO_DIGIT.items() if k not in ("không", "một", "mốt", "lăm")}
 
 # Câu ngắn hợp lệ (chốt lượt nhanh)
 SHORT_ANSWERS = {
@@ -211,19 +231,26 @@ SHORT_ANSWERS = {
     "chuẩn", "đồng ý", "alo", "xin chào", "cảm ơn", "tạm biệt",
 }
 
-# Hậu tố địa chỉ và số lượng đặc thù bưu chính VNPost
-ADDRESS_AND_NUM_SUFFIXES = (
+# Tiền tố danh từ/đơn vị đứng trước một chữ số (ví dụ: quận 1, bưu cục 3, số 5, ngõ 2, mã 9)
+NUMBER_PREFIXES = (
     "số", "ngõ", "ngách", "hẻm", "đường", "phố", "phường", "xã",
-    "quận", "huyện", "tỉnh", "thành phố", "mười", "trăm", "nghìn", "triệu", "mã", "vận đơn", "bưu cục",
+    "quận", "huyện", "tỉnh", "thành phố", "mã", "vận đơn", "bưu cục",
+    "căn hộ", "tầng", "phòng",
 )
+
+# Cụm từ địa chỉ bỏ lửng rõ ràng (chưa đọc tên/số địa chỉ)
+DANGLING_ADDRESS_SUFFIXES = ("ở số", "tại số", "nhà số", "ngõ", "ngách", "hẻm")
+ADDRESS_AND_NUM_SUFFIXES = NUMBER_PREFIXES
 
 # Từ nối ngập ngừng tối giản (giao phần lớn phán đoán ngữ điệu cho Smart Turn)
 HESITATION_SUFFIXES = ("và", "hoặc", "nhưng", "mà", "thì", "vì", "là", "về")
 # fmt: on
 
 _TENS = "|".join(TEN_WORDS)
-_UNITS = "|".join(WORD_TO_DIGIT)
 _DIGITS = "|".join(WORD_TO_DIGIT)
+_COMPOUND_UNITS = "|".join(w for w in WORD_TO_DIGIT if w not in ("không", "năm"))
+_TEEN_UNITS = "|".join(w for w in WORD_TO_DIGIT if w not in ("không", "mốt", "năm"))
+_NUM_HEAD = rf"(?:\d{{1,2}}|mười|{_DIGITS})"
 
 # Cụm cấu hình biểu thức chính quy (Regex) tập trung
 PATTERNS = {
@@ -235,31 +262,79 @@ PATTERNS = {
     "phone_prefix": re.compile(r"0[35789]"),
     "postal": re.compile(r"\b(bưu chính|bưu điện|postal|zip|mã vùng)\b"),
     "tracking": re.compile(r"(\d{3,}|\b(eb|vn|ems|cp|lp)\s*\d+)$", re.IGNORECASE),
-    "compound_tens": re.compile(rf"\b({_TENS})\s+mươi\s+({_UNITS})\b", re.IGNORECASE),
+    "compound_tens": re.compile(rf"\b({_TENS})\s+mươi\s+({_COMPOUND_UNITS})\b", re.IGNORECASE),
     "even_tens": re.compile(rf"\b({_TENS})\s+mươi\b", re.IGNORECASE),
-    "teens": re.compile(rf"\bmười\s+({_UNITS})\b", re.IGNORECASE),
-    "linh": re.compile(rf"\b(?:linh|lẻ)\s+({_UNITS})\b", re.IGNORECASE),
-    "tram": re.compile(
-        rf"\b(\d{{2}})\s*(?:nghìn|ngàn)\s*({_DIGITS}|[1-9])\s*trăm\b", re.IGNORECASE
+    "teens": re.compile(rf"\bmười\s+({_TEEN_UNITS})\b", re.IGNORECASE),
+    "nghin_ktram_linh": re.compile(
+        rf"\b({_NUM_HEAD})\s*(?:nghìn|ngàn)\s*không\s*trăm\s*(?:linh|lẻ)\s*({_DIGITS})\b",
+        re.IGNORECASE,
     ),
-    "nghin": re.compile(r"\b(\d{2})\s*(?:nghìn|ngàn)\b", re.IGNORECASE),
-    "muoi": re.compile(r"\bmười\b", re.IGNORECASE),
+    "nghin_tram_tens": re.compile(
+        rf"\b({_NUM_HEAD})\s*(?:nghìn|ngàn)\s*(\d|{_DIGITS})\s*trăm\s*(\d{{2}})\b",
+        re.IGNORECASE,
+    ),
+    "nghin_tram": re.compile(
+        rf"\b({_NUM_HEAD})\s*(?:nghìn|ngàn)\s*(\d|{_DIGITS})\s*trăm\b", re.IGNORECASE
+    ),
+    "nghin_linh": re.compile(
+        rf"\b({_NUM_HEAD})\s*(?:nghìn|ngàn)\s*(?:linh|lẻ)\s*({_DIGITS})\b", re.IGNORECASE
+    ),
+    "nghin_tens": re.compile(
+        rf"\b({_NUM_HEAD})\s*(?:nghìn|ngàn)\s*(\d{{2}})\b", re.IGNORECASE
+    ),
+    "nghin": re.compile(rf"\b({_NUM_HEAD})\s*(?:nghìn|ngàn)\b", re.IGNORECASE),
+    "tram_linh": re.compile(
+        rf"\b(\d|{_DIGITS})\s*trăm\s*(?:linh|lẻ)\s*({_DIGITS})\b", re.IGNORECASE
+    ),
+    "tram_tens": re.compile(rf"\b(\d|{_DIGITS})\s*trăm\s*(\d{{2}})\b", re.IGNORECASE),
+    "tram_even": re.compile(rf"\b(\d|{_DIGITS})\s*trăm\b", re.IGNORECASE),
+    "seq_lead_in": re.compile(
+        r"(?:\b(?:số|số\s+điện\s+thoại|điện\s+thoại|sđt|đầu\s+số|mã\s+vận\s+đơn|mã\s+bưu\s+chính|mã\s+bưu\s+điện|mã\s+zip|mã\s+vùng|mã\s+đơn|mã\s+số|mã|vận\s+đơn|tài\s+khoản|stk|căn\s+cước|cccd|cmnd)(?:\s+(?:của\s+)?(?:tôi|em|anh|chị|mình|bạn|khách|cháu))?\s+(?:là|là\s+số|số)?|\b(?:số\s+điện\s+thoại|sđt|đầu\s+số|mã\s+vận\s+đơn|mã\s+bưu\s+chính|mã\s+bưu\s+điện|mã\s+zip|mã\s+đơn|vận\s+đơn))$",
+        re.IGNORECASE,
+    ),
+    "question_tag": re.compile(
+        r"\b(?:có|phải|được|đúng|biết|thấy|nghe|rảnh)\b.*\bkhông$",
+        re.IGNORECASE,
+    ),
 }
 
 
+def _to_digit(word_or_digit: str) -> str:
+    """Chuyển đổi một từ số hoặc chữ số sang chuỗi chữ số."""
+    w = word_or_digit.lower()
+    if w == "mười":
+        return "10"
+    return WORD_TO_DIGIT.get(w, w)
+
+
 def normalize_compound_numbers(text: str) -> str:
-    """Chuẩn hóa cách đọc số ghép tiếng Việt (hàng chục, mười, linh/lẻ, tròn nghìn) thành chữ số."""
+    """Chuẩn hóa cách đọc số ghép tiếng Việt (hàng chục, mười, linh/lẻ, hàng trăm, tròn nghìn) thành chữ số."""
     text = PATTERNS["compound_tens"].sub(
         lambda m: f"{TEN_WORDS[m.group(1).lower()]}{WORD_TO_DIGIT[m.group(2).lower()]}", text
     )
     text = PATTERNS["even_tens"].sub(lambda m: f"{TEN_WORDS[m.group(1).lower()]}0", text)
     text = PATTERNS["teens"].sub(lambda m: f"1{WORD_TO_DIGIT[m.group(1).lower()]}", text)
-    text = PATTERNS["linh"].sub(lambda m: f"0{WORD_TO_DIGIT[m.group(1).lower()]}", text)
-    text = PATTERNS["muoi"].sub("10", text)
-    text = PATTERNS["tram"].sub(
-        lambda m: f"{m.group(1)}{WORD_TO_DIGIT.get(m.group(2).lower(), m.group(2))}00", text
+    text = PATTERNS["nghin_ktram_linh"].sub(
+        lambda m: f"{_to_digit(m.group(1))}00{_to_digit(m.group(2))}", text
     )
-    return PATTERNS["nghin"].sub(r"\g<1>000", text)
+    text = PATTERNS["nghin_tram_tens"].sub(
+        lambda m: f"{_to_digit(m.group(1))}{_to_digit(m.group(2))}{m.group(3)}", text
+    )
+    text = PATTERNS["nghin_tram"].sub(
+        lambda m: f"{_to_digit(m.group(1))}{_to_digit(m.group(2))}00", text
+    )
+    text = PATTERNS["nghin_linh"].sub(
+        lambda m: f"{_to_digit(m.group(1))}00{_to_digit(m.group(2))}", text
+    )
+    text = PATTERNS["nghin_tens"].sub(
+        lambda m: f"{_to_digit(m.group(1))}0{m.group(2)}", text
+    )
+    text = PATTERNS["nghin"].sub(lambda m: f"{_to_digit(m.group(1))}000", text)
+    text = PATTERNS["tram_linh"].sub(
+        lambda m: f"{_to_digit(m.group(1))}0{_to_digit(m.group(2))}", text
+    )
+    text = PATTERNS["tram_tens"].sub(lambda m: f"{_to_digit(m.group(1))}{m.group(2)}", text)
+    return PATTERNS["tram_even"].sub(lambda m: f"{_to_digit(m.group(1))}00", text)
 
 
 def normalize_text(text: str) -> str:
@@ -279,6 +354,16 @@ def _flush_digit_run(digit_run: list[tuple[str, str]], converted: list[str]) -> 
         converted.extend(d[0] for d in digit_run)
 
 
+def _has_following_digit(tokens: list[str], start_idx: int) -> bool:
+    """Kiểm tra xem phía sau token hiện tại có chứa từ đọc số hoặc chữ số nào không."""
+    for j in range(start_idx, len(tokens)):
+        c = PATTERNS["clean"].sub("", tokens[j]).lower()
+        if c in ("linh", "lẻ"):
+            continue
+        return c in WORD_TO_DIGIT or c.isdigit() or c == "mười"
+    return False
+
+
 # 1. Chuẩn hóa số đọc bằng chữ thành chữ số
 def normalize_speech_input(text: str) -> str:
     """Tự động gom cụm từ đọc số tiếng Việt liên tiếp (>=5 số, hỗ trợ SĐT và mã bưu chính 5 số) thành chuỗi chữ số."""
@@ -287,11 +372,20 @@ def normalize_speech_input(text: str) -> str:
     converted: list[str] = []
     digit_run: list[tuple[str, str]] = []
 
-    for tok in tokens:
+    for i, tok in enumerate(tokens):
         clean_tok = PATTERNS["clean"].sub("", tok).lower()
         if clean_tok in WORD_TO_DIGIT:
             digit_run.append((tok, WORD_TO_DIGIT[clean_tok]))
-        elif re.fullmatch(r"\d+", clean_tok):
+        elif clean_tok == "mười":
+            digit_run.append((tok, "10"))
+        elif clean_tok in ("linh", "lẻ"):
+            if digit_run and _has_following_digit(tokens, i + 1):
+                digit_run.append((tok, "0"))
+            else:
+                _flush_digit_run(digit_run, converted)
+                digit_run = []
+                converted.append(tok)
+        elif clean_tok.isdigit():
             digit_run.append((tok, clean_tok))
         else:
             _flush_digit_run(digit_run, converted)
@@ -318,6 +412,30 @@ def is_only_filler(text: str) -> bool:
     return all(word in FILLER_WORDS for word in words)
 
 
+def _is_incomplete_digit_tail(norm: str, norm_digits: str, tail_match: re.Match[str]) -> bool:
+    """Kiểm tra phần đuôi chữ số có đang đọc dở (SĐT, mã bưu chính, đầu số địa chỉ)."""
+    if PATTERNS["question_tag"].search(norm):
+        return False
+
+    tail_digits = PATTERNS["spaces"].sub("", tail_match.group(1))
+    if len(tail_digits) >= 2:
+        if PATTERNS["postal"].search(norm):
+            return len(tail_digits) < 5
+        if len(tail_digits) == 10:
+            return False
+        phone_starts = list(PATTERNS["phone_prefix"].finditer(tail_digits))
+        if phone_starts:
+            last_start = phone_starts[-1].start()
+            return len(tail_digits[last_start:]) < 10
+        return len(tail_digits) < 10
+
+    if len(tail_digits) == 1:
+        prefix = norm_digits[: tail_match.start(1)].strip()
+        return _ends_with_any(prefix, NUMBER_PREFIXES) or bool(PATTERNS["seq_lead_in"].search(prefix))
+
+    return False
+
+
 # 2. Nhận diện người dùng đang đọc số điện thoại, mã vận đơn hoặc địa chỉ
 def is_reading_sequence(text: str) -> bool:
     """Phát hiện người dùng đang đọc dở dãy số (SĐT, mã bưu chính, mã vận đơn) hoặc địa chỉ."""
@@ -326,28 +444,16 @@ def is_reading_sequence(text: str) -> bool:
         return False
 
     norm_compound = normalize_compound_numbers(norm)
-    tokens = [WORD_TO_DIGIT.get(w, w) for w in norm_compound.split()]
+    tokens = [EXTRA_DIGITS.get(w, WORD_TO_DIGIT.get(w, w)) for w in norm_compound.split()]
     norm_digits = " ".join(tokens)
 
     tail_match = PATTERNS["digit_tail"].search(norm_digits)
-    if tail_match:
-        tail_digits = PATTERNS["spaces"].sub("", tail_match.group(1))
-        # Chỉ coi là dãy số/SĐT khi có >= 2 chữ số (loại trừ từ 'không' đơn lẻ cuối câu hỏi)
-        if len(tail_digits) >= 2:
-            # Nếu là mã bưu chính (5 chữ số) kèm từ khóa bưu chính/bưu điện/zip
-            if PATTERNS["postal"].search(norm):
-                return len(tail_digits) < 5
-
-            # Nếu có tiền tố đầu số di động VN (03, 05, 07, 08, 09), lấy cụm SĐT gần nhất
-            phone_starts = list(PATTERNS["phone_prefix"].finditer(tail_digits))
-            if phone_starts:
-                last_start = phone_starts[-1].start()
-                return len(tail_digits[last_start:]) < 10
-            return len(tail_digits) < 10
+    if tail_match and _is_incomplete_digit_tail(norm, norm_digits, tail_match):
+        return True
 
     if PATTERNS["tracking"].search(norm):
         return True
-    return _ends_with_any(norm, ADDRESS_AND_NUM_SUFFIXES)
+    return _ends_with_any(norm, DANGLING_ADDRESS_SUFFIXES)
 
 
 # 3. Chỉ nhận diện từ đệm và dấu hiệu bỏ lửng rõ ràng; nhường đánh giá ngữ nghĩa cho Smart Turn
@@ -485,16 +591,15 @@ class SmartTurnDetector:
         if self.session is None or self.feature_extractor is None:
             return {"probability": 0.0}
 
-        if len(audio_f32) > MAX_SAMPLES:
-            audio = audio_f32[-MAX_SAMPLES:]
-        elif len(audio_f32) < MAX_SAMPLES:
-            audio = np.pad(audio_f32, (MAX_SAMPLES - len(audio_f32), 0), mode="constant")
-        else:
-            audio = audio_f32
+        audio = audio_f32[-MAX_SAMPLES:] if len(audio_f32) > MAX_SAMPLES else audio_f32
 
-        mean = np.mean(audio)
-        std = np.std(audio)
-        audio = (audio - mean) / np.sqrt(std**2 + 1e-7)
+        if len(audio) > 0:
+            mean = np.mean(audio)
+            std = np.std(audio)
+            audio = (audio - mean) / np.sqrt(std**2 + 1e-7)
+
+        if len(audio) < MAX_SAMPLES:
+            audio = np.pad(audio, (MAX_SAMPLES - len(audio), 0), mode="constant")
 
         inputs = self.feature_extractor(
             audio,
