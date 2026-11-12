@@ -192,6 +192,7 @@ class VoiceSession:
         self._vad_lock = asyncio.Lock()
 
         self._pending_audio: deque[bytes] = deque(maxlen=50)
+        self._is_processing_audio = False
 
         self.detector = detector or get_detector()
         self.vad = VadStreamState(model=vad_model)
@@ -213,6 +214,7 @@ class VoiceSession:
         self.vad.reset()
         self.audio_buf.clear()
         self._pending_audio.clear()
+        self._is_processing_audio = False
         self.silence_frames = 0
         self.speech_frames = 0
         self.has_speech = False
@@ -295,7 +297,21 @@ class VoiceSession:
         if not self._is_turn_active() or self.stt is None:
             return
 
-        await self._process_frame(frame)
+        self._pending_audio.append(frame)
+        await self._drain_pending_audio()
+
+    async def _drain_pending_audio(self) -> None:
+        """Xả tuần tự các khung âm thanh trong _pending_audio tới STT/VAD theo thứ tự FIFO."""
+        if self._is_processing_audio:
+            return
+        self._is_processing_audio = True
+        try:
+            while self._pending_audio and self._is_turn_active():
+                frame = self._pending_audio.popleft()
+                if not await self._process_frame(frame):
+                    break
+        finally:
+            self._is_processing_audio = False
 
     async def _process_frame(self, frame: bytes) -> bool:
         """Chuyển tiếp khung âm thanh tới STT và cập nhật VAD."""
@@ -476,11 +492,7 @@ class VoiceSession:
 
         self.state = SessionState.LISTENING
 
-        if self._pending_audio:
-            while self._pending_audio:
-                pending_frame = self._pending_audio.popleft()
-                if not await self._process_frame(pending_frame):
-                    break
+        await self._drain_pending_audio()
 
     async def stop_turn(self) -> None:
         """Dừng nhận dạng và chuyển trạng thái sang suy nghĩ / tổng hợp câu trả lời."""
