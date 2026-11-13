@@ -77,9 +77,9 @@ VAD_RMS_START = 0.0025
 VAD_RMS_KEEP = 0.0015
 
 # Ngưỡng xác suất Smart Turn
-PROB_VERY_HIGH = 0.85  # Rất tự tin dứt câu (ngắt siêu nhanh ~400ms)
-PROB_HIGH = 0.70  # Tự tin dứt câu (~600ms)
-PROB_MID = 0.55  # Tự tin trung bình (~1.2s)
+PROB_VERY_HIGH = 0.85  # Rất tự tin dứt câu (ngắt siêu nhanh 500ms)
+PROB_HIGH = 0.70  # Tự tin dứt câu (700ms)
+PROB_MID = 0.55  # Tự tin trung bình (1.2s)
 WALL_TIMEOUT_S = 2.5  # Hết thời gian chờ im lặng theo đồng hồ thực tế (câu thường)
 WALL_EXTENDED_TIMEOUT_S = 3.5  # Hết thời gian chờ tối đa khi ngập ngừng hoặc đọc số
 
@@ -93,13 +93,13 @@ def ms_to_frames(ms: int) -> int:
 MIN_SPEECH_FRAMES = ms_to_frames(300)
 MIN_SILENCE_FRAMES = ms_to_frames(300)
 CHECK_INTERVAL = ms_to_frames(100)  # Kiểm tra mỗi 100ms để bắt tức thì khoảnh khắc dứt câu
-FRAMES_ULTRA_FAST = ms_to_frames(500)  # 500ms khi prob >= 0.80
-FRAMES_FAST = ms_to_frames(700)  # 700ms khi prob >= 0.65
-FRAMES_SLOW = ms_to_frames(1200)  # 1.2s khi prob >= 0.50
-FRAMES_SEQUENCE = ms_to_frames(1500)  # 1.5s khi đang đọc số
+FRAMES_ULTRA_FAST = ms_to_frames(500)  # 500ms khi prob >= 0.85 (PROB_VERY_HIGH)
+FRAMES_FAST = ms_to_frames(700)  # 700ms khi prob >= 0.70 (PROB_HIGH)
+FRAMES_SLOW = ms_to_frames(1200)  # 1.2s khi prob >= 0.55 (PROB_MID)
+FRAMES_SEQUENCE = ms_to_frames(1500)  # 1.5s khi đang đọc số hoặc mã vận đơn
 FILLER_TIMEOUT = ms_to_frames(2000)
 SILENCE_TIMEOUT = ms_to_frames(2000)
-TIMEOUT_EXTENDED = ms_to_frames(3500)
+TIMEOUT_EXTENDED = ms_to_frames(3500)  # 3.5s timeout tối đa khi ngập ngừng hoặc đọc số
 
 
 def decide_turn_end(
@@ -355,7 +355,7 @@ class VoiceSession:
         prob_threshold = VAD_PROB_KEEP if self.has_speech else VAD_PROB_START
         rms_threshold = VAD_RMS_KEEP if self.has_speech else VAD_RMS_START
 
-        # Khi Silero VAD tự tin là tiếng người, ưu tiên nhận diện kể cả khi nói thì thầm/nói nhỏ
+        # Khi Silero VAD tự tin là tiếng người (>= 0.70), duy trì theo ngưỡng RMS_KEEP để chống nhiễu ồn nền
         if speech_prob >= 0.70:
             return rms >= VAD_RMS_KEEP
 
@@ -369,7 +369,10 @@ class VoiceSession:
             self.silence_frames = 0
             self.last_speech_time = now
             self._last_detect_frame = 0
-        elif self.has_speech:
+        elif not self.has_speech:
+            # Chưa từng có tiếng nói trong lượt này: liên tục trượt mốc thời gian để không bị tích lũy wall_silence_s ảo
+            self.last_speech_time = now
+        else:
             self.silence_frames += 1
 
     def _schedule_detect(self) -> None:
@@ -654,9 +657,13 @@ class VoiceSession:
                 return
             new_text = str(payload or "").strip()
             if new_text:
-                self.last_partial_text = new_text
-                self.has_speech = True
-                self.speech_frames = max(self.speech_frames, MIN_SPEECH_FRAMES)
+                async with self._vad_lock:
+                    self.last_partial_text = new_text
+                    self.has_speech = True
+                    self.speech_frames = max(self.speech_frames, MIN_SPEECH_FRAMES)
+                    self.silence_frames = 0
+                    self.last_speech_time = time.monotonic()
+                    self._last_detect_frame = 0
             await self._send_ws({"type": "partial", "text": payload})
         elif kind == "error" and self.state in (SessionState.STARTING, SessionState.LISTENING):
             # Nếu đã chuyển sang THINKING (đang chạy _finalize_stt), để stt.finish() xử lý cùng fallback_text

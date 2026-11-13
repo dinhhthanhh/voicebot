@@ -25,16 +25,17 @@ Hệ thống trợ lý giọng nói đàm thoại thời gian thực độ trễ
 - **Kiến trúc phát hiện 2 tầng tách bạch:**
   - **Silero VAD v5 (Voice Activity Detection):** Chuyên trách phát hiện theo thời gian thực xem người dùng **có đang nói hay không** (phân biệt giọng nói với khoảng lặng và tạp âm môi trường).
   - **Smart Turn v3.2 ONNX (Turn-Taking Prediction):** Chuyên trách dự đoán xem người dùng **đã nói xong lượt hay chưa** bằng cách phân tích ngữ nghĩa âm học (cao độ rơi, ngữ điệu, khoảng lặng dứt câu) trên cửa sổ trượt tối đa 8 giây âm thanh gần nhất.
-- **Bộ lọc năng lượng RMS & Ngưỡng trễ:** Ngăn tiếng ồn nền và hơi thở gây kích hoạt giả bằng cơ chế hysteresis trễ (tối ưu bắt nhạy cả giọng nói nhỏ / thì thầm gần mic):
-  - Bắt đầu nói: Xác suất VAD $\ge 0.50$ và RMS $\ge 0.001$.
-  - Duy trì nói: Xác suất VAD $\ge 0.30$ và RMS $\ge 0.0006$.
-  - Ưu tiên giọng nói nhỏ: Khi Silero VAD nhận diện chắc chắn là tiếng người ($\ge 0.70$), chấp nhận RMS siêu nhỏ $\ge 0.0003$.
-- **Ngưỡng quyết định ngắt câu linh hoạt:**
-  - Tự tin cao ($\ge 0.65$): Ngắt nhạy sau $0.7\text{s}$ im lặng (câu thường) hoặc $1.4\text{s}$ (khi ngập ngừng) hoặc $1.8\text{s}$ (khi đọc xong dãy số).
-  - Tự tin trung bình ($\ge 0.50$): Ngắt sau $1.4\text{s}$ im lặng đối với câu dứt khoát không ngập ngừng.
+- **Bộ lọc năng lượng RMS & Ngưỡng trễ:** Ngăn tiếng ồn nền và hơi thở gây kích hoạt giả bằng cơ chế hysteresis trễ (đã tinh chỉnh chống nhiễu ồn phòng):
+  - Bắt đầu nói: Xác suất VAD $\ge 0.60$ và RMS $\ge 0.0025$.
+  - Duy trì nói: Xác suất VAD $\ge 0.40$ và RMS $\ge 0.0015$.
+  - Khi Silero VAD nhận diện chắc chắn là tiếng người ($\ge 0.70$): Duy trì theo ngưỡng RMS $\ge 0.0015$ (loại bỏ tiếng ồn nền tĩnh).
+- **Ngưỡng quyết định ngắt câu linh hoạt (phân tầng 3 mức Smart Turn):**
+  - Rất tự tin dứt câu ($\ge 0.85$): Ngắt siêu nhanh sau $0.5\text{s}$ ($500\text{ms}$) im lặng (hoặc $1.0\text{s}$ khi đọc xong dãy số).
+  - Tự tin cao ($\ge 0.70$): Ngắt sau $0.7\text{s}$ ($700\text{ms}$) im lặng (câu thường), $1.2\text{s}$ (khi ngập ngừng) hoặc $1.5\text{s}$ (khi đọc xong dãy số/mã vận đơn).
+  - Tự tin trung bình ($\ge 0.55$): Ngắt sau $1.2\text{s}$ im lặng đối với câu dứt khoát không ngập ngừng.
   - Hết thời gian im lặng (Timeout an toàn):
     - Câu thường: Tự động ngắt khi im lặng $\ge 2.0\text{s}$ (hoặc $\ge 2.5\text{s}$ theo đồng hồ thực).
-    - Câu ngập ngừng / đọc dở dãy số: Tự động gia hạn tới $4.0\text{s}$ im lặng (hoặc $\ge 4.0\text{s}$ theo đồng hồ thực).
+    - Câu ngập ngừng / đọc dở dãy số: Tự động gia hạn tới $3.5\text{s}$ im lặng (hoặc $\ge 3.5\text{s}$ theo đồng hồ thực).
     - Chỉ nói từ đệm (ừ, à, ờ...): Tự động ngắt sau $2.0\text{s}$ im lặng.
 - **Bảo vệ ngữ cảnh dở dang:** Tự động tăng thời gian chờ nếu người dùng đang đọc dở số điện thoại/dãy số hoặc kết thúc bằng các từ nối/ngập ngừng (*"và"*, *"hoặc"*, *"thì"*, *"nhưng"*, *"là"*...).
 
