@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from stt import (
     MAX_AUDIO_BYTES,
@@ -174,6 +174,11 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(INDEX_HTML)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    return Response(status_code=204)
 
 
 class VoiceSession:
