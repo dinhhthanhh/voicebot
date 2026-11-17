@@ -86,11 +86,17 @@ class SttError(RuntimeError):
 
 
 class SttSession:
-    """Quản lý một phiên STT streaming qua WebSocket cho trình duyệt."""
+    """Quản lý một phiên STT streaming qua WebSocket tới dịch vụ nhận dạng giọng nói."""
 
-    def __init__(self, url: str, on_event: Callable[[str, Any], Awaitable[None]]) -> None:
+    def __init__(
+        self,
+        url: str,
+        on_partial: Callable[[str], Awaitable[None]],
+        on_error: Callable[[Any], Awaitable[None]],
+    ) -> None:
         self.url = url
-        self.on_event = on_event
+        self.on_partial = on_partial
+        self.on_error = on_error
         self.ws: ClientConnection | None = None
         self.final_text = ""
         self.error: dict[str, Any] | None = None
@@ -103,7 +109,7 @@ class SttSession:
         for attempt in range(max_retries + 1):
             try:
                 await self._handshake()
-                self._reader = asyncio.create_task(self._read())
+                self._reader = asyncio.create_task(self._recv_loop())
                 return
             except SttError as exc:
                 await self._close_ws()
@@ -144,8 +150,8 @@ class SttSession:
         if self.ws is not None:
             await self.ws.send(pcm)
 
-    async def _read(self) -> None:
-        """Đọc kết quả từ server STT và kích hoạt callback sự kiện."""
+    async def _recv_loop(self) -> None:
+        """Đọc kết quả từ server STT và kích hoạt callback kết quả tạm thời hoặc lỗi."""
         ws = self.ws
         if ws is None:
             return
@@ -159,26 +165,26 @@ class SttSession:
                     logger.warning("STT server trả về dữ liệu không phải JSON: %s", json_err)
                     self.error = {"type": "error", "message": f"Dữ liệu STT không hợp lệ: {json_err}"}
                     with contextlib.suppress(Exception):
-                        await self.on_event("error", self.error)
+                        await self.on_error(self.error)
                     break
 
                 kind = msg.get("type")
                 if kind == "partial" and msg.get("text"):
-                    await self.on_event("partial", msg["text"])
+                    await self.on_partial(msg["text"])
                 elif kind == "final":
                     self.final_text = msg.get("text", "")
                     break
                 elif kind == "error":
                     self.error = msg
-                    await self.on_event("error", msg)
+                    await self.on_error(msg)
                     break
         except websockets.ConnectionClosed:
             pass
         except Exception as exc:
-            logger.exception("Lỗi kết nối trong SttSession._read: %s", exc)
+            logger.exception("Lỗi kết nối trong SttSession._recv_loop: %s", exc)
             self.error = {"type": "error", "message": f"Lỗi nhận dạng giọng nói: {exc}"}
             with contextlib.suppress(Exception):
-                await self.on_event("error", self.error)
+                await self.on_error(self.error)
         finally:
             self._done.set()
 
@@ -513,7 +519,7 @@ class SileroVadModel:
     def predict_chunk(
         self, chunk: np.ndarray, state: np.ndarray, sr: np.ndarray
     ) -> tuple[float, np.ndarray]:
-        """Chạy suy luận 1 khối 576 mẫu âm thanh float32 mono 16kHz (kèm 64 mẫu context)."""
+        """Chạy suy luận 1 khối 512 mẫu mới ghép 64 mẫu context (tổng 576 mẫu float32 mono 16kHz)."""
         if self.session is None:
             return 0.0, state
         outputs = cast(

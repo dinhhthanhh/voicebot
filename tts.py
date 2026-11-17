@@ -187,26 +187,26 @@ class SpeechFilter:
         self.capped = False
 
     def feed(self, delta: str) -> list[str]:
-        """Tiếp nhận một phần văn bản mới từ luồng LLM."""
+        """Tiếp nhận delta văn bản từ LLM, trả về danh sách câu hoàn chỉnh đã tách được."""
         self.buf += delta
         out: list[str] = []
         while "\n" in self.buf:
             line, self.buf = self.buf.split("\n", 1)
-            self._handle(line, complete=True, out=out)
+            self._route_line(line, complete=True, out=out)
             self.kind, self.fresh = None, True
-        self.buf = self._handle(self.buf, complete=False, out=out)
+        self.buf = self._route_line(self.buf, complete=False, out=out)
         return out
 
     def flush(self) -> list[str]:
         """Xả toàn bộ nội dung còn lại trong bộ đệm khi luồng LLM kết thúc."""
         out: list[str] = []
-        self._handle(self.buf, complete=True, out=out)
+        self._route_line(self.buf, complete=True, out=out)
         self.buf, self.kind, self.fresh = "", None, True
 
         if self.hold:
             remaining = self.hold
             self.hold = ""
-            self._push(remaining, out, end=True, force=True)
+            self._emit(remaining, out, end=True, force=True)
         return out
 
     def _detect_line_kind(self, stripped: str, complete: bool) -> LineKind | None:
@@ -239,17 +239,17 @@ class SpeechFilter:
 
         if complete:
             for part in parts:
-                self._push(part, out, end=True)
+                self._emit(part, out, end=True)
             return ""
 
         if len(parts) > 1:
             for part in parts[:-1]:
-                self._push(part, out)
+                self._emit(part, out)
             self.fresh = False
             return parts[-1]
         return text
 
-    def _handle(self, text: str, complete: bool, out: list[str]) -> str:
+    def _route_line(self, text: str, complete: bool, out: list[str]) -> str:
         """Phân loại và điều phối xử lý từng dòng văn bản theo loại nội dung."""
         stripped = text.lstrip()
 
@@ -269,8 +269,8 @@ class SpeechFilter:
 
         return self._handle_prose(text, stripped, complete, out)
 
-    def _push(self, sent: str, out: list[str], end: bool = False, force: bool = False) -> None:
-        """Kiểm tra và đưa câu vào danh sách xuất khẩu."""
+    def _emit(self, sent: str, out: list[str], end: bool = False, force: bool = False) -> None:
+        """Làm sạch, ghép câu ngắn, giới hạn số câu/ký tự và đưa vào danh sách xuất."""
         if self.capped:
             return
 
@@ -444,7 +444,7 @@ def _replace_token_for_tts(match: re.Match) -> str:
 
 
 def _normalize_dates(text: str) -> str:
-    """Chuẩn hóa các định dạng ngày tháng (DD/MM/YYYY, tháng MM/YYYY, ngày DD/MM, 15/11) thành lời nói tự nhiên."""
+    """Chuẩn hóa ngày tháng, dấu gạch chéo đặc biệt (24/7, địa chỉ) thành lời nói tự nhiên."""
     text = SERVICE_247_RE.sub("hai tư trên bảy", text)
     text = ADDRESS_SLASH_RE.sub(r"\1 \2 xuyệt \3", text)
     text = DATE_DMY_RE.sub(
@@ -610,7 +610,7 @@ async def _produce_tts_sentences(
     client: httpx.AsyncClient,
     sentence_queue: asyncio.Queue,
     send_raw: Callable[[str], Awaitable[None]],
-    mark: Callable[[str], None],
+    mark_time: Callable[[str], None],
     raw_parts: list[str],
 ) -> None:
     """Đọc stream từ LLM, gửi raw text lên giao diện và đẩy các câu đã lọc vào hàng đợi."""
@@ -618,14 +618,14 @@ async def _produce_tts_sentences(
     end_sent = False
     try:
         async for piece in stream_reply(messages, url=llm_url, client=client):
-            mark("first_content")
+            mark_time("first_content")
             raw_parts.append(piece)
             await send_raw(piece)
             for s in speech_filter.feed(piece):
-                mark("first_sentence")
+                mark_time("first_sentence")
                 await sentence_queue.put(s)
         for s in speech_filter.flush():
-            mark("first_sentence")
+            mark_time("first_sentence")
             await sentence_queue.put(s)
         await sentence_queue.put(_END)
         end_sent = True
@@ -650,7 +650,7 @@ async def _consume_tts_audio(
     voice: str,
     client: httpx.AsyncClient,
     send_audio: Callable[[bytes], Awaitable[None]],
-    mark: Callable[[str], None],
+    mark_time: Callable[[str], None],
 ) -> None:
     """Lấy từng câu từ hàng đợi, gửi qua Zero-TTS stream và đẩy chunk PCM tới client."""
     try:
@@ -658,7 +658,7 @@ async def _consume_tts_audio(
             norm_sent = normalize_text_for_tts(sent)
             for piece in split_for_tts(norm_sent):
                 async for pcm in synth_stream(piece, base_url=tts_url, voice=voice, client=client):
-                    mark("first_audio")
+                    mark_time("first_audio")
                     await send_audio(pcm)
     except asyncio.CancelledError:
         raise
@@ -693,7 +693,7 @@ async def run_turn(
     sentence_queue: asyncio.Queue = asyncio.Queue(maxsize=8)
     raw_parts: list[str] = []
 
-    def mark(name: str) -> None:
+    def mark_time(name: str) -> None:
         metrics.setdefault(name, time.perf_counter() - t0)
 
     messages = [
@@ -709,7 +709,7 @@ async def run_turn(
             client=client,
             sentence_queue=sentence_queue,
             send_raw=send_raw,
-            mark=mark,
+            mark_time=mark_time,
             raw_parts=raw_parts,
         )
     )
@@ -720,7 +720,7 @@ async def run_turn(
             voice=voice,
             client=client,
             send_audio=send_audio,
-            mark=mark,
+            mark_time=mark_time,
         )
     )
     try:
