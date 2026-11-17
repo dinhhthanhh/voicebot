@@ -10,16 +10,18 @@ Hệ thống trợ lý giọng nói đàm thoại thời gian thực độ trễ
 - **Kênh hiển thị (Màn hình):** Stream toàn văn câu trả lời từ LLM tức thì (bao gồm đầy đủ Markdown, bảng biểu, mã nguồn, danh sách).
 - **Kênh âm thanh (Thoại):** Xử lý song song qua hàng đợi Producer-Consumer. Tách câu thời gian thực và đẩy ngay câu hoàn chỉnh đầu tiên qua Zero-TTS (PCM 48 kHz, Mono, 16-bit) để phát âm thanh lập tức tới người dùng.
 
-### 2. Bộ lọc văn bản thông minh (`SpeechFilter`)
-- **Tách câu thời gian thực:** Nhận diện ranh giới câu tự nhiên theo dấu ngắt câu và ngữ cảnh hội thoại.
-- **Lược bỏ thành phần trực quan:** Tự động bỏ qua các khối mã nguồn (` ``` `) và bảng Markdown (`|...|`) để tránh việc bot đọc cú pháp thô (LLM được định hướng diễn đạt tóm tắt tự nhiên trước phần bảng/mã).
-- **Chuẩn hóa văn bản Tiếng Việt nâng cao:**
-  - **Số điện thoại & Mã bưu chính:** Nhận dạng số di động 10 số, số cố định dạng `(024) 3xxx`, mã quốc gia `+84` và mã bưu chính VNPost (5 số).
-  - **Cách đọc số ghép tự nhiên:** Chuyển đổi mượt mà các cụm chục (*"mươi"*, *"mười"*), lẻ (*"linh"*, *"lẻ"*), và tròn nghìn/trăm (*"mười nghìn"*, *"mười hai nghìn năm trăm"*).
-  - **Số và tiền tệ:** Phân biệt chính xác phân cách hàng nghìn (`1.500`, `1,500`) và số thập phân (`0,007` → đọc là "không phẩy không không bảy"); hỗ trợ các ký hiệu tiền tệ thông dụng (`đồng`, `VNĐ`, `đ`, `k`).
-  - **Đơn vị & ký hiệu:** Đổi tự động các đơn vị đo lường thông dụng (`km`, `m`, `cm`, `mm`, `kg`, `g`, `ha`, `m²`, `m³`, `m2`, `m3`, `%`...).
-  - **Biểu thức & đường dẫn:** Chuẩn hóa biểu thức toán học, đường dẫn URL sang văn phong giao tiếp trực tiếp.
-  - **Capping:** Giới hạn độ dài và số lượng câu đọc tối đa nhằm giữ câu trả lời thoại súc tích, mạch lạc.
+### 2. Xử lý & Chuẩn hóa văn bản Tiếng Việt 3 tầng
+- **Tiền xử lý đầu vào STT (`stt.py`):**
+  - **Chuẩn hóa số ghép tiếng Việt (`normalize_compound_numbers`):** Chuyển đổi linh hoạt các cụm từ đọc số thành chữ số (hàng chục *"mươi"*, *"mười"*, lẻ *"linh"*, *"lẻ"*, và hàng trăm/nghìn tròn số như *"hai mươi mốt"* → `21`, *"mười hai nghìn năm trăm"* → `12500`).
+  - **Gom chuỗi số liên tiếp (`normalize_speech_input`):** Tự động nhận diện và gom các từ đọc số rời rạc liên tiếp ($\ge 5$ chữ số) thành chuỗi số hoàn chỉnh (hỗ trợ số điện thoại 10 số, mã bưu chính VNPost 5 số, số CCCD, mã vận đơn).
+- **Bộ lọc luồng LLM (`SpeechFilter` trong `tts.py`):**
+  - **Tách câu thời gian thực:** Nhận diện ranh giới câu tự nhiên theo dấu ngắt câu (`SENT_RE` hỗ trợ lookbehind bỏ qua các từ viết tắt thông dụng như `TP.`, `ThS.`, `BS.`, `Mr.`...) để đẩy ngay câu hoàn chỉnh đầu tiên xuống Zero-TTS.
+  - **Lược bỏ thành phần trực quan:** Tự động bỏ qua các khối mã nguồn (` ``` `), bảng Markdown (`|...|`), vạch phân cách và làm sạch inline formatting (emoji, link Markdown, công thức toán LaTeX `$`, đường dẫn URL) nhằm tránh việc bot đọc cú pháp thô.
+  - **Capping an toàn:** Giới hạn tối đa 8 câu hoặc 600 ký tự thoại; tự động thêm câu thông báo thoại *"Phần còn lại đã được hiển thị trên màn hình."* khi đạt ngưỡng giới hạn để giữ câu trả lời thoại súc tích, mạch lạc.
+- **Hậu xử lý văn bản đọc TTS (`normalize_text_for_tts` trong `tts.py`):**
+  - **Số và tiền tệ:** Phân biệt chính xác phân cách hàng nghìn (`1.500`, `1,500`) và số thập phân (`0,007` → đọc là *"không phẩy không không bảy"* qua `num2words`); hỗ trợ các ký hiệu tiền tệ thông dụng (`đồng`, `VNĐ`, `đ`, `k` → *"nghìn"*).
+  - **Số điện thoại & Ngày tháng:** Chuẩn hóa số điện thoại cố định `(024) 3xxx`, số di động, mã quốc tế `+84` đọc tách từng chữ số; định dạng ngày tháng `DD/MM/YYYY`, dịch vụ `24/7` (*"hai tư trên bảy"*), địa chỉ ngõ ngách `số 10/2` (*"số 10 xuyệt 2"*).
+  - **Đơn vị & ký hiệu:** Đổi tự động các đơn vị đo lường thông dụng (`km`, `m`, `cm`, `mm`, `kg`, `g`, `ha`, `m²`, `m³`, `m2`, `m3`, `%`...) sang từ ngữ phát âm tự nhiên.
 
 ### 3. Cơ chế kết thúc lượt nói thông minh (Smart Turn & VAD)
 - **Kiến trúc phát hiện 2 tầng tách bạch:**
@@ -40,9 +42,9 @@ Hệ thống trợ lý giọng nói đàm thoại thời gian thực độ trễ
 - **Bảo vệ ngữ cảnh dở dang:** Tự động tăng thời gian chờ nếu người dùng đang đọc dở số điện thoại/dãy số hoặc kết thúc bằng các từ nối/ngập ngừng (*"và"*, *"hoặc"*, *"thì"*, *"nhưng"*, *"là"*...).
 
 ### 4. Giao diện Web & Trải nghiệm đàm thoại liên tục
-- **Web Audio API:** Thu âm từ micro và Linear Resample về 16 kHz PCM16 gửi STT; phát stream âm thanh PCM16 48 kHz mượt mà với cơ chế zero-copy giảm tối đa áp lực Garbage Collector.
-- **Cơ chế chống dội âm (Anti-feedback):** Kết hợp `echoCancellation: true` phần cứng/trình duyệt của Web Audio API, ngắt micro trong khi bot đang phát âm thanh, và thêm khoảng trễ đệm 600ms (`scheduleAutoListen`) trước khi mở lại micro để đón lượt nói mới.
-- **Đàm thoại tự nhiên:** Bấm **"Bắt đầu nói"** để kích hoạt chế độ đàm thoại liên tục (các nút chuyển sang **"Gửi"** để ngắt thủ công và **"Dừng nói"** để hủy lượt thoại). Bot và người dùng trò chuyện qua lại tự động mà không cần bấm nút lại từng câu.
+- **Web Audio API & AudioWorklet:** Thu âm từ micro và Linear Resample về 16 kHz PCM16 gửi STT (kết hợp bộ lọc chống méo bậc 4 Butterworth 7.2 kHz); phát stream âm thanh PCM16 48 kHz mượt mà với cơ chế zero-copy qua `AudioWorklet` (có fallback `ScriptProcessor`) giảm tối đa áp lực Garbage Collector.
+- **Cơ chế chống dội âm (Anti-feedback):** Kết hợp `echoCancellation: true` phần cứng/trình duyệt của Web Audio API, tự động chặn gửi frame micro ở tầng phần mềm (`isBotBusy`) trong khi bot đang suy nghĩ hoặc phát âm thanh, và thêm khoảng trễ đệm 600ms (`scheduleAutoListen`) trước khi mở lại micro đón lượt nói mới.
+- **Đàm thoại tự nhiên:** Bấm **"Bắt đầu nói"** để kích hoạt chế độ đàm thoại liên tục (các nút chuyển sang **"Gửi"** để ngắt thủ công, **"Dừng nói"** để hủy lượt thoại, và **"Hội thoại mới"** để xóa lịch sử ngữ cảnh). Bot và người dùng trò chuyện qua lại tự động mà không cần bấm nút lại từng câu.
 
 ---
 
@@ -74,8 +76,10 @@ Các tham số có thể cấu hình qua biến môi trường (hoặc sử dụ
 | `LLM_URL` | `https://ai.vnpost.vn/vllm-qwen38-27b/v1/chat/completions` | OpenAI-compatible endpoint của LLM |
 | `TTS_BASE_URL` | `https://ai.vnpost.vn/zero-tts` | Endpoint dịch vụ Zero-TTS |
 | `TTS_VOICE` | `maichi` | Giọng đọc mặc định của Zero-TTS |
+| `SMART_TURN_MODEL_PATH` | `models/smart-turn-v3.2-cpu.onnx` | Đường dẫn file mô hình Smart Turn v3.2 ONNX |
+| `VAD_MODEL_PATH` | `models/silero_vad.onnx` | Đường dẫn file mô hình Silero VAD v5 ONNX |
 
-*Lưu ý: Các mô hình ONNX và giao diện Web được nạp tự động theo đường dẫn tương đối trong thư mục dự án (`models/silero_vad.onnx`, `models/smart-turn-v3.2-cpu.onnx`, `index.html`).*
+*Lưu ý: Mặc định nếu không chỉ định biến môi trường, các mô hình ONNX và giao diện Web được nạp tự động theo đường dẫn tương đối trong thư mục dự án (`models/silero_vad.onnx`, `models/smart-turn-v3.2-cpu.onnx`, `index.html`).*
 
 ---
 
