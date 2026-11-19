@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="vi">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <link rel="icon" href="data:,">
+    <title>Voicebot Demo</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div class="container">
+        <!-- Header & Trạng thái kết nối -->
+        <div class="header-row">
+            <h3>Voicebot</h3>
+            <div class="connection-status">
+                <span class="status-dot" id="connectionBadge"></span>
+                <span id="connectionText">Đang kết nối...</span>
+            </div>
+        </div>
+
+        <!-- Trạng thái đàm thoại -->
+        <div class="row status-row">
+            <div>
+                Trạng thái: <span id="state">Đang kết nối...</span>
+            </div>
+        </div>
+
+        <!-- Các nút điều khiển chính -->
+        <div class="row buttons-row">
+            <button id="btnTalk" class="btn-ctrl">Bắt đầu nói</button>
+            <button id="btnFinish" class="btn-ctrl">Gửi</button>
+            <button id="btnStop" class="btn-ctrl">Dừng nói</button>
+            <button id="btnReset" class="btn-ctrl">Hội thoại mới</button>
+        </div>
+
+        <!-- Khung hội thoại Bạn & Bot -->
+        <div class="row">
+            <b>Bạn:</b>
+            <div id="you" class="box"></div>
+        </div>
+
+        <div class="row">
+            <b>Bot:</b>
+            <pre id="bot" class="box"></pre>
+        </div>
+
+        <!-- Thông báo lỗi hoặc trạng thái phụ -->
+        <div class="row" id="err"></div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>
