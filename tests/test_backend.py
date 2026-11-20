@@ -537,7 +537,7 @@ def test_parse_sse_delta_error_stream():
 
 
 def test_is_smart_turn_ready():
-    assert isinstance(services.is_smart_turn_ready(), bool)
+    assert isinstance(services.smart_turn_detector.is_ready, bool)
 
 
 def test_stt_send_audio_generic_exception():

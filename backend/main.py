@@ -40,7 +40,7 @@ async def lifespan(_app: FastAPI):
     logger.info("Khởi động Voicebot Gateway tại %s:%s", settings.app_host, settings.app_port)
     for w in settings.validate_config():
         logger.warning("Cấu hình cảnh báo: %s", w)
-    await asyncio.to_thread(services.init_smart_turn)
+    await asyncio.to_thread(services.smart_turn_detector.load_model)
     yield
     logger.info("Tắt Voicebot Gateway.")
     await services.close_http_client()
@@ -67,7 +67,7 @@ async def health_check():
     return JSONResponse(
         {
             "status": "ok",
-            "smart_turn_ready": services.is_smart_turn_ready(),
+            "smart_turn_ready": services.smart_turn_detector.is_ready,
             "active_sessions": len(orchestrator.sessions),
         }
     )

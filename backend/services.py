@@ -386,7 +386,7 @@ class SmartTurnDetector:
         self._load_lock = threading.Lock()
         self._attempted = False
 
-    def _load_model(self) -> None:
+    def load_model(self) -> None:
         with self._load_lock:
             if self._attempted:
                 return
@@ -406,8 +406,10 @@ class SmartTurnDetector:
             except Exception as exc:
                 logger.error("Lỗi khi khởi tạo Smart Turn ONNX: %s", exc)
 
-    def warmup(self) -> None:
-        self._load_model()
+    @property
+    def is_ready(self) -> bool:
+        """Kiểm tra mô hình Smart Turn ONNX đã nạp vào RAM và sẵn sàng hay chưa."""
+        return self.session is not None
 
     def _sync_predict(self, audio_bytes: bytes, sample_rate: int = 16000) -> float:
         if self.session is None or self.feature_extractor is None:
@@ -427,9 +429,9 @@ class SmartTurnDetector:
         outputs = cast(list[np.ndarray], self.session.run(None, {"input_features": inputs.input_features.astype(np.float32)}))
         return max(0.0, min(1.0, float(outputs[0][0].item())))
 
-    async def predict_probability(self, audio_bytes: bytes, sample_rate: int = 16000) -> float:
+    async def predict(self, audio_bytes: bytes, sample_rate: int = 16000) -> float:
         if not self._attempted:
-            await asyncio.to_thread(self._load_model)
+            await asyncio.to_thread(self.load_model)
         if self.session is None or self.feature_extractor is None or len(audio_bytes) < 3200:
             return 0.0
         try:
@@ -438,18 +440,5 @@ class SmartTurnDetector:
             return 0.0
 
 
-_smart_turn_detector = SmartTurnDetector()
-
-
-def init_smart_turn() -> None:
-    _smart_turn_detector.warmup()
-
-
-async def predict_smart_turn(audio_buffer: bytes, sample_rate: int = 16000) -> float:
-    return await _smart_turn_detector.predict_probability(audio_buffer, sample_rate=sample_rate)
-
-
-def is_smart_turn_ready() -> bool:
-    """Kiểm tra mô hình Smart Turn ONNX đã nạp vào RAM và sẵn sàng hay chưa."""
-    return _smart_turn_detector.session is not None
+smart_turn_detector = SmartTurnDetector()
 

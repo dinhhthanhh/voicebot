@@ -272,7 +272,7 @@ class VoiceSession:
         try:
             audio = self.get_turn_audio()
             prob = await asyncio.wait_for(
-                services.predict_smart_turn(audio),
+                services.smart_turn_detector.predict(audio),
                 timeout=settings.smart_turn_silence_timeout_seconds,
             )
             if (
