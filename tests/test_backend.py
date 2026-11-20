@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -485,13 +486,15 @@ def test_safe_send_closed_and_disconnect():
         except StopIteration as e:
             return e.value
 
-    # Session closed: coro should not be executed
+    # Session closed: send callback should not be executed
     session.closed = True
+    called_on_closed = []
 
-    async def dummy_coro():
-        pass
+    async def dummy_send():
+        called_on_closed.append(True)
 
-    _step(session._safe_send(dummy_coro()))
+    _step(session._safe_send(dummy_send))
+    assert called_on_closed == []
 
     # Callable format
     session.closed = False
@@ -520,6 +523,10 @@ def test_config_validation_ranges():
         max_sessions=0,
         llm_timeout_seconds=0.0,
         tts_timeout_seconds=0.0,
+        tts_split_limit=5,
+        tts_max_sentences=0,
+        tts_max_chars=5,
+        turn_max_audio_bytes=1000,
     )
     warnings = bad_cfg.validate_config()
     assert any("SMART_TURN_THRESHOLD" in w for w in warnings)
@@ -529,6 +536,10 @@ def test_config_validation_ranges():
     assert any("MAX_SESSIONS" in w for w in warnings)
     assert any("LLM_TIMEOUT_SECONDS" in w for w in warnings)
     assert any("TTS_TIMEOUT_SECONDS" in w for w in warnings)
+    assert any("TTS_SPLIT_LIMIT" in w for w in warnings)
+    assert any("TTS_MAX_SENTENCES" in w for w in warnings)
+    assert any("TTS_MAX_CHARS" in w for w in warnings)
+    assert any("TURN_MAX_AUDIO_BYTES" in w for w in warnings)
 
 
 def test_parse_sse_delta_error_stream():
@@ -557,6 +568,620 @@ def test_stt_send_audio_generic_exception():
 
     with pytest.raises(services.STTError, match="Lỗi gửi audio tới STT"):
         _step(stt.send_audio(b"\x00\x00" * 160))
+
+
+# ---------------------------------------------------------------------------
+# 5. Tests bổ sung cho các cải tiến Logic (Review fixes)
+# ---------------------------------------------------------------------------
+def test_match_turn_strict_and_empty_handling():
+    session = VoiceSession(session_id="test_match_turn")
+    # Khi current_turn_id là None
+    assert session._match_turn("turn_1") is False
+    assert session._match_turn(None, allow_empty=True) is False
+    assert session._match_turn(None, allow_empty=False) is False
+
+    # Khi có current_turn_id
+    session.current_turn_id = "turn_active"
+    assert session._match_turn("turn_active") is True
+    assert session._match_turn("turn_old") is False
+    assert session._match_turn(None, allow_empty=False) is False
+    assert session._match_turn(None, allow_empty=True) is True
+    assert session._match_turn("", allow_empty=False) is False
+    assert session._match_turn("", allow_empty=True) is True
+
+
+def test_handle_cancel_clears_current_turn_id():
+    session = VoiceSession(session_id="test_cancel_id")
+    session.current_turn_id = "turn_to_cancel"
+    session.state = VoiceState.SPEAKING
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    _step(session._handle_cancel("turn_to_cancel"))
+    assert session.current_turn_id is None
+    assert session.state == VoiceState.IDLE
+
+
+def test_playback_done_and_cancel_isolation():
+    session = VoiceSession(session_id="test_isolation")
+    session.current_turn_id = "turn_current"
+    session.state = VoiceState.SPEAKING
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    # Playback done từ turn cũ không được ảnh hưởng turn hiện tại
+    _step(session.handle_event({"type": "playback.done", "turn_id": "turn_old"}))
+    assert session.state == VoiceState.SPEAKING
+    assert session.current_turn_id == "turn_current"
+
+    # Playback done không có turn_id cũng bị từ chối
+    _step(session.handle_event({"type": "playback.done"}))
+    assert session.state == VoiceState.SPEAKING
+
+    # Playback done đúng turn_id sẽ chuyển về IDLE
+    _step(session.handle_event({"type": "playback.done", "turn_id": "turn_current"}))
+    assert session.state == VoiceState.IDLE
+
+
+def test_wav_chunk_extended_header_over_4096():
+    # Header lớn hơn 4096 byte chứa extended metadata/JUNK
+    extended_junk = b"JUNK" + b"\x00" * 5000
+    fake_header = b"RIFF" + b"\x00" * 36 + extended_junk + b"data\x04\x00\x00\x00"
+    payload = b"\xde\xad\xbe\xef"
+
+    buf = bytearray()
+    data, parsed, leftover = services._process_tts_chunk(
+        fake_header + payload, header_parsed=False, header_buf=buf, leftover=b""
+    )
+    assert parsed is True
+    assert data == payload
+    assert leftover == b""
+
+
+def test_smart_turn_logs_warning_on_exception(caplog):
+    import logging
+    detector = services.SmartTurnDetector(model_path="dummy.onnx")
+
+    def failing_predict(*args, **kwargs):
+        raise RuntimeError("Inference crash")
+
+    detector.session = object()  # type: ignore
+    detector.feature_extractor = object()  # type: ignore
+    detector._attempted = True
+    detector._sync_predict = failing_predict
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    with caplog.at_level(logging.WARNING):
+        result = _step(detector.predict(b"\x00\x00" * 2000))
+
+    assert result == 0.0
+    assert any("Lỗi suy luận Smart Turn" in record.message for record in caplog.records)
+
+
+def test_stt_error_event_transitions_session_to_error():
+    import asyncio
+
+    session = VoiceSession(session_id="test_stt_err")
+    session.current_turn_id = "turn_err_1"
+    session.state = VoiceState.LISTENING
+
+    class MockSTTWithError:
+        def __init__(self):
+            self.closed = False
+
+        async def events(self):
+            yield {"type": "error", "error_code": "AUDIO_TOO_LONG", "message": "Quá dài"}
+
+        async def close(self):
+            self.closed = True
+
+    mock_stt = MockSTTWithError()
+    session.stt_client = mock_stt  # type: ignore
+
+    events_emitted = []
+
+    async def mock_send(ev):
+        events_emitted.append(ev)
+
+    session.send_json_cb = mock_send
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    _step(session._forward_stt_events(mock_stt, "turn_err_1"))  # type: ignore
+    assert session.state == VoiceState.ERROR
+    assert session.stt_client is None
+    assert mock_stt.closed is True
+    assert any(ev.get("type") == "session.error" and ev.get("code") == "AUDIO_TOO_LONG" for ev in events_emitted)
+
+
+def test_handle_audio_frame_stt_error():
+    session = VoiceSession(session_id="test_stt_send_err")
+    session.current_turn_id = "turn_send_err"
+    session.state = VoiceState.LISTENING
+
+    class MockFailingSTT:
+        is_active = True
+
+        async def send_audio(self, pcm):
+            raise services.STTError("STT send failed", code="STT_SEND_ERROR")
+
+        async def close(self):
+            self.is_active = False
+
+    session.stt_client = MockFailingSTT()  # type: ignore
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    _step(session.handle_audio_frame(b"\x00\x00" * 160))
+    assert session.state == VoiceState.ERROR
+    assert session.stt_client is None
+
+
+def test_producer_preserves_queue_on_normal_completion():
+    import asyncio
+
+    session = VoiceSession(session_id="test_prod_queue")
+    session.current_turn_id = "turn_prod"
+    session.state = VoiceState.THINKING
+
+    async def fake_llm(messages):
+        yield "Câu một. "
+        yield "Câu hai. "
+
+    original_llm = services.llm_stream
+    services.llm_stream = fake_llm
+
+    queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=8)
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    try:
+        _step(session._produce_tts_text("turn_prod", queue, "User prompt"))
+        items = []
+        while not queue.empty():
+            items.append(queue.get_nowait())
+
+        # Kiểm tra không bị drain hàng đợi: các câu vẫn còn nguyên kèm None ở cuối
+        assert len(items) == 3
+        assert "Câu một." in items[0]
+        assert "Câu hai." in items[1]
+        assert items[2] is None
+    finally:
+        services.llm_stream = original_llm
+
+
+def test_stt_finish_timeout_raises_stt_error():
+    class HangingWS:
+        async def send(self, data):
+            pass
+
+    stt = services.STTClient("sess_timeout", "turn_t", "req_t")
+    stt.websocket = HangingWS()  # type: ignore
+    stt.is_active = True
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    with pytest.raises(services.STTError) as exc_info:
+        _step(stt.finish(timeout=0.01))
+
+    assert exc_info.value.code == "STT_TIMEOUT"
+    assert stt.is_active is False
+    assert stt._closed is True
+
+
+def test_process_turn_stt_timeout_fallback_to_partial():
+    session = VoiceSession(session_id="sess_fallback")
+    session.current_turn_id = "turn_fb"
+    session.state = VoiceState.THINKING
+    session.last_partial_text = "Tôi cần gửi bưu phẩm"
+
+    class TimeoutSTT:
+        async def finish(self):
+            raise services.STTError("Timeout STT", code="STT_TIMEOUT")
+
+    session.stt_client = TimeoutSTT()  # type: ignore
+
+    events = []
+
+    async def mock_send(ev):
+        events.append(ev)
+
+    session.send_json_cb = mock_send
+
+    # Mock _run_turn_taskgroup để không gọi LLM thật
+    async def mock_tg(turn_id, text):
+        pass
+
+    session._run_turn_taskgroup = mock_tg  # type: ignore
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    _step(session._process_turn("turn_fb"))
+
+    # Kiểm tra transcript.final được phát với nội dung partial dự phòng
+    final_ev = next((ev for ev in events if ev.get("type") == "transcript.final"), None)
+    assert final_ev is not None
+    assert final_ev.get("text") == "Tôi cần gửi bưu phẩm"
+
+
+def test_process_turn_stt_timeout_no_partial_transitions_to_error():
+    session = VoiceSession(session_id="sess_timeout_err")
+    session.current_turn_id = "turn_to_err"
+    session.state = VoiceState.THINKING
+    session.last_partial_text = ""
+
+    class TimeoutSTT:
+        async def finish(self):
+            raise services.STTError("Timeout STT", code="STT_TIMEOUT")
+
+    session.stt_client = TimeoutSTT()  # type: ignore
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    _step(session._process_turn("turn_to_err"))
+    assert session.state == VoiceState.ERROR
+
+
+def test_stt_close_idempotent_and_concurrent():
+    class DummyWS:
+        def __init__(self):
+            self.close_count = 0
+
+        async def close(self, code=1000, reason=""):
+            self.close_count += 1
+
+    stt = services.STTClient("sess_concurrent", "turn_c", "req_c")
+    ws = DummyWS()
+    stt.websocket = ws  # type: ignore
+    stt.is_active = True
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    _step(stt.close())
+    _step(stt.close())
+
+    assert stt._closed is True
+    assert stt.is_active is False
+    assert ws.close_count == 1  # Chỉ đóng đúng 1 lần
+
+
+def test_stt_recv_loop_propagates_cancelled_error():
+    class ClosingWS:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise asyncio.CancelledError()
+
+    stt = services.STTClient("sess_cancel", "turn_c", "req_c")
+    stt.websocket = ClosingWS()  # type: ignore
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    with pytest.raises(asyncio.CancelledError):
+        _step(stt._recv_loop())
+
+    assert stt.is_active is False
+    assert stt.is_done.is_set() is True
+
+
+def test_parse_sse_delta_strict_validation():
+    # Kiểm tra cấu trúc rỗng hoặc không hợp lệ không phát sinh ngoại lệ
+    assert services._parse_sse_delta('{"choices": [null]}') is None
+    assert services._parse_sse_delta('{"choices": [{"delta": null}]}') is None
+    assert services._parse_sse_delta('{"choices": [{"delta": {"content": 123}}]}') is None
+    assert services._parse_sse_delta('{"choices": []}') is None
+    assert services._parse_sse_delta('{"choices": "not_a_list"}') is None
+    assert services._parse_sse_delta('"just_string"') is None
+    assert services._parse_sse_delta("12345") is None
+
+    # Hợp lệ
+    assert services._parse_sse_delta('{"choices": [{"delta": {"content": "Xin chào"}}]}') == "Xin chào"
+
+
+def test_find_wav_data_offset_standard_and_extended():
+    # 1. Standard WAV (44 byte)
+    std_wav = (
+        b"RIFF\x24\x00\x00\x00WAVE"
+        b"fmt \x10\x00\x00\x00" + b"\x01\x00\x01\x00\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00"
+        b"data\x04\x00\x00\x00"
+    )
+    assert services._find_wav_data_offset(bytearray(std_wav)) == 44
+
+    # 2. Extended WAV với subchunk LIST trước data
+    list_chunk = b"LIST\x08\x00\x00\x0012345678"
+    ext_wav = (
+        b"RIFF\x30\x00\x00\x00WAVE"
+        b"fmt \x10\x00\x00\x00" + b"\x01\x00\x01\x00\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00"
+        + list_chunk
+        + b"data\x04\x00\x00\x00"
+    )
+    assert services._find_wav_data_offset(bytearray(ext_wav)) == 44 + len(list_chunk)
+
+    # 3. Non-RIFF stream (raw PCM)
+    assert services._find_wav_data_offset(bytearray(b"\x01\x02\x03\x04" * 10)) == 0
+
+
+def test_tts_stream_odd_byte_leftover_warning_and_pad(caplog):
+    import logging
+
+    class MockResp:
+        status_code = 200
+
+        async def aiter_bytes(self):
+            # Chunk 1: 4 byte PCM chẵn
+            yield b"\x01\x02\x03\x04"
+            # Chunk 2: 3 byte PCM lẻ (tổng 7 byte)
+            yield b"\x05\x06\x07"
+
+    class MockClient:
+        is_closed = False
+
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def stream(self, *args, **kwargs):
+            yield MockResp()
+
+    orig_client_fn = services.get_http_client
+    services.get_http_client = lambda: MockClient()  # type: ignore
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    async def _collect():
+        chunks = []
+        with caplog.at_level(logging.WARNING):
+            async for chunk in services.tts_stream("Test leftover"):
+                chunks.append(chunk)
+        return chunks
+
+    try:
+        chunks = _step(_collect())
+        total_bytes = b"".join(chunks)
+        # Tổng byte phải là số chẵn (7 byte gốc + 1 byte pad null = 8 byte)
+        assert len(total_bytes) % 2 == 0
+        assert len(total_bytes) == 8
+        assert any("Dữ liệu PCM từ TTS không hợp lệ" in r.message for r in caplog.records)
+    finally:
+        services.get_http_client = orig_client_fn
+
+
+# ---------------------------------------------------------------------------
+# 6. Tests cho 4 Vấn đề logic mới (Turn order, STT finish, Smart Turn Lock)
+# ---------------------------------------------------------------------------
+def test_produce_tts_text_order_text_done_before_sentinel():
+    session = VoiceSession(session_id="test_order")
+    session.current_turn_id = "turn_order"
+    session.state = VoiceState.THINKING
+
+    events_emitted = []
+
+    async def mock_send_json(data):
+        events_emitted.append(data.get("type"))
+
+    session.send_json_cb = mock_send_json
+
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def mock_llm_stream(messages):
+        yield "Chào bạn hôm nay thế nào?"
+
+    orig_llm = services.llm_stream
+    services.llm_stream = mock_llm_stream
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    try:
+        _step(session._produce_tts_text("turn_order", queue, "xin chào"))
+        assert "assistant.text.done" in events_emitted
+        items = []
+        while not queue.empty():
+            items.append(queue.get_nowait())
+        assert len(items) >= 2
+        assert items[-1] is None
+        assert "Chào bạn hôm nay thế nào?" in items[0]
+    finally:
+        services.llm_stream = orig_llm
+
+
+def test_stt_finish_raises_on_connection_closed_without_is_done():
+    stt = services.STTClient("sess_1", "turn_1", "req_1")
+    stt.websocket = None
+    stt.is_active = False
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    with pytest.raises(services.STTError) as exc_info:
+        _step(stt.finish(timeout=0.01))
+    assert exc_info.value.code == "CONNECTION_CLOSED"
+
+
+def test_stt_recv_loop_detects_clean_disconnect_without_final():
+    stt = services.STTClient("sess_2", "turn_2", "req_2")
+
+    class MockEmptyWs:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def close(self):
+            pass
+
+    stt.websocket = MockEmptyWs()
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    _step(stt._recv_loop())
+    assert stt.error_payload is not None
+    assert stt.error_payload.get("error_code") == "CONNECTION_CLOSED"
+    assert stt.is_done.is_set() is True
+
+
+def test_smart_turn_detector_predict_lock_and_finish_turn_cancels_task():
+    detector = services.SmartTurnDetector()
+    assert hasattr(detector, "_predict_lock")
+
+    session = VoiceSession(session_id="test_st_cancel")
+    session.current_turn_id = "turn_st"
+    session.state = VoiceState.LISTENING
+
+    cancelled = False
+
+    class DummyTask:
+        def done(self):
+            return False
+
+        def cancel(self):
+            nonlocal cancelled
+            cancelled = True
+
+    session._smart_turn_task = DummyTask()  # type: ignore
+    session._spawn_task = lambda coro: coro.close()  # type: ignore
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    _step(session.finish_turn())
+    assert cancelled is True
+    assert session._smart_turn_task is None
+    assert session.state == VoiceState.THINKING
+
+
+def test_close_session_cleans_up_even_if_closed_flag_already_set():
+    session = VoiceSession(session_id="test_cleanup_after_send_fail")
+    session.closed = True  # Giả lập _safe_send phát hiện lỗi và đặt closed=True trước
+    session.current_turn_id = "turn_leak_check"
+    session.buffer_audio(b"\x00" * 320)
+    session.history.append({"role": "user", "content": "hello"})
+
+    stt_closed = False
+
+    class MockSTT:
+        async def close(self):
+            nonlocal stt_closed
+            stt_closed = True
+
+    session.stt_client = MockSTT()  # type: ignore
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    # Gọi close() phải thực hiện dọn dẹp đầy đủ chứ không return sớm do self.closed == True
+    _step(session.close())
+    assert session._cleanup_done is True
+    assert session.current_turn_id is None
+    assert session.turn_audio_bytes == 0
+    assert len(session.history) == 0
+    assert stt_closed is True
+    assert session.stt_client is None
+
+
+def test_set_state_error_resets_audio_and_smart_turn_flags():
+    session = VoiceSession(session_id="test_error_state_reset")
+    session.current_turn_id = "turn_err"
+    session.state = VoiceState.LISTENING
+    session.has_speech = True
+    session.is_vad_speaking = True
+
+    cancelled = False
+
+    class DummyTask:
+        def done(self):
+            return False
+
+        def cancel(self):
+            nonlocal cancelled
+            cancelled = True
+
+    session._smart_turn_task = DummyTask()  # type: ignore
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    _step(session.set_state(VoiceState.ERROR))
+    assert session.state == VoiceState.ERROR
+    assert session.has_speech is False
+    assert session.is_vad_speaking is False
+    assert cancelled is True
+    assert session._smart_turn_task is None
+    # current_turn_id vẫn được giữ lại để phục vụ nhận diện turn lỗi
+    assert session.current_turn_id == "turn_err"
+
+
+
+
 
 
 

@@ -81,30 +81,28 @@ class STTClient:
         self.is_done = asyncio.Event()
         self.final_text = ""
         self.error_payload: dict[str, Any] | None = None
+        self._close_lock = asyncio.Lock()
+        self._closed = False
 
     @classmethod
-    async def connect(cls, session_id: str, turn_id: str, request_id: str | None = None, max_retries: int = 2) -> STTClient:
+    async def connect(
+        cls,
+        session_id: str,
+        turn_id: str,
+        request_id: str | None = None,
+        max_retries: int | None = None,
+    ) -> STTClient:
         req_id = request_id or str(uuid.uuid4())
+        retries = max_retries if max_retries is not None else settings.stt_max_retries
         last_error: Exception | None = None
 
-        for attempt in range(max_retries + 1):
+        for attempt in range(retries + 1):
             client = cls(session_id=session_id, turn_id=turn_id, request_id=req_id)
             try:
                 client.websocket = await websockets.connect(settings.stt_ws_url, max_size=10 * 1024 * 1024)
                 client.recv_task = asyncio.create_task(client._recv_loop())
-                await client.websocket.send(
-                    json.dumps({
-                        "type": "start",
-                        "request_id": req_id,
-                        "model": settings.stt_model,
-                        "language": settings.stt_language,
-                        "sample_rate": settings.stt_sample_rate,
-                        "encoding": "pcm_s16le",
-                        "channels": 1,
-                        "vad": settings.stt_vad,
-                    })
-                )
-                await asyncio.wait_for(client.is_ready.wait(), timeout=10.0)
+                await client._send_config()
+                await asyncio.wait_for(client.is_ready.wait(), timeout=settings.stt_connect_timeout)
                 if client.error_payload:
                     raise STTError(
                         client.error_payload.get("message", "Lỗi khởi tạo STT"),
@@ -114,19 +112,35 @@ class STTClient:
                 return client
             except STTError as stt_err:
                 await client.close()
-                if stt_err.code in ("OVERLOADED", "QUEUE_TIMEOUT") and attempt < max_retries:
+                if stt_err.code in ("OVERLOADED", "QUEUE_TIMEOUT") and attempt < retries:
                     await asyncio.sleep(0.5 * (2**attempt))
                     continue
                 raise
             except Exception as exc:
                 last_error = exc
                 await client.close()
-                if attempt < max_retries:
+                if attempt < retries:
                     await asyncio.sleep(0.5 * (2**attempt))
                 else:
                     break
 
-        raise STTError(f"Không thể kết nối dịch vụ STT sau {max_retries + 1} lần thử: {last_error}", code="STT_CONNECT_FAILED")
+        raise STTError(f"Không thể kết nối dịch vụ STT sau {retries + 1} lần thử: {last_error}", code="STT_CONNECT_FAILED")
+
+    async def _send_config(self) -> None:
+        """Gửi gói tin cấu hình khởi tạo phiên STT tới server Qwen3-ASR."""
+        if not self.websocket:
+            return
+        payload = {
+            "type": "start",
+            "request_id": self.request_id,
+            "model": settings.stt_model,
+            "language": settings.stt_language,
+            "sample_rate": settings.stt_sample_rate,
+            "encoding": "pcm_s16le",
+            "channels": 1,
+            "vad": settings.stt_vad,
+        }
+        await self.websocket.send(json.dumps(payload))
 
     async def _handle_message(self, message: dict[str, Any]) -> bool:
         message_type = message.get("type")
@@ -153,14 +167,23 @@ class STTClient:
                 with contextlib.suppress(json.JSONDecodeError):
                     if await self._handle_message(json.loads(raw_message)):
                         break
+            else:
+                if not self.final_text and not self.error_payload:
+                    self.error_payload = {
+                        "type": "error",
+                        "error_code": "CONNECTION_CLOSED",
+                        "message": "Kết nối STT bị đóng trước khi nhận kết quả hoàn tất.",
+                    }
+                    await self.event_queue.put(self.error_payload)
         except asyncio.CancelledError:
-            pass
+            raise
         except websockets.ConnectionClosed as cc:
             if not self.final_text and not self.error_payload:
                 self.error_payload = {"type": "error", "error_code": "CONNECTION_CLOSED", "message": f"Mất kết nối STT (mã: {cc.code})"}
                 await self.event_queue.put(self.error_payload)
         except Exception as exc:
-            self.error_payload = {"type": "error", "error_code": "STT_RECV_ERROR", "message": str(exc)}
+            if not self.error_payload:
+                self.error_payload = {"type": "error", "error_code": "STT_RECV_ERROR", "message": str(exc)}
             await self.event_queue.put(self.error_payload)
         finally:
             self.is_done.set()
@@ -171,8 +194,11 @@ class STTClient:
     async def send_audio(self, pcm_bytes: bytes) -> None:
         if not self.is_active or not self.websocket:
             raise STTError("STT session đã đóng hoặc không hoạt động.")
-        if time.monotonic() - self.created_at > 600:
-            raise STTError("Phiên nhận dạng vượt quá thời lượng tối đa 600 giây.", code="AUDIO_TOO_LONG")
+        if time.monotonic() - self.created_at > settings.stt_max_duration_seconds:
+            raise STTError(
+                f"Phiên nhận dạng vượt quá thời lượng tối đa {int(settings.stt_max_duration_seconds)} giây.",
+                code="AUDIO_TOO_LONG",
+            )
         if len(pcm_bytes) % 2 != 0:
             raise STTError("Số byte âm thanh phải chẵn.", code="INVALID_AUDIO_FORMAT")
         if len(pcm_bytes) > 1024 * 1024:
@@ -195,34 +221,72 @@ class STTClient:
             if event.get("type") in ("final", "error"):
                 break
 
-    async def finish(self, timeout: float = 10.0) -> str:
+    async def finish(self, timeout: float | None = None) -> str:
+        wait_timeout = timeout if timeout is not None else settings.stt_connect_timeout
+        timed_out = False
         try:
             if self.websocket and self.is_active:
                 await self.websocket.send(json.dumps({"type": "finish"}))
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(self.is_done.wait(), timeout=timeout)
+                wait_coro = self.is_done.wait()
+                try:
+                    await asyncio.wait_for(wait_coro, timeout=wait_timeout)
+                except TimeoutError:
+                    timed_out = True
+                except RuntimeError:
+                    wait_coro.close()
+                    if not self.is_done.is_set():
+                        timed_out = True
+            elif not self.final_text:
+                if self.error_payload:
+                    err_code = self.error_payload.get("error_code") or self.error_payload.get("code") or "CONNECTION_CLOSED"
+                    raise STTError(
+                        self.error_payload.get("message", "Mất kết nối STT."),
+                        code=err_code,
+                        raw_payload=self.error_payload,
+                    )
+                raise STTError("Kết nối STT đã mất hoặc không hoạt động trước khi hoàn tất.", code="CONNECTION_CLOSED")
+
             if self.error_payload and not self.final_text:
                 err_code = self.error_payload.get("error_code") or self.error_payload.get("code") or "STT_ERROR"
-                raise STTError(self.error_payload.get("message", "Lỗi nhận dạng."), code=err_code, raw_payload=self.error_payload)
+                raise STTError(
+                    self.error_payload.get("message", "Lỗi nhận dạng."),
+                    code=err_code,
+                    raw_payload=self.error_payload,
+                )
+
+            if timed_out and not self.final_text:
+                raise STTError(
+                    f"Hết thời gian chờ phản hồi STT sau {wait_timeout}s.",
+                    code="STT_TIMEOUT",
+                )
+
             return self.final_text
         finally:
             await self.close()
 
     async def close(self) -> None:
-        self.is_active = False
-        self.is_done.set()
-        current_task = None
-        with contextlib.suppress(RuntimeError):
-            current_task = asyncio.current_task()
-        if self.recv_task and not self.recv_task.done() and self.recv_task is not current_task:
-            self.recv_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self.recv_task
-        self.recv_task = None
-        if self.websocket:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self.websocket.close(code=1000, reason="Turn closed")
+        if self._closed:
+            return
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.is_active = False
+            self.is_done.set()
+            current_task = None
+            with contextlib.suppress(RuntimeError):
+                current_task = asyncio.current_task()
+            recv_task = self.recv_task
+            self.recv_task = None
+            if recv_task and not recv_task.done() and recv_task is not current_task:
+                recv_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await recv_task
+            ws = self.websocket
             self.websocket = None
+            if ws:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await ws.close(code=1000, reason="Turn closed")
 
 
 # ---------------------------------------------------------------------------
@@ -253,14 +317,23 @@ def _parse_sse_delta(data_str: str) -> str | None:
         chunk = json.loads(data_str)
     except Exception:
         return None
-    if isinstance(chunk, dict):
-        if "error" in chunk:
-            err = chunk["error"]
-            err_msg = err.get("message") if isinstance(err, dict) else str(err)
-            raise LLMError(f"LLM trả về lỗi stream: {err_msg}", code="LLM_STREAM_ERROR")
-        choices = chunk.get("choices")
-        if choices and isinstance(choices, list) and len(choices) > 0:
-            return choices[0].get("delta", {}).get("content")
+    if not isinstance(chunk, dict):
+        return None
+
+    if "error" in chunk:
+        err = chunk["error"]
+        err_msg = err.get("message") if isinstance(err, dict) else str(err)
+        raise LLMError(f"LLM trả về lỗi stream: {err_msg}", code="LLM_STREAM_ERROR")
+
+    choices = chunk.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            delta = first.get("delta")
+            if isinstance(delta, dict):
+                content = delta.get("content")
+                if isinstance(content, str):
+                    return content
     return None
 
 
@@ -312,6 +385,48 @@ async def llm_stream(messages: list[dict[str, str]], timeout: float | None = Non
 # ---------------------------------------------------------------------------
 # 4. TTS Adapter (ZeroTTS HTTP Stream)
 # ---------------------------------------------------------------------------
+def _find_wav_data_offset(header_buf: bytearray) -> int | None:
+    """Phân tích cấu trúc RIFF/WAVE để xác định vị trí bắt đầu của PCM data payload.
+
+    Trả về:
+    - int > 0: Offset bắt đầu của PCM audio data trong header_buf.
+    - None: Cần nhận thêm byte để hoàn tất việc phân tích RIFF/WAVE.
+    - 0: Không phải định dạng RIFF/WAVE (coi toàn bộ là raw PCM).
+    """
+    buf_len = len(header_buf)
+    if buf_len < 4:
+        return None
+    if not header_buf.startswith(b"RIFF"):
+        return 0
+
+    # Nếu có đúng cấu trúc tiêu chuẩn RIFF....WAVE, duyệt qua từng subchunk
+    if buf_len >= 12 and header_buf[8:12] == b"WAVE":
+        offset = 12
+        while offset + 8 <= buf_len:
+            chunk_id = bytes(header_buf[offset : offset + 4])
+            chunk_size = int.from_bytes(header_buf[offset + 4 : offset + 8], "little")
+            if chunk_id == b"data":
+                return offset + 8
+            next_offset = offset + 8 + chunk_size + (chunk_size % 2)
+            if next_offset <= offset:
+                break
+            offset = next_offset
+
+    # Fallback cho streaming WAV hoặc các định dạng RIFF có header mở rộng / mock test
+    data_idx = header_buf.find(b"data")
+    if data_idx != -1:
+        if buf_len >= data_idx + 8:
+            return data_idx + 8
+        return None
+
+    # Nếu đã đệm quá 64KB mà vẫn không có marker 'data'
+    if buf_len > 65536:
+        logger.warning("Không tìm thấy chunk 'data' sau %d byte header RIFF/WAVE. Giữ nguyên stream.", buf_len)
+        return 0
+
+    return None
+
+
 def _process_tts_chunk(
     raw_chunk: bytes, header_parsed: bool, header_buf: bytearray, leftover: bytes
 ) -> tuple[bytes, bool, bytes]:
@@ -324,17 +439,17 @@ def _process_tts_chunk(
             raw_chunk, header_parsed = bytes(header_buf), True
             header_buf.clear()
         else:
-            data_idx = header_buf.find(b"data")
-            if data_idx != -1 and len(header_buf) >= data_idx + 8:
-                raw_chunk = bytes(header_buf[data_idx + 8 :])
-                header_buf.clear()
-                header_parsed = True
-            elif len(header_buf) > 4096:
-                raw_chunk = bytes(header_buf[44:])
+            data_offset = _find_wav_data_offset(header_buf)
+            if data_offset is None:
+                return b"", False, leftover
+            elif data_offset == 0:
+                raw_chunk = bytes(header_buf)
                 header_buf.clear()
                 header_parsed = True
             else:
-                return b"", False, leftover
+                raw_chunk = bytes(header_buf[data_offset:])
+                header_buf.clear()
+                header_parsed = True
 
     if leftover:
         raw_chunk, leftover = leftover + raw_chunk, b""
@@ -367,6 +482,12 @@ async def tts_stream(text: str, voice: str | None = None, timeout: float | None 
                 aligned_data, header_parsed, leftover = _process_tts_chunk(raw_chunk, header_parsed, header_buf, leftover)
                 if aligned_data:
                     yield aligned_data
+            if leftover:
+                logger.warning(
+                    "Dữ liệu PCM từ TTS không hợp lệ (stream kết thúc với %d byte lẻ). Căn chỉnh 1 byte null để bảo toàn sample 16-bit.",
+                    len(leftover),
+                )
+                yield leftover + b"\x00"
     except httpx.TimeoutException as exc:
         raise TTSError(f"Hết thời gian chờ phản hồi TTS sau {actual_timeout}s.", code="TTS_TIMEOUT") from exc
     except httpx.RequestError as exc:
@@ -384,6 +505,7 @@ class SmartTurnDetector:
         self.session: ort.InferenceSession | None = None
         self.feature_extractor: WhisperFeatureExtractor | None = None
         self._load_lock = threading.Lock()
+        self._predict_lock = threading.Lock()
         self._attempted = False
 
     def load_model(self) -> None:
@@ -414,20 +536,31 @@ class SmartTurnDetector:
     def _sync_predict(self, audio_bytes: bytes, sample_rate: int = 16000) -> float:
         if self.session is None or self.feature_extractor is None:
             return 0.0
-        audio_f32 = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        max_samples = 8 * sample_rate
-        if len(audio_f32) > max_samples:
-            audio_f32 = audio_f32[-max_samples:]
-        if len(audio_f32) > 0:
-            std = np.std(audio_f32)
-            audio_f32 = (audio_f32 - np.mean(audio_f32)) / np.sqrt(std**2 + 1e-7)
-        if len(audio_f32) < max_samples:
-            audio_f32 = np.pad(audio_f32, (max_samples - len(audio_f32), 0), mode="constant")
-        inputs = self.feature_extractor(
-            audio_f32, sampling_rate=sample_rate, return_tensors="np", padding="do_not_pad", truncation=False, do_normalize=False
-        )
-        outputs = cast(list[np.ndarray], self.session.run(None, {"input_features": inputs.input_features.astype(np.float32)}))
-        return max(0.0, min(1.0, float(outputs[0][0].item())))
+        with self._predict_lock:
+            try:
+                audio_f32 = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                max_samples = 8 * sample_rate
+                if len(audio_f32) > max_samples:
+                    audio_f32 = audio_f32[-max_samples:]
+                if len(audio_f32) > 0:
+                    std = np.std(audio_f32)
+                    audio_f32 = (audio_f32 - np.mean(audio_f32)) / np.sqrt(std**2 + 1e-7)
+                if len(audio_f32) < max_samples:
+                    audio_f32 = np.pad(audio_f32, (max_samples - len(audio_f32), 0), mode="constant")
+                inputs = self.feature_extractor(
+                    audio_f32, sampling_rate=sample_rate, return_tensors="np", padding="do_not_pad", truncation=False, do_normalize=False
+                )
+                outputs = cast(list[np.ndarray], self.session.run(None, {"input_features": inputs.input_features.astype(np.float32)}))
+                return max(0.0, min(1.0, float(outputs[0][0].item())))
+            except Exception as exc:
+                logger.warning(
+                    "Lỗi suy luận Smart Turn ONNX (audio_len=%d, sr=%d): %s",
+                    len(audio_bytes),
+                    sample_rate,
+                    exc,
+                    exc_info=True,
+                )
+                return 0.0
 
     async def predict(self, audio_bytes: bytes, sample_rate: int = 16000) -> float:
         if not self._attempted:
@@ -436,7 +569,13 @@ class SmartTurnDetector:
             return 0.0
         try:
             return await asyncio.to_thread(self._sync_predict, audio_bytes, sample_rate)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Lỗi suy luận Smart Turn (audio_len=%d): %s",
+                len(audio_bytes),
+                exc,
+                exc_info=True,
+            )
             return 0.0
 
 

@@ -33,6 +33,9 @@ from backend.text_processing import (
 logger = logging.getLogger("voice")
 
 
+# =============================================================================
+# Helper functions
+# =============================================================================
 def _drain_queue(queue: asyncio.Queue[Any]) -> None:
     """Xả sạch hàng đợi để dừng xử lý ngay lập tức khi phát sinh lỗi."""
     while not queue.empty():
@@ -48,6 +51,9 @@ def _calc_rms(pcm_data: bytes) -> float:
     return float(np.sqrt(np.mean(samples * samples)) / 32768.0)
 
 
+# =============================================================================
+# VoiceState
+# =============================================================================
 class VoiceState(StrEnum):
     """Các trạng thái hợp lệ trong State Machine của Voicebot."""
 
@@ -59,6 +65,9 @@ class VoiceState(StrEnum):
     ERROR = "error"
 
 
+# =============================================================================
+# VoiceSession
+# =============================================================================
 @dataclass
 class VoiceSession:
     """Phiên tương tác thoại trực tiếp gắn liền với một kết nối WebSocket."""
@@ -69,6 +78,7 @@ class VoiceSession:
     current_turn_id: str | None = None
     active_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     closed: bool = False
+    _cleanup_done: bool = field(default=False, repr=False)
 
     has_speech: bool = False
     is_vad_speaking: bool = False
@@ -86,15 +96,19 @@ class VoiceSession:
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
+    # -------------------------------------------------------------------------
+    # Session & Audio Buffer
+    # -------------------------------------------------------------------------
     def __post_init__(self) -> None:
         if not self.barge_in_preroll.maxlen:
             self.barge_in_preroll = deque(maxlen=settings.barge_in_preroll_frames)
 
-    def buffer_audio(self, pcm: bytes, max_bytes: int = 256_000) -> None:
+    def buffer_audio(self, pcm: bytes, max_bytes: int | None = None) -> None:
         """Đệm âm thanh O(1) qua deque và xả frame cũ khi vượt giới hạn."""
+        limit = max_bytes if max_bytes is not None else settings.turn_max_audio_bytes
         self.turn_audio_buffer.append(pcm)
         self.turn_audio_bytes += len(pcm)
-        while self.turn_audio_bytes > max_bytes and self.turn_audio_buffer:
+        while self.turn_audio_bytes > limit and self.turn_audio_buffer:
             self.turn_audio_bytes -= len(self.turn_audio_buffer.popleft())
 
     def get_turn_audio(self) -> bytes:
@@ -107,41 +121,28 @@ class VoiceSession:
         self.barge_in_preroll.clear()
         self.barge_in_hits = 0
 
-    def is_active_turn(self, turn_id: str | None) -> bool:
-        """Kiểm tra turn có còn đang hoạt động và session chưa đóng hay không."""
-        return not self.closed and bool(turn_id) and self.current_turn_id == turn_id
-
-    async def _close_stt(self) -> None:
-        """Đóng kết nối WebSocket STT an toàn."""
-        if self.stt_client:
-            stt = self.stt_client
-            self.stt_client = None
-            with contextlib.suppress(Exception):
-                await stt.close()
-
     async def close(self) -> None:
         """Đóng toàn bộ phiên thoại và giải phóng tài nguyên."""
-        if self.closed:
+        if self._cleanup_done:
             return
         self.closed = True
+        self._cleanup_done = True
+        self.current_turn_id = None
         await self._close_stt()
-        with contextlib.suppress(Exception):
-            await self.cancel_active_tasks()
+        await self.cancel_active_tasks()
         self.reset_audio_buffers()
         self.history.clear()
 
-    async def _safe_send(self, target: Awaitable[None] | Callable[[], Awaitable[None]]) -> None:
+    # -------------------------------------------------------------------------
+    # WebSocket Communication
+    # -------------------------------------------------------------------------
+    async def _safe_send(self, send: Callable[[], Awaitable[None]]) -> None:
         if self.closed:
-            if asyncio.iscoroutine(target):
-                target.close()
             return
-        coro = target() if callable(target) else target
         try:
             async with self.send_lock:
                 if not self.closed:
-                    await coro
-                elif asyncio.iscoroutine(coro):
-                    coro.close()
+                    await send()
         except (ConnectionResetError, BrokenPipeError):
             self.closed = True
         except Exception as exc:
@@ -167,7 +168,7 @@ class VoiceSession:
             "segment_id": segment_id,
             "chunk_id": chunk_id,
             "format": "pcm_s16le",
-            "sample_rate": 48000,
+            "sample_rate": settings.tts_sample_rate,
             "channels": 1,
         }
         send_json, send_bin = self.send_json_cb, self.send_binary_cb
@@ -184,8 +185,17 @@ class VoiceSession:
         if self.state == VoiceState.ERROR and not force:
             return
         self.state = new_state
+        if new_state == VoiceState.ERROR:
+            if self._smart_turn_task and not self._smart_turn_task.done():
+                self._smart_turn_task.cancel()
+                self._smart_turn_task = None
+            self.has_speech = False
+            self.is_vad_speaking = False
         await self.emit_event("voice.state", turn_id=self.current_turn_id, state=new_state.value)
 
+    # -------------------------------------------------------------------------
+    # Task Management
+    # -------------------------------------------------------------------------
     async def cancel_active_tasks(self) -> None:
         current_task = None
         with contextlib.suppress(RuntimeError):
@@ -204,6 +214,9 @@ class VoiceSession:
         task.add_done_callback(self.active_tasks.discard)
         return task
 
+    # -------------------------------------------------------------------------
+    # Conversation History
+    # -------------------------------------------------------------------------
     def add_history(self, role: str, content: str) -> None:
         max_messages = max(0, settings.voice_max_history_pairs * 2)
         if max_messages == 0:
@@ -220,9 +233,26 @@ class VoiceSession:
         messages.extend(self.history)
         return messages
 
-    # -----------------------------------------------------------------------
-    # Quản lý Turn & Điều phối sự kiện
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Turn Management
+    # -------------------------------------------------------------------------
+    def is_active_turn(self, turn_id: str | None) -> bool:
+        """Kiểm tra turn có còn đang hoạt động và session chưa đóng hay không."""
+        return not self.closed and bool(turn_id) and self.current_turn_id == turn_id
+
+    def _match_turn(self, turn_id: str | None, allow_empty: bool = False) -> bool:
+        """Kiểm tra sự kiện có khớp với turn hiện tại không.
+
+        - Nếu phiên không có current_turn_id hoạt động: luôn trả về False.
+        - Nếu có turn_id: bắt buộc phải khớp chính xác với current_turn_id.
+        - Nếu không có turn_id: chỉ khớp khi allow_empty=True (chế độ tương thích cho cancel).
+        """
+        if not self.current_turn_id:
+            return False
+        if turn_id is not None and turn_id.strip() != "":
+            return turn_id == self.current_turn_id
+        return allow_empty
+
     async def start_turn(self) -> None:
         async with self.turn_lock:
             turn_id = f"turn_{uuid.uuid4().hex[:8]}"
@@ -244,6 +274,37 @@ class VoiceSession:
                 await self.emit_event("session.error", code="STT_CONNECT_FAILED", message=str(exc))
                 await self.set_state(VoiceState.ERROR)
 
+    async def finish_turn(self) -> None:
+        turn_id = self.current_turn_id
+        if not turn_id or self.state != VoiceState.LISTENING:
+            return
+        if self._smart_turn_task and not self._smart_turn_task.done():
+            self._smart_turn_task.cancel()
+            self._smart_turn_task = None
+        await self.set_state(VoiceState.THINKING)
+        self._spawn_task(self._process_turn(turn_id))
+
+    async def _handle_cancel(self, turn_id: str | None = None) -> None:
+        if self._match_turn(turn_id, allow_empty=True):
+            old_turn_id = self.current_turn_id
+            await self._close_stt()
+            await self.cancel_active_tasks()
+            await self.emit_event("playback.stop", turn_id=old_turn_id)
+            await self.set_state(VoiceState.IDLE, force=True)
+            self.reset_audio_buffers()
+            self.current_turn_id = None
+
+    # -------------------------------------------------------------------------
+    # STT & Smart Turn
+    # -------------------------------------------------------------------------
+    async def _close_stt(self) -> None:
+        """Đóng kết nối WebSocket STT an toàn."""
+        if self.stt_client:
+            stt = self.stt_client
+            self.stt_client = None
+            with contextlib.suppress(Exception):
+                await stt.close()
+
     async def _forward_stt_events(self, stt: services.STTClient, turn_id: str) -> None:
         try:
             async for event in stt.events():
@@ -261,15 +322,21 @@ class VoiceSession:
                 elif event_type == "vad":
                     await self._handle_vad(turn_id, event.get("state") or event.get("vad_type") or "activity")
                 elif event_type == "error":
-                    await self.emit_event(
-                        "session.error",
-                        code=event.get("error_code") or "STT_ERROR",
-                        message=event.get("message", "Lỗi STT"),
-                    )
+                    code = event.get("error_code") or event.get("code") or "STT_ERROR"
+                    msg = event.get("message", "Lỗi STT")
+                    await self.emit_event("session.error", code=code, message=msg)
+                    if self.is_active_turn(turn_id):
+                        await self._close_stt()
+                        await self.set_state(VoiceState.ERROR)
+                    break
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error("Lỗi forward STT: %s", exc)
+            logger.error("Lỗi forward STT turn [%s]: %s", turn_id, exc)
+            if self.is_active_turn(turn_id):
+                await self._close_stt()
+                await self.emit_event("session.error", code="STT_FORWARD_ERROR", message=str(exc))
+                await self.set_state(VoiceState.ERROR)
 
     async def _predict_and_trigger(self, turn_id: str) -> None:
         try:
@@ -305,23 +372,19 @@ class VoiceSession:
         elif vad_state == "speech_ended":
             self.is_vad_speaking = False
             self.last_speech_time = time.monotonic()
-            if self.has_speech and self.state == VoiceState.LISTENING:
+            if self.has_speech and self.state == VoiceState.LISTENING and self.is_active_turn(turn_id):
                 if self._smart_turn_task and not self._smart_turn_task.done():
                     return
                 self._smart_turn_task = self._spawn_task(self._predict_and_trigger(turn_id))
-
-    async def finish_turn(self) -> None:
-        turn_id = self.current_turn_id
-        if not turn_id or self.state != VoiceState.LISTENING:
-            return
-        await self.set_state(VoiceState.THINKING)
-        self._spawn_task(self._process_turn(turn_id))
 
     def is_silence_timeout(self) -> bool:
         if self.is_vad_speaking or not (self.has_speech and self.last_speech_time > 0):
             return False
         return (time.monotonic() - self.last_speech_time) >= settings.smart_turn_silence_timeout_seconds
 
+    # -------------------------------------------------------------------------
+    # Barge-in
+    # -------------------------------------------------------------------------
     async def check_barge_in(self, pcm_data: bytes) -> bool:
         if self.state not in (VoiceState.THINKING, VoiceState.SPEAKING):
             return False
@@ -364,48 +427,50 @@ class VoiceSession:
             try:
                 await self.stt_client.send_audio(pcm_data)
             except services.STTError as err:
+                logger.error("Lỗi gửi audio tới STT turn [%s]: %s", self.current_turn_id, err)
+                await self._close_stt()
                 await self.emit_event("session.error", code=err.code, message=str(err))
+                await self.set_state(VoiceState.ERROR)
+                return
 
         if self.is_silence_timeout():
             await self.finish_turn()
 
-    # -----------------------------------------------------------------------
-    # Dual Pipeline (STT -> LLM/TTS song song)
-    # -----------------------------------------------------------------------
-    async def _handle_pipeline_error(self, turn_id: str, queue: asyncio.Queue[Any], code: str, msg: str) -> None:
-        if not self.is_active_turn(turn_id):
-            return
-        _drain_queue(queue)
-        await self.emit_event("playback.stop", turn_id=turn_id)
-        await self.emit_event("session.error", code=code, message=msg)
-        await self.set_state(VoiceState.ERROR)
-
-    async def _stream_llm_to_queue(
-        self, turn_id: str, queue: asyncio.Queue[str | None], streamer: TTSTextStreamer, user_text: str
-    ) -> list[str]:
-        chunks: list[str] = []
-        messages = self.build_messages() + [{"role": "user", "content": user_text}]
-        async for delta in services.llm_stream(messages):
-            if not self.is_active_turn(turn_id) or self.state == VoiceState.ERROR:
-                return chunks
-            if not chunks:
-                delta = delta.lstrip("\r\n ")
-                if not delta:
-                    continue
-            chunks.append(delta)
-            await self.emit_event("assistant.text.delta", turn_id=turn_id, text=delta)
-            for sentence in streamer.feed(delta):
-                await queue.put(sentence)
-
-        for sentence in streamer.feed():
-            await queue.put(sentence)
-        return chunks
-
+    # -------------------------------------------------------------------------
+    # LLM Producer
+    # -------------------------------------------------------------------------
     async def _produce_tts_text(self, turn_id: str, queue: asyncio.Queue[str | None], user_text: str) -> None:
-        streamer = TTSTextStreamer(min_chars=8, max_sentences=8, max_chars=600)
+        streamer = TTSTextStreamer()
         chunks: list[str] = []
+        sentinel_sent = False
         try:
-            chunks = await self._stream_llm_to_queue(turn_id, queue, streamer, user_text)
+            messages = self.build_messages() + [{"role": "user", "content": user_text}]
+            async for delta in services.llm_stream(messages):
+                if not self.is_active_turn(turn_id) or self.state == VoiceState.ERROR:
+                    break
+                if not chunks:
+                    delta = delta.lstrip("\r\n ")
+                    if not delta:
+                        continue
+                chunks.append(delta)
+                await self.emit_event("assistant.text.delta", turn_id=turn_id, text=delta)
+                for sentence in streamer.feed(delta):
+                    await queue.put(sentence)
+
+            if self.is_active_turn(turn_id) and self.state != VoiceState.ERROR:
+                for sentence in streamer.feed():
+                    await queue.put(sentence)
+
+                full_text = "".join(chunks).strip()
+                if full_text:
+                    await self.emit_event("assistant.text.done", turn_id=turn_id, text=full_text)
+                    self.add_history("user", user_text)
+                    self.add_history("assistant", full_text)
+                elif self.state == VoiceState.THINKING:
+                    await self.set_state(VoiceState.IDLE)
+
+                await queue.put(None)
+                sentinel_sent = True
         except services.LLMError as err:
             logger.error("Lỗi LLM: %s", err)
             await self._handle_pipeline_error(turn_id, queue, err.code, str(err))
@@ -418,41 +483,18 @@ class VoiceSession:
             await self._handle_pipeline_error(turn_id, queue, "LLM_STREAM_ERROR", str(exc))
             raise
         finally:
-            if queue.full():
+            if not sentinel_sent:
                 _drain_queue(queue)
-            with contextlib.suppress(Exception):
-                queue.put_nowait(None)
+                with contextlib.suppress(Exception):
+                    queue.put_nowait(None)
 
-        if self.state == VoiceState.ERROR:
-            return
-
-        full_text = "".join(chunks).strip()
-        if not full_text:
-            if self.state == VoiceState.THINKING:
-                await self.set_state(VoiceState.IDLE)
-            return
-
-        if self.is_active_turn(turn_id) and self.state != VoiceState.ERROR:
-            await self.emit_event("assistant.text.done", turn_id=turn_id, text=full_text)
-            self.add_history("user", user_text)
-            self.add_history("assistant", full_text)
-
-    async def _stream_sentence_tts(
-        self, turn_id: str, sentence: str, seg_id: int, start_chunk_id: int
-    ) -> tuple[int, int]:
-        chunk_id = start_chunk_id
-        chunk_bytes = 0
-        async for pcm_chunk in services.tts_stream(sentence):
-            if not self.is_active_turn(turn_id) or self.state == VoiceState.ERROR:
-                break
-            chunk_bytes += len(pcm_chunk)
-            await self.emit_audio_chunk(turn_id, seg_id, chunk_id, pcm_chunk)
-            chunk_id += 1
-        return chunk_id, chunk_bytes
-
+    # -------------------------------------------------------------------------
+    # TTS Consumer
+    # -------------------------------------------------------------------------
     async def _finish_speaking(self, turn_id: str, total_bytes: int) -> None:
         await self.emit_event("assistant.audio.done", turn_id=turn_id)
-        delay = (total_bytes / 96000) + 1.5 if total_bytes > 0 else 1.0
+        bytes_per_sec = settings.tts_sample_rate * 2
+        delay = (total_bytes / bytes_per_sec) + 1.5 if total_bytes > 0 else 1.0
 
         async def _fallback() -> None:
             await asyncio.sleep(delay)
@@ -471,8 +513,13 @@ class VoiceSession:
                 if self.state != VoiceState.SPEAKING:
                     await self.set_state(VoiceState.SPEAKING)
 
-                chunk_id, sentence_bytes = await self._stream_sentence_tts(turn_id, sentence, seg_id, chunk_id)
-                total_bytes += sentence_bytes
+                async for pcm_chunk in services.tts_stream(sentence):
+                    if not self.is_active_turn(turn_id) or self.state == VoiceState.ERROR:
+                        break
+                    total_bytes += len(pcm_chunk)
+                    await self.emit_audio_chunk(turn_id, seg_id, chunk_id, pcm_chunk)
+                    chunk_id += 1
+
                 seg_id += 1
 
             if self.is_active_turn(turn_id) and self.state != VoiceState.ERROR:
@@ -492,31 +539,36 @@ class VoiceSession:
             await self._handle_pipeline_error(turn_id, queue, "TTS_STREAM_ERROR", str(exc))
             raise
 
-    async def _extract_final_stt_text(self) -> str:
-        final_text = ""
-        if self.stt_client:
-            stt = self.stt_client
-            self.stt_client = None
-            final_text = await stt.finish()
-        if not final_text and self.last_partial_text:
-            final_text = self.last_partial_text.strip()
-        return final_text
-
     async def _respond_with_filler(self, turn_id: str, prompt: str) -> None:
+        if not self.is_active_turn(turn_id):
+            return
         await self.emit_event("assistant.text.done", turn_id=turn_id, text=prompt)
-        q: asyncio.Queue[str | None] = asyncio.Queue(maxsize=8)
-        q.put_nowait(normalize_text_for_tts(prompt))
-        q.put_nowait(None)
-        await self._stream_tts_audio(turn_id, q)
+        queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=8)
+        queue.put_nowait(normalize_text_for_tts(prompt))
+        queue.put_nowait(None)
+        await self._stream_tts_audio(turn_id, queue)
 
     async def _run_turn_taskgroup(self, turn_id: str, final_text: str) -> None:
         queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=8)
         try:
             async with asyncio.TaskGroup() as tg:
-                self._spawn_task(tg.create_task(self._produce_tts_text(turn_id, queue, final_text)))
-                self._spawn_task(tg.create_task(self._stream_tts_audio(turn_id, queue)))
-        except* services.ServiceError:
-            pass
+                tg.create_task(self._produce_tts_text(turn_id, queue, final_text))
+                tg.create_task(self._stream_tts_audio(turn_id, queue))
+        except* services.ServiceError as eg:
+            if self.is_active_turn(turn_id) and self.state != VoiceState.ERROR:
+                first_err = eg.exceptions[0] if eg.exceptions else services.ServiceError("Lỗi pipeline")
+                await self._handle_turn_exception(turn_id, first_err)
+
+    # -------------------------------------------------------------------------
+    # Error Handling
+    # -------------------------------------------------------------------------
+    async def _handle_pipeline_error(self, turn_id: str, queue: asyncio.Queue[Any], code: str, msg: str) -> None:
+        if not self.is_active_turn(turn_id):
+            return
+        _drain_queue(queue)
+        await self.emit_event("playback.stop", turn_id=turn_id)
+        await self.emit_event("session.error", code=code, message=msg)
+        await self.set_state(VoiceState.ERROR)
 
     async def _handle_turn_exception(self, turn_id: str, exc: Exception) -> None:
         if not self.is_active_turn(turn_id):
@@ -529,15 +581,35 @@ class VoiceSession:
             await self.emit_event("session.error", code="PIPELINE_ERROR", message=str(exc))
         await self.set_state(VoiceState.ERROR)
 
+    # -------------------------------------------------------------------------
+    # Event Handling
+    # -------------------------------------------------------------------------
     async def _process_turn(self, turn_id: str) -> None:
         try:
-            final_text = await self._extract_final_stt_text()
-            if not final_text:
-                if self.is_active_turn(turn_id):
-                    await self.set_state(VoiceState.IDLE)
-                return
+            final_text = ""
+            if self.stt_client:
+                stt = self.stt_client
+                self.stt_client = None
+                try:
+                    final_text = await stt.finish()
+                except services.STTError as stt_err:
+                    if stt_err.code == "STT_TIMEOUT" and self.last_partial_text:
+                        logger.warning(
+                            "STT timeout turn [%s], dùng transcript partial dự phòng: '%s'",
+                            turn_id,
+                            self.last_partial_text,
+                        )
+                        final_text = self.last_partial_text.strip()
+                    else:
+                        raise
+            if not final_text and self.last_partial_text:
+                final_text = self.last_partial_text.strip()
 
             if not self.is_active_turn(turn_id):
+                return
+
+            if not final_text:
+                await self.set_state(VoiceState.IDLE)
                 return
 
             await self.emit_event("transcript.final", turn_id=turn_id, text=final_text)
@@ -559,17 +631,6 @@ class VoiceSession:
         except Exception as exc:
             await self._handle_turn_exception(turn_id, exc)
 
-    async def _handle_cancel(self, turn_id: str | None) -> None:
-        if not turn_id or not self.current_turn_id or turn_id == self.current_turn_id:
-            await self._close_stt()
-            with contextlib.suppress(Exception):
-                await self.cancel_active_tasks()
-            with contextlib.suppress(Exception):
-                await self.emit_event("playback.stop", turn_id=self.current_turn_id)
-            with contextlib.suppress(Exception):
-                await self.set_state(VoiceState.IDLE, force=True)
-            self.reset_audio_buffers()
-
     async def handle_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
         if event_type == "session.start":
@@ -577,21 +638,24 @@ class VoiceSession:
             await self.set_state(VoiceState.IDLE, force=True)
         elif event_type == "turn.start":
             await self.start_turn()
-        elif event_type == "turn.finish":
-            req_turn = event.get("turn_id")
-            if not req_turn or req_turn == self.current_turn_id:
-                await self.finish_turn()
+        elif event_type == "turn.finish" and self._match_turn(event.get("turn_id"), allow_empty=False):
+            await self.finish_turn()
         elif event_type == "session.cancel":
             await self._handle_cancel(event.get("turn_id"))
         elif event_type == "session.stop":
             await self.emit_event("session.stopped")
             await orchestrator.close_session(self.session_id)
-        elif event_type == "playback.done":
-            req_turn = event.get("turn_id")
-            if (not req_turn or req_turn == self.current_turn_id) and self.state == VoiceState.SPEAKING:
-                await self.set_state(VoiceState.IDLE)
+        elif (
+            event_type == "playback.done"
+            and self._match_turn(event.get("turn_id"), allow_empty=False)
+            and self.state == VoiceState.SPEAKING
+        ):
+            await self.set_state(VoiceState.IDLE)
 
 
+# =============================================================================
+# VoiceOrchestrator
+# =============================================================================
 class VoiceOrchestrator:
     """Quản lý danh sách các phiên VoiceSession trong RAM."""
 
@@ -623,4 +687,7 @@ class VoiceOrchestrator:
             await session.close()
 
 
+# =============================================================================
+# orchestrator singleton instance
+# =============================================================================
 orchestrator = VoiceOrchestrator()

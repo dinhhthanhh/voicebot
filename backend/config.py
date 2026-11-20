@@ -71,6 +71,13 @@ class Settings:
     stt_language: str = field(default_factory=lambda: os.getenv("STT_LANGUAGE", "Vietnamese"))
     stt_sample_rate: int = field(default_factory=lambda: int(os.getenv("STT_SAMPLE_RATE", "16000")))
     stt_vad: str = field(default_factory=lambda: os.getenv("STT_VAD", "silero"))
+    stt_max_retries: int = field(default_factory=lambda: int(os.getenv("STT_MAX_RETRIES", "2")))
+    stt_connect_timeout: float = field(
+        default_factory=lambda: float(os.getenv("STT_CONNECT_TIMEOUT", "10.0"))
+    )
+    stt_max_duration_seconds: float = field(
+        default_factory=lambda: float(os.getenv("STT_MAX_DURATION_SECONDS", "600"))
+    )
 
     # TTS Settings
     tts_base_url: str = field(
@@ -83,10 +90,18 @@ class Settings:
     tts_timeout_seconds: float = field(
         default_factory=lambda: float(os.getenv("TTS_TIMEOUT_SECONDS", "90"))
     )
+    tts_sample_rate: int = field(default_factory=lambda: int(os.getenv("TTS_SAMPLE_RATE", "48000")))
+    tts_split_limit: int = field(default_factory=lambda: int(os.getenv("TTS_SPLIT_LIMIT", "450")))
+    tts_min_chars: int = field(default_factory=lambda: int(os.getenv("TTS_MIN_CHARS", "8")))
+    tts_max_sentences: int = field(default_factory=lambda: int(os.getenv("TTS_MAX_SENTENCES", "8")))
+    tts_max_chars: int = field(default_factory=lambda: int(os.getenv("TTS_MAX_CHARS", "600")))
 
     # Orchestrator & Session Settings
     voice_max_history_pairs: int = field(
         default_factory=lambda: int(os.getenv("VOICE_MAX_HISTORY_PAIRS", "8"))
+    )
+    turn_max_audio_bytes: int = field(
+        default_factory=lambda: int(os.getenv("TURN_MAX_AUDIO_BYTES", "256000"))
     )
 
     # Thư mục frontend và models
@@ -132,6 +147,10 @@ class Settings:
             (self.max_sessions < 1, f"MAX_SESSIONS ({self.max_sessions}) phải >= 1."),
             (self.llm_timeout_seconds <= 0, f"LLM_TIMEOUT_SECONDS ({self.llm_timeout_seconds}) phải lớn hơn 0."),
             (self.tts_timeout_seconds <= 0, f"TTS_TIMEOUT_SECONDS ({self.tts_timeout_seconds}) phải lớn hơn 0."),
+            (self.tts_split_limit < 10, f"TTS_SPLIT_LIMIT ({self.tts_split_limit}) phải >= 10."),
+            (self.tts_max_sentences < 1, f"TTS_MAX_SENTENCES ({self.tts_max_sentences}) phải >= 1."),
+            (self.tts_max_chars < 10, f"TTS_MAX_CHARS ({self.tts_max_chars}) phải >= 10."),
+            (self.turn_max_audio_bytes < 3200, f"TURN_MAX_AUDIO_BYTES ({self.turn_max_audio_bytes}) phải >= 3200."),
         ]
         for condition, msg in rules:
             if condition:

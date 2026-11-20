@@ -9,8 +9,11 @@ Nhiệm vụ:
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from num2words import num2words
+
+from backend.config import settings
 
 # ---------------------------------------------------------------------------
 # 1. Lọc từ đệm nhận dạng giọng nói (ASR Filler Filter)
@@ -61,8 +64,15 @@ def clean_inline_markdown(text: str) -> str:
 class SpeechFilter:
     """Bộ tách câu gọn nhẹ từ luồng LLM streaming cho TTS."""
 
-    def __init__(self, min_chars: int = 8, max_sentences: int = 8, max_chars: int = 600) -> None:
-        self.min_chars, self.max_sentences, self.max_chars = min_chars, max_sentences, max_chars
+    def __init__(
+        self,
+        min_chars: int | None = None,
+        max_sentences: int | None = None,
+        max_chars: int | None = None,
+    ) -> None:
+        self.min_chars = min_chars if min_chars is not None else settings.tts_min_chars
+        self.max_sentences = max_sentences if max_sentences is not None else settings.tts_max_sentences
+        self.max_chars = max_chars if max_chars is not None else settings.tts_max_chars
         self.buf = ""
         self.hold = ""
         self.sent_count = 0
@@ -226,12 +236,13 @@ def normalize_text_for_tts(text: str) -> str:
     return TTS_TOKEN_RE.sub(_replace_token_for_tts, text)
 
 
-def split_for_tts(text: str, limit: int = 450) -> list[str]:
+def split_for_tts(text: str, limit: int | None = None) -> list[str]:
     """Tách câu văn bản dài tại dấu phẩy hoặc khoảng trắng gần nhất."""
+    max_len = limit if limit is not None else settings.tts_split_limit
     parts: list[str] = []
-    while len(text) > limit:
-        cut = max(text.rfind(",", 0, limit), text.rfind(" ", 0, limit))
-        cut = cut if cut > 0 else limit
+    while len(text) > max_len:
+        cut = max(text.rfind(",", 0, max_len), text.rfind(" ", 0, max_len))
+        cut = cut if cut > 0 else max_len
         parts.append(text[: cut + 1].strip())
         text = text[cut + 1 :].strip()
     if text:
@@ -246,25 +257,14 @@ class TTSTextStreamer:
     -> Cắt ngắn theo giới hạn TTS (split_for_tts).
     """
 
-    def __init__(
-        self,
-        min_chars: int = 8,
-        max_sentences: int = 8,
-        max_chars: int = 600,
-        split_limit: int = 450,
-    ) -> None:
-        self.speech_filter = SpeechFilter(
-            min_chars=min_chars,
-            max_sentences=max_sentences,
-            max_chars=max_chars,
-        )
-        self.split_limit = split_limit
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.speech_filter = SpeechFilter(*args, **kwargs)
 
     def feed(self, delta: str | None = None) -> list[str]:
         raw = self.speech_filter.feed(delta) if delta is not None else self.speech_filter.flush()
         return [
             chunk
             for s in raw
-            for chunk in split_for_tts(normalize_text_for_tts(s), limit=self.split_limit)
+            for chunk in split_for_tts(normalize_text_for_tts(s))
         ]
 
