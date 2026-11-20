@@ -182,6 +182,9 @@ class STTClient:
         except websockets.ConnectionClosed as exc:
             self.is_active = False
             raise STTError("Kết nối STT bị ngắt khi gửi audio.") from exc
+        except Exception as exc:
+            self.is_active = False
+            raise STTError(f"Lỗi gửi audio tới STT: {exc}", code="STT_SEND_ERROR") from exc
 
     async def events(self) -> AsyncIterator[dict[str, Any]]:
         while True:
@@ -246,10 +249,17 @@ async def close_http_client() -> None:
 
 
 def _parse_sse_delta(data_str: str) -> str | None:
-    with contextlib.suppress(Exception):
+    try:
         chunk = json.loads(data_str)
+    except Exception:
+        return None
+    if isinstance(chunk, dict):
+        if "error" in chunk:
+            err = chunk["error"]
+            err_msg = err.get("message") if isinstance(err, dict) else str(err)
+            raise LLMError(f"LLM trả về lỗi stream: {err_msg}", code="LLM_STREAM_ERROR")
         choices = chunk.get("choices")
-        if choices:
+        if choices and isinstance(choices, list) and len(choices) > 0:
             return choices[0].get("delta", {}).get("content")
     return None
 
@@ -437,4 +447,9 @@ def init_smart_turn() -> None:
 
 async def predict_smart_turn(audio_buffer: bytes, sample_rate: int = 16000) -> float:
     return await _smart_turn_detector.predict_probability(audio_buffer, sample_rate=sample_rate)
+
+
+def is_smart_turn_ready() -> bool:
+    """Kiểm tra mô hình Smart Turn ONNX đã nạp vào RAM và sẵn sàng hay chưa."""
+    return _smart_turn_detector.session is not None
 

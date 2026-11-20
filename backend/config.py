@@ -115,12 +115,27 @@ class Settings:
     def validate_config(self) -> list[str]:
         """Kiểm tra tính hợp lệ của cấu hình, trả về danh sách cảnh báo."""
         warnings: list[str] = []
-        if not self.stt_ws_url:
-            warnings.append("STT_WS_URL chưa được thiết lập.")
-        if not self.llm_chat_completions_url:
-            warnings.append("LLM_CHAT_COMPLETIONS_URL chưa được thiết lập.")
-        if not self.tts_base_url:
-            warnings.append("TTS_BASE_URL chưa được thiết lập.")
+        required_urls = [
+            ("STT_WS_URL", self.stt_ws_url),
+            ("LLM_CHAT_COMPLETIONS_URL", self.llm_chat_completions_url),
+            ("TTS_BASE_URL", self.tts_base_url),
+        ]
+        for name, val in required_urls:
+            if not val:
+                warnings.append(f"{name} chưa được thiết lập.")
+
+        rules: list[tuple[bool, str]] = [
+            (not (0 < self.smart_turn_threshold <= 1.0), f"SMART_TURN_THRESHOLD ({self.smart_turn_threshold}) nên nằm trong khoảng (0, 1.0]."),
+            (self.smart_turn_silence_timeout_seconds <= 0, f"SMART_TURN_SILENCE_TIMEOUT_SECONDS ({self.smart_turn_silence_timeout_seconds}) phải lớn hơn 0."),
+            (self.barge_in_rms_threshold <= 0, f"BARGE_IN_RMS_THRESHOLD ({self.barge_in_rms_threshold}) phải lớn hơn 0."),
+            (self.barge_in_debounce_frames < 1, f"BARGE_IN_DEBOUNCE_FRAMES ({self.barge_in_debounce_frames}) phải >= 1."),
+            (self.max_sessions < 1, f"MAX_SESSIONS ({self.max_sessions}) phải >= 1."),
+            (self.llm_timeout_seconds <= 0, f"LLM_TIMEOUT_SECONDS ({self.llm_timeout_seconds}) phải lớn hơn 0."),
+            (self.tts_timeout_seconds <= 0, f"TTS_TIMEOUT_SECONDS ({self.tts_timeout_seconds}) phải lớn hơn 0."),
+        ]
+        for condition, msg in rules:
+            if condition:
+                warnings.append(msg)
         return warnings
 
 

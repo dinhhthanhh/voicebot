@@ -511,6 +511,54 @@ def test_safe_send_closed_and_disconnect():
     assert session.closed is True
 
 
+def test_config_validation_ranges():
+    bad_cfg = settings.__class__(
+        smart_turn_threshold=1.5,
+        smart_turn_silence_timeout_seconds=-1.0,
+        barge_in_rms_threshold=0.0,
+        barge_in_debounce_frames=0,
+        max_sessions=0,
+        llm_timeout_seconds=0.0,
+        tts_timeout_seconds=0.0,
+    )
+    warnings = bad_cfg.validate_config()
+    assert any("SMART_TURN_THRESHOLD" in w for w in warnings)
+    assert any("SMART_TURN_SILENCE_TIMEOUT_SECONDS" in w for w in warnings)
+    assert any("BARGE_IN_RMS_THRESHOLD" in w for w in warnings)
+    assert any("BARGE_IN_DEBOUNCE_FRAMES" in w for w in warnings)
+    assert any("MAX_SESSIONS" in w for w in warnings)
+    assert any("LLM_TIMEOUT_SECONDS" in w for w in warnings)
+    assert any("TTS_TIMEOUT_SECONDS" in w for w in warnings)
+
+
+def test_parse_sse_delta_error_stream():
+    with pytest.raises(services.LLMError, match="Rate limit exceeded"):
+        services._parse_sse_delta('{"error": {"message": "Rate limit exceeded"}}')
+
+
+def test_is_smart_turn_ready():
+    assert isinstance(services.is_smart_turn_ready(), bool)
+
+
+def test_stt_send_audio_generic_exception():
+    class MockWS:
+        async def send(self, data):
+            raise OSError("Socket write broken")
+
+    stt = services.STTClient("sess", "turn", "req")
+    stt.websocket = MockWS()
+    stt.is_active = True
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    with pytest.raises(services.STTError, match="Lỗi gửi audio tới STT"):
+        _step(stt.send_audio(b"\x00\x00" * 160))
+
+
 
 
 

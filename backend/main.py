@@ -63,10 +63,18 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    return JSONResponse({"status": "ok", "active_sessions": len(orchestrator.sessions)})
+    return JSONResponse(
+        {
+            "status": "ok",
+            "smart_turn_ready": services.is_smart_turn_ready(),
+            "active_sessions": len(orchestrator.sessions),
+        }
+    )
 
 
 async def _handle_ws_message(session: VoiceSession, message: dict[str, Any]) -> None:
+    if session.closed:
+        return
     if "text" in message:
         try:
             payload = json.loads(message["text"])
