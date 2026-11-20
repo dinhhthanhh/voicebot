@@ -28,7 +28,7 @@ Hệ thống trợ lý giọng nói đàm thoại thời gian thực độ trễ
 ### 3. Cơ chế kết thúc lượt nói thông minh (Smart Turn & VAD)
 
 - **Silero VAD (ASR Side / Local):** Phát hiện tiếng nói trong frame âm thanh thời gian thực.
-- **Smart Turn v3.2 ONNX:** Phân tích ngữ nghĩa âm học (cao độ, ngữ điệu kết thúc) trên cửa sổ trượt âm thanh 8s gần nhất.
+- **Smart Turn v3.2 ONNX:** Phân tích ngữ nghĩa âm học (cao độ, ngữ điệu kết thúc) trên cửa sổ trượt âm thanh 8s gần nhất từ mô hình [pipecat-ai/smart-turn-v3](https://huggingface.co/pipecat-ai/smart-turn-v3).
 - **Heuristics bảo vệ ngữ cảnh:** Tự động tăng thời gian chờ ngắt khi người dùng ngập ngừng (*"ừ"*, *"à"*, *"ờ"*), nói từ nối (*"và"*, *"thì"*, *"nhưng"*...) hoặc đọc dở dãy số điện thoại/mã vận đơn.
 
 ### 4. Giao diện Web Audio Hiện đại
@@ -55,14 +55,14 @@ voice-bot/
 │   ├── app.js                  # AudioWorklet, WebSocket client, Web Audio API
 │   └── style.css               # Giao diện trực quan hiện đại
 ├── models/                     # Thư mục chứa mô hình ONNX
-│   └── smart-turn-v3.2-cpu.onnx# Smart Turn v3.2 (ONNX runtime CPU)
+│   └── smart-turn-v3.2-cpu.onnx# Smart Turn v3.2 (tải từ Hugging Face pipecat-ai/smart-turn-v3)
 ├── docs/                       # Tài liệu chi tiết kiến trúc & giao thức
 │   ├── 01_architecture.md      # Cấu trúc hệ thống & nguyên tắc thiết kế
 │   ├── 02_voice_flow.md        # Luồng hội thoại, Smart Turn và barge-in
 │   ├── 03_api_protocol.md      # Hợp đồng WebSocket & API
 │   └── 04_implementation.md    # Checklist triển khai & nghiệm thu
 ├── tests/                      # Bộ kiểm thử tự động
-│   └── test_backend.py         # 18 test cases kiểm thử toàn diện backend
+│   └── test_backend.py         # 37 test cases kiểm thử toàn diện backend
 ├── requirements.txt            # Danh sách thư viện phụ thuộc (pip)
 ├── pyproject.toml              # Cấu hình dự án & linter (ruff)
 └── README.md                   # Tài liệu hướng dẫn dự án
@@ -80,7 +80,7 @@ Tạo file `.env` tại thư mục `backend/` (hoặc thư mục gốc dự án)
 | `LLM_URL`               | `https://ai.vnpost.vn/vllm-qwen38-27b/v1/chat/completions` | OpenAI-compatible endpoint của LLM               |
 | `TTS_BASE_URL`          | `https://ai.vnpost.vn/zero-tts`                            | Endpoint dịch vụ Zero-TTS                       |
 | `TTS_VOICE`             | `maichi`                                                   | Giọng đọc mặc định của Zero-TTS            |
-| `SMART_TURN_MODEL_PATH` | `models/smart-turn-v3.2-cpu.onnx`                          | Đường dẫn file mô hình Smart Turn v3.2 ONNX |
+| `SMART_TURN_MODEL_PATH` | `models/smart-turn-v3.2-cpu.onnx`                          | Đường dẫn file mô hình Smart Turn v3.2 ONNX ([Hugging Face](https://huggingface.co/pipecat-ai/smart-turn-v3)) |
 
 ---
 
@@ -102,7 +102,54 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 2. Kiểm tra bộ kiểm thử (Unit tests & Linting)
+### 2. Tải mô hình Smart Turn v3.2 ONNX
+
+Mô hình phát hiện ngắt lượt thông minh được cung cấp tại repo Hugging Face: [pipecat-ai/smart-turn-v3](https://huggingface.co/pipecat-ai/smart-turn-v3).
+
+Dự án sử dụng mặc định file `smart-turn-v3.2-cpu.onnx` và đặt tại thư mục `models/`. Bạn có thể tải theo một trong các cách sau:
+
+#### Cách 1: Sử dụng PowerShell (Khuyên dùng trên Windows)
+
+```powershell
+# Tạo thư mục models nếu chưa có
+if (!(Test-Path -Path "models")) { New-Item -ItemType Directory -Path "models" }
+
+# Tải file mô hình CPU (khoảng 8.7 MB)
+Invoke-WebRequest -Uri "https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart-turn-v3.2-cpu.onnx" -OutFile "models/smart-turn-v3.2-cpu.onnx"
+```
+
+#### Cách 2: Sử dụng `curl` (Linux / macOS / Git Bash / Command Prompt)
+
+```bash
+mkdir -p models
+curl -L -o models/smart-turn-v3.2-cpu.onnx https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart-turn-v3.2-cpu.onnx
+```
+
+#### Cách 3: Sử dụng Python (`huggingface_hub`)
+
+Nếu môi trường đã cài đặt `transformers` / `huggingface_hub`:
+
+```powershell
+python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='pipecat-ai/smart-turn-v3', filename='smart-turn-v3.2-cpu.onnx', local_dir='models')"
+```
+
+#### Cách 4: Sử dụng Hugging Face CLI
+
+```powershell
+huggingface-cli download pipecat-ai/smart-turn-v3 smart-turn-v3.2-cpu.onnx --local-dir models
+```
+
+#### Cách 5: Tải thủ công từ giao diện Hugging Face
+
+1. Truy cập [pipecat-ai/smart-turn-v3 Files](https://huggingface.co/pipecat-ai/smart-turn-v3/tree/main).
+2. Nhấn vào file **`smart-turn-v3.2-cpu.onnx`** và chọn **Download**.
+3. Lưu file vào đường dẫn `models/smart-turn-v3.2-cpu.onnx` trong thư mục dự án.
+
+> [!NOTE]
+> - **Phiên bản GPU:** Nếu muốn chạy inference trên GPU với `smart-turn-v3.2-gpu.onnx` (~32.4 MB), tải file tương ứng và khai báo trong file `.env`: `SMART_TURN_MODEL_PATH=models/smart-turn-v3.2-gpu.onnx`.
+> - **Cơ chế Fallback:** Nếu file mô hình không tồn tại trong thư mục `models/`, hệ thống sẽ cảnh báo trong log và tự động fallback về cơ chế ngắt dựa trên Silero VAD kèm thời gian chờ im lặng (silence timeout), đảm bảo bot vẫn hoạt động bình thường.
+
+### 3. Kiểm tra bộ kiểm thử (Unit tests & Linting)
 
 Chạy kiểm tra cú pháp và linter:
 
@@ -110,13 +157,13 @@ Chạy kiểm tra cú pháp và linter:
 .\.venv\Scripts\ruff check backend tests
 ```
 
-Chạy bộ 18 bài kiểm tra tự động:
+Chạy bộ 37 bài kiểm tra tự động:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest tests\test_backend.py -v
 ```
 
-### 3. Khởi động Web Server
+### 4. Khởi động Web Server
 
 Chạy server FastAPI uvicorn:
 
