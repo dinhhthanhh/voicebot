@@ -260,19 +260,11 @@ class TTSTextStreamer:
         )
         self.split_limit = split_limit
 
-    def feed(self, delta: str) -> list[str]:
-        raw_sentences = self.speech_filter.feed(delta)
-        out: list[str] = []
-        for sentence in raw_sentences:
-            norm = normalize_text_for_tts(sentence)
-            out.extend(split_for_tts(norm, limit=self.split_limit))
-        return out
-
-    def flush(self) -> list[str]:
-        raw_sentences = self.speech_filter.flush()
-        out: list[str] = []
-        for sentence in raw_sentences:
-            norm = normalize_text_for_tts(sentence)
-            out.extend(split_for_tts(norm, limit=self.split_limit))
-        return out
+    def feed(self, delta: str | None = None) -> list[str]:
+        raw = self.speech_filter.feed(delta) if delta is not None else self.speech_filter.flush()
+        return [
+            chunk
+            for s in raw
+            for chunk in split_for_tts(normalize_text_for_tts(s), limit=self.split_limit)
+        ]
 

@@ -53,6 +53,7 @@
     const btnReset = $("btnReset");
     const youBox = $("you");
     const botBox = $("bot");
+    const setPlaceholder = (el, text) => { el.innerHTML = `<span class="placeholder-text">${text}</span>`; };
 
     // AudioWorklet Processor đa luồng resample 16kHz + đệm 100ms
     const WORKLET_CODE = `
@@ -211,6 +212,8 @@ registerProcessor('mic-processor', MicProcessor);
             return;
         }
 
+        const isMatchTurn = !m.turn_id || m.turn_id === currentTurnId;
+
         switch (m.type) {
             case "session.ready":
                 refreshState();
@@ -234,16 +237,16 @@ registerProcessor('mic-processor', MicProcessor);
                 refreshState();
                 break;
             case "transcript.partial":
-                if (!m.turn_id || m.turn_id === currentTurnId) youBox.textContent = m.text || "";
+                if (isMatchTurn) youBox.textContent = m.text || "";
                 break;
             case "transcript.final":
-                if (!m.turn_id || m.turn_id === currentTurnId) {
+                if (isMatchTurn) {
                     youBox.textContent = m.text || "";
-                    botBox.innerHTML = '<span class="placeholder-text">Đang nhận phản hồi...</span>';
+                    setPlaceholder(botBox, "Đang nhận phản hồi...");
                 }
                 break;
             case "assistant.text.delta":
-                if (!m.turn_id || m.turn_id === currentTurnId) {
+                if (isMatchTurn) {
                     if (botBox.querySelector(".placeholder-text")) botBox.textContent = "";
                     let delta = m.text || "";
                     if (!botBox.textContent) delta = delta.replace(/^[\r\n\s]+/, "");
@@ -251,21 +254,18 @@ registerProcessor('mic-processor', MicProcessor);
                 }
                 break;
             case "assistant.text.done":
-                if (!m.turn_id || m.turn_id === currentTurnId) {
-                    if (m.text) botBox.textContent = m.text.trim();
-                }
+                if (isMatchTurn && m.text) botBox.textContent = m.text.trim();
                 break;
             case "assistant.audio.chunk":
-                if (!m.turn_id || m.turn_id === currentTurnId) {
+                if (isMatchTurn) {
                     pendingChunkMeta = m;
                     if (m.sample_rate) ttsSampleRate = m.sample_rate;
                 }
                 break;
             case "assistant.audio.done":
-                if (!m.turn_id || m.turn_id === currentTurnId) scheduleAutoListen();
+                if (isMatchTurn) scheduleAutoListen();
                 break;
             case "playback.stop":
-                clearAutoListenTimers();
                 stopPlayback();
                 break;
             case "session.error":
@@ -411,6 +411,7 @@ registerProcessor('mic-processor', MicProcessor);
     }
 
     function stopPlayback() {
+        clearAutoListenTimers();
         for (const src of playingSources) {
             try { src.stop(); } catch (_) { }
         }
@@ -464,7 +465,6 @@ registerProcessor('mic-processor', MicProcessor);
     }
 
     function teardownCallState() {
-        clearAutoListenTimers();
         onWorkletFlushed = null;
         callActive = false;
         recording = false;
@@ -472,7 +472,6 @@ registerProcessor('mic-processor', MicProcessor);
         stopPlayback();
         releaseMicrophone();
         setCallButtons(false);
-        refreshState();
     }
 
     function startListeningTurn() {
@@ -511,27 +510,28 @@ registerProcessor('mic-processor', MicProcessor);
     // Gán sự kiện điều khiển
     btnTalk.onclick = async () => {
         if (!isWsOpen()) return setErr("Chưa kết nối được máy chủ. Bấm Hội thoại mới.");
-        clearAutoListenTimers();
         if (isBotBusy()) return setErr("Bot đang nói. Vui lòng chờ hoặc bấm Dừng nói.");
-        teardownCallState();
-        try { await ensureAudio(); } catch (e) { return setErr("Không thể truy cập microphone: " + e.message); }
+        try {
+            await ensureAudio();
+        } catch (e) {
+            return setErr("Không thể truy cập microphone: " + e.message);
+        }
         setErr("");
-        youBox.innerHTML = '<span class="placeholder-text">Đang nghe...</span>';
-        botBox.innerHTML = '<span class="placeholder-text">Đang chờ câu hỏi của bạn...</span>';
+        setPlaceholder(youBox, "Đang nghe...");
+        setPlaceholder(botBox, "Đang chờ câu hỏi của bạn...");
         callActive = true;
         startListeningTurn();
     };
 
-    btnFinish.onclick = () => stopTalking();
+    btnFinish.onclick = stopTalking;
     btnStop.onclick = () => {
         teardownCallState();
         sendJson({ type: "session.cancel", turn_id: currentTurnId });
-        refreshState();
     };
     btnReset.onclick = () => {
         teardownCallState();
-        youBox.innerHTML = '<span class="placeholder-text">Nội dung giọng nói của bạn sẽ hiển thị tại đây...</span>';
-        botBox.innerHTML = '<span class="placeholder-text">Câu trả lời từ trợ lý sẽ hiển thị tại đây...</span>';
+        setPlaceholder(youBox, "Nội dung giọng nói của bạn sẽ hiển thị tại đây...");
+        setPlaceholder(botBox, "Câu trả lời từ trợ lý sẽ hiển thị tại đây...");
         setErr("");
         connect();
     };

@@ -259,7 +259,7 @@ def test_tts_text_streamer():
     collected = []
     for d in deltas:
         collected.extend(streamer.feed(d))
-    collected.extend(streamer.flush())
+    collected.extend(streamer.feed())
 
     assert len(collected) >= 2
     full = " ".join(collected)
@@ -269,7 +269,7 @@ def test_tts_text_streamer():
 def test_tts_text_streamer_capping():
     streamer = TTSTextStreamer(max_sentences=2, max_chars=50)
     text = "Câu thứ nhất rất là dài. Câu thứ hai tiếp tục dài. Câu thứ ba không được đọc."
-    parts = streamer.feed(text) + streamer.flush()
+    parts = streamer.feed(text) + streamer.feed()
     assert len(parts) == 3
     assert parts[-1] == REMAINDER_NOTE
 
