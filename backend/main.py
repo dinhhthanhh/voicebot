@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import sys
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -72,7 +73,7 @@ async def health_check():
     )
 
 
-async def _handle_ws_message(session: VoiceSession, message: dict[str, Any]) -> None:
+async def _handle_ws_message(session: VoiceSession, message: Mapping[str, Any]) -> None:
     if session.closed:
         return
     if "text" in message:
