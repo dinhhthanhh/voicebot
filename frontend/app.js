@@ -1,6 +1,6 @@
 /**
  * Voicebot Demo - Frontend Client (app.js)
- * Tích hợp AudioWorklet 16kHz + Butterworth filter, PCM 48kHz scheduling, Barge-in.
+ * Tích hợp AudioWorklet 16kHz + Butterworth filter, PCM 48kHz scheduling.
  */
 
 (() => {
@@ -349,7 +349,7 @@ registerProcessor('mic-processor', MicProcessor);
             processorNode = new AudioWorkletNode(audioCtx, "mic-processor");
             processorNode.port.onmessage = (e) => {
                 const { flushed, pcm } = e.data || {};
-                if (pcm && (flushed || callActive)) {
+                if (pcm && (flushed || (callActive && !isBotBusy()))) {
                     sendBinary(pcm);
                 }
                 if (flushed && typeof onWorkletFlushed === "function") {

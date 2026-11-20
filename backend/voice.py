@@ -1,10 +1,10 @@
-"""Module điều phối phiên thoại (Session & Turn Orchestrator).
+"""Module điều phối phiên thoại (VoiceSession).
 
 Chịu trách nhiệm:
-- Quản lý phiên thoại và State Machine (idle, listening, thinking, speaking, interrupted, error).
+- Quản lý phiên thoại và State Machine (idle, listening, thinking, speaking, error).
 - Điều phối STT -> LLM -> TTS và Smart Turn v3.2 thời gian thực.
 - Quản lý lịch sử hội thoại theo cặp user / assistant.
-- Hủy tác vụ an toàn khi người dùng ngắt lời (barge-in) hoặc disconnect.
+- Hủy tác vụ an toàn khi người dùng bấm dừng hoặc disconnect.
 """
 
 from __future__ import annotations
@@ -19,8 +19,6 @@ from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
-
-import numpy as np
 
 from backend import services
 from backend.config import settings
@@ -41,14 +39,6 @@ def _drain_queue(queue: asyncio.Queue[Any]) -> None:
     while not queue.empty():
         with contextlib.suppress(asyncio.QueueEmpty):
             queue.get_nowait()
-
-
-def _calc_rms(pcm_data: bytes) -> float:
-    """Tính năng lượng hiệu dụng RMS của frame âm thanh PCM 16-bit."""
-    if not pcm_data or len(pcm_data) % 2 != 0:
-        return 0.0
-    samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32)
-    return float(np.sqrt(np.mean(samples * samples)) / 32768.0)
 
 
 # =============================================================================
@@ -85,8 +75,6 @@ class VoiceSession:
     last_speech_time: float = 0.0
     turn_audio_buffer: deque[bytes] = field(default_factory=deque)
     turn_audio_bytes: int = 0
-    barge_in_preroll: deque[bytes] = field(default_factory=deque)
-    barge_in_hits: int = 0
     stt_client: services.STTClient | None = None
     last_partial_text: str = ""
     _smart_turn_task: asyncio.Task[Any] | None = field(default=None, repr=False)
@@ -99,10 +87,6 @@ class VoiceSession:
     # -------------------------------------------------------------------------
     # Session & Audio Buffer
     # -------------------------------------------------------------------------
-    def __post_init__(self) -> None:
-        if not self.barge_in_preroll.maxlen:
-            self.barge_in_preroll = deque(maxlen=settings.barge_in_preroll_frames)
-
     def buffer_audio(self, pcm: bytes, max_bytes: int | None = None) -> None:
         """Đệm âm thanh O(1) qua deque và xả frame cũ khi vượt giới hạn."""
         limit = max_bytes if max_bytes is not None else settings.turn_max_audio_bytes
@@ -115,11 +99,9 @@ class VoiceSession:
         return b"".join(self.turn_audio_buffer)
 
     def reset_audio_buffers(self) -> None:
-        """Xóa sạch bộ đệm âm thanh và đếm barge-in."""
+        """Xóa sạch bộ đệm âm thanh."""
         self.turn_audio_buffer.clear()
         self.turn_audio_bytes = 0
-        self.barge_in_preroll.clear()
-        self.barge_in_hits = 0
 
     async def close(self) -> None:
         """Đóng toàn bộ phiên thoại và giải phóng tài nguyên."""
@@ -382,44 +364,13 @@ class VoiceSession:
             return False
         return (time.monotonic() - self.last_speech_time) >= settings.smart_turn_silence_timeout_seconds
 
-    # -------------------------------------------------------------------------
-    # Barge-in
-    # -------------------------------------------------------------------------
-    async def check_barge_in(self, pcm_data: bytes) -> bool:
-        if self.state not in (VoiceState.THINKING, VoiceState.SPEAKING):
-            return False
-
-        self.barge_in_preroll.append(pcm_data)
-        if _calc_rms(pcm_data) >= settings.barge_in_rms_threshold:
-            self.barge_in_hits += 1
-            if self.barge_in_hits >= settings.barge_in_debounce_frames:
-                self.barge_in_hits = 0
-                combined = b"".join(self.barge_in_preroll)
-                self.barge_in_preroll.clear()
-
-                await self.emit_event("playback.stop", turn_id=self.current_turn_id)
-                await self.set_state(VoiceState.INTERRUPTED)
-                await self.start_turn()
-                if self.state == VoiceState.LISTENING:
-                    self.has_speech = True
-                    self.last_speech_time = time.monotonic()
-                    self.buffer_audio(combined)
-                    if self.stt_client and self.stt_client.is_active:
-                        with contextlib.suppress(Exception):
-                            await self.stt_client.send_audio(combined)
-                return True
-        else:
-            if self.barge_in_hits > 0:
-                self.barge_in_hits -= 1
-        return False
-
     async def handle_audio_frame(self, pcm_data: bytes) -> None:
         if self.closed:
             return
         if len(pcm_data) % 2 != 0:
             await self.emit_event("session.error", code="INVALID_AUDIO_FORMAT", message="Byte frame phải là số chẵn.")
             return
-        if await self.check_barge_in(pcm_data) or self.state != VoiceState.LISTENING or not self.current_turn_id:
+        if self.state != VoiceState.LISTENING or not self.current_turn_id:
             return
 
         self.buffer_audio(pcm_data)
@@ -644,50 +595,10 @@ class VoiceSession:
             await self._handle_cancel(event.get("turn_id"))
         elif event_type == "session.stop":
             await self.emit_event("session.stopped")
-            await orchestrator.close_session(self.session_id)
+            await self.close()
         elif (
             event_type == "playback.done"
             and self._match_turn(event.get("turn_id"), allow_empty=False)
             and self.state == VoiceState.SPEAKING
         ):
             await self.set_state(VoiceState.IDLE)
-
-
-# =============================================================================
-# VoiceOrchestrator
-# =============================================================================
-class VoiceOrchestrator:
-    """Quản lý danh sách các phiên VoiceSession trong RAM."""
-
-    def __init__(self) -> None:
-        self.sessions: dict[str, VoiceSession] = {}
-
-    def create_session(
-        self,
-        session_id: str | None = None,
-        send_json_cb: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-        send_binary_cb: Callable[[bytes], Awaitable[None]] | None = None,
-    ) -> VoiceSession:
-        if len(self.sessions) >= settings.max_sessions:
-            raise RuntimeError(f"Số lượng phiên đồng thời đã đạt giới hạn tối đa ({settings.max_sessions}).")
-        if not session_id:
-            session_id = f"session_{uuid.uuid4().hex[:8]}"
-            while session_id in self.sessions:
-                session_id = f"session_{uuid.uuid4().hex[:8]}"
-        elif session_id in self.sessions:
-            raise ValueError(f"Phiên '{session_id}' đã tồn tại trong hệ thống.")
-
-        session = VoiceSession(session_id=session_id, send_json_cb=send_json_cb, send_binary_cb=send_binary_cb)
-        self.sessions[session_id] = session
-        return session
-
-    async def close_session(self, session_id: str) -> None:
-        session = self.sessions.pop(session_id, None)
-        if session:
-            await session.close()
-
-
-# =============================================================================
-# orchestrator singleton instance
-# =============================================================================
-orchestrator = VoiceOrchestrator()

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import sys
+import uuid
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,7 +24,7 @@ if str(_ROOT_DIR) not in sys.path:
 
 from backend import services  # noqa: E402
 from backend.config import settings  # noqa: E402
-from backend.voice import VoiceSession, orchestrator  # noqa: E402
+from backend.voice import VoiceSession  # noqa: E402
 
 logging.basicConfig(
     level=getattr(logging, settings.app_log_level.upper(), logging.INFO),
@@ -68,7 +69,6 @@ async def health_check():
         {
             "status": "ok",
             "smart_turn_ready": services.smart_turn_detector.is_ready,
-            "active_sessions": len(orchestrator.sessions),
         }
     )
 
@@ -101,13 +101,11 @@ async def websocket_voice_endpoint(websocket: WebSocket):
     async def send_binary(data: bytes) -> None:
         await websocket.send_bytes(data)
 
-    try:
-        session = orchestrator.create_session(send_json_cb=send_json, send_binary_cb=send_binary)
-    except RuntimeError as exc:
-        logger.warning("Từ chối kết nối WebSocket do quá tải: %s", exc)
-        await send_json({"type": "session.error", "code": "SERVER_OVERLOADED", "message": str(exc)})
-        await websocket.close(code=1008, reason="Server overloaded")
-        return
+    session = VoiceSession(
+        session_id=f"session_{uuid.uuid4().hex[:8]}",
+        send_json_cb=send_json,
+        send_binary_cb=send_binary,
+    )
 
     try:
         while True:
@@ -121,7 +119,7 @@ async def websocket_voice_endpoint(websocket: WebSocket):
         if "disconnect" not in str(exc).lower():
             logger.exception("Lỗi trong WebSocket loop: %s", exc)
     finally:
-        await orchestrator.close_session(session.session_id)
+        await session.close()
 
 
 if settings.frontend_dir.is_dir():

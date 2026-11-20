@@ -23,3 +23,9 @@ data/
 
 # ONNX model files
 *.onnx
+
+# Environment variables
+.env
+.env.*
+!.env.example
+

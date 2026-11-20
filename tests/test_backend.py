@@ -18,7 +18,7 @@ from backend.text_processing import (
     normalize_text_for_tts,
     split_for_tts,
 )
-from backend.voice import VoiceOrchestrator, VoiceSession, VoiceState, _calc_rms
+from backend.voice import VoiceSession, VoiceState
 
 
 # ---------------------------------------------------------------------------
@@ -151,13 +151,11 @@ def test_smart_turn_fallback():
 
 
 # ---------------------------------------------------------------------------
-# 4. Tests cho Voice Session & Orchestrator (voice.py)
+# 4. Tests cho Voice Session (voice.py)
 # ---------------------------------------------------------------------------
 def test_session_lifecycle():
-    orchestrator = VoiceOrchestrator()
-    session = orchestrator.create_session("test_sess_01")
+    session = VoiceSession("test_sess_01")
     assert session.session_id == "test_sess_01"
-    assert orchestrator.sessions.get("test_sess_01") is session
 
     # Kiểm tra thêm lịch sử và cắt tỉa
     for i in range(20):
@@ -229,14 +227,6 @@ def test_wav_chunk_advanced():
     assert p2 is True
     assert d2 == payload
     assert l2 == b""
-
-
-def test_orchestrator_max_sessions():
-    orch = VoiceOrchestrator()
-    for i in range(settings.max_sessions):
-        orch.create_session(f"sess_{i}")
-    with pytest.raises(RuntimeError):
-        orch.create_session("sess_overflow")
 
 
 def test_thinking_to_idle_when_empty_or_filtered():
@@ -313,47 +303,6 @@ def test_drain_queue():
     assert q.empty()
 
 
-def test_barge_in_preroll_and_decay():
-    import numpy as np
-
-    session = VoiceSession(session_id="test_barge_preroll")
-    session.state = VoiceState.SPEAKING
-    session.current_turn_id = "turn_1"
-
-    def _step(coro):
-        try:
-            coro.send(None)
-        except StopIteration as e:
-            return e.value
-
-    quiet_pcm = (np.ones(160, dtype=np.int16) * 300).tobytes()
-    loud_pcm = (np.ones(160, dtype=np.int16) * 3500).tobytes()
-
-    # 1. Gửi frame nhỏ: lưu vào pre-roll, hits = 0
-    res = _step(session.check_barge_in(quiet_pcm))
-    assert res is False
-    assert len(session.barge_in_preroll) == 1
-    assert session.barge_in_hits == 0
-
-    # 2. Gửi 1 frame lớn: hit = 1
-    res = _step(session.check_barge_in(loud_pcm))
-    assert res is False
-    assert session.barge_in_hits == 1
-    assert len(session.barge_in_preroll) == 2
-
-    # 3. Gửi 1 frame nhỏ giữa chừng: hits giảm về 0 (decay) nhưng pre-roll KHÔNG bị xóa
-    res = _step(session.check_barge_in(quiet_pcm))
-    assert res is False
-    assert session.barge_in_hits == 0
-    assert len(session.barge_in_preroll) == 3
-
-    # 4. Gửi liên tiếp các frame lớn cho đến khi đạt debounce
-    for _ in range(settings.barge_in_debounce_frames):
-        res = _step(session.check_barge_in(loud_pcm))
-    assert res is True
-    assert len(session.barge_in_preroll) == 0
-
-
 def test_smart_turn_task_lifecycle():
     session = VoiceSession(session_id="test_vad_lifecycle")
     session.state = VoiceState.LISTENING
@@ -379,10 +328,8 @@ def test_smart_turn_task_lifecycle():
 
 
 def test_close_session_safe_on_error():
-    orch = VoiceOrchestrator()
-    session = orch.create_session("sess_err_cleanup")
+    session = VoiceSession(session_id="sess_err_cleanup")
     session.buffer_audio(b"\x00" * 320)
-    session.barge_in_preroll.append(b"\x00" * 320)
 
     class FailingSTT:
         async def close(self):
@@ -396,27 +343,10 @@ def test_close_session_safe_on_error():
         except StopIteration as e:
             return e.value
 
-    _step(orch.close_session("sess_err_cleanup"))
+    _step(session.close())
     assert session.closed is True
     assert session.turn_audio_bytes == 0
-    assert len(session.barge_in_preroll) == 0
     assert session.stt_client is None
-    assert "sess_err_cleanup" not in orch.sessions
-
-
-def test_calc_rms_empty_and_odd():
-    assert _calc_rms(b"") == 0.0
-    assert _calc_rms(b"\x00") == 0.0
-    assert _calc_rms(b"\x00\x00") == 0.0
-    pcm = b"\x00\x10" * 100
-    assert _calc_rms(pcm) > 0.0
-
-
-def test_create_session_duplicate_id():
-    orch = VoiceOrchestrator()
-    orch.create_session("sess_dup_01")
-    with pytest.raises(ValueError, match="đã tồn tại"):
-        orch.create_session("sess_dup_01")
 
 
 def test_add_history_zero_limit():
@@ -435,7 +365,6 @@ def test_handle_cancel_safe_when_stt_close_fails():
     session.current_turn_id = "turn_cancel_01"
     session.state = VoiceState.SPEAKING
     session.buffer_audio(b"\x00" * 320)
-    session.barge_in_preroll.append(b"\x00" * 320)
 
     class FailingSTT:
         async def close(self):
@@ -453,7 +382,6 @@ def test_handle_cancel_safe_when_stt_close_fails():
     assert session.stt_client is None
     assert session.state == VoiceState.IDLE
     assert session.turn_audio_bytes == 0
-    assert len(session.barge_in_preroll) == 0
 
 
 def test_pipeline_error_isolated_to_turn():
@@ -518,8 +446,6 @@ def test_config_validation_ranges():
     bad_cfg = settings.__class__(
         smart_turn_threshold=1.5,
         smart_turn_silence_timeout_seconds=-1.0,
-        barge_in_rms_threshold=0.0,
-        barge_in_debounce_frames=0,
         max_sessions=0,
         llm_timeout_seconds=0.0,
         tts_timeout_seconds=0.0,
@@ -531,8 +457,6 @@ def test_config_validation_ranges():
     warnings = bad_cfg.validate_config()
     assert any("SMART_TURN_THRESHOLD" in w for w in warnings)
     assert any("SMART_TURN_SILENCE_TIMEOUT_SECONDS" in w for w in warnings)
-    assert any("BARGE_IN_RMS_THRESHOLD" in w for w in warnings)
-    assert any("BARGE_IN_DEBOUNCE_FRAMES" in w for w in warnings)
     assert any("MAX_SESSIONS" in w for w in warnings)
     assert any("LLM_TIMEOUT_SECONDS" in w for w in warnings)
     assert any("TTS_TIMEOUT_SECONDS" in w for w in warnings)
@@ -672,8 +596,6 @@ def test_smart_turn_logs_warning_on_exception(caplog):
 
 
 def test_stt_error_event_transitions_session_to_error():
-    import asyncio
-
     session = VoiceSession(session_id="test_stt_err")
     session.current_turn_id = "turn_err_1"
     session.state = VoiceState.LISTENING
