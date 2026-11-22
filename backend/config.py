@@ -40,7 +40,6 @@ class Settings:
             o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()
         ]
     )
-    max_sessions: int = field(default_factory=lambda: int(os.getenv("MAX_SESSIONS", "10")))
 
     # LLM Settings
     llm_chat_completions_url: str = field(
@@ -114,8 +113,11 @@ class Settings:
     smart_turn_threshold: float = field(
         default_factory=lambda: float(os.getenv("SMART_TURN_THRESHOLD", "0.70"))
     )
-    smart_turn_silence_timeout_seconds: float = field(
-        default_factory=lambda: float(os.getenv("SMART_TURN_SILENCE_TIMEOUT_SECONDS", "2.5"))
+    smart_turn_inference_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("SMART_TURN_INFERENCE_TIMEOUT_SECONDS", "3.0"))
+    )
+    smart_turn_fallback_seconds: float = field(
+        default_factory=lambda: float(os.getenv("SMART_TURN_FALLBACK_SECONDS", "5.0"))
     )
 
     def validate_config(self) -> list[str]:
@@ -132,8 +134,8 @@ class Settings:
 
         rules: list[tuple[bool, str]] = [
             (not (0 < self.smart_turn_threshold <= 1.0), f"SMART_TURN_THRESHOLD ({self.smart_turn_threshold}) nên nằm trong khoảng (0, 1.0]."),
-            (self.smart_turn_silence_timeout_seconds <= 0, f"SMART_TURN_SILENCE_TIMEOUT_SECONDS ({self.smart_turn_silence_timeout_seconds}) phải lớn hơn 0."),
-            (self.max_sessions < 1, f"MAX_SESSIONS ({self.max_sessions}) phải >= 1."),
+            (self.smart_turn_inference_timeout_seconds <= 0, f"SMART_TURN_INFERENCE_TIMEOUT_SECONDS ({self.smart_turn_inference_timeout_seconds}) phải lớn hơn 0."),
+            (self.smart_turn_fallback_seconds <= 0, f"SMART_TURN_FALLBACK_SECONDS ({self.smart_turn_fallback_seconds}) phải lớn hơn 0."),
             (self.llm_timeout_seconds <= 0, f"LLM_TIMEOUT_SECONDS ({self.llm_timeout_seconds}) phải lớn hơn 0."),
             (self.tts_timeout_seconds <= 0, f"TTS_TIMEOUT_SECONDS ({self.tts_timeout_seconds}) phải lớn hơn 0."),
             (self.tts_split_limit < 10, f"TTS_SPLIT_LIMIT ({self.tts_split_limit}) phải >= 10."),

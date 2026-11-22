@@ -59,10 +59,8 @@ mono; - PCM16LE; - 16 kHz; - frame có số byte chẵn.
 
   `assistant.text.done`     `turn_id`               LLM hoàn tất
 
-  `assistant.audio.chunk`   `turn_id`,              Metadata của binary
-                            `segment_id`,           audio tiếp theo
-                            `chunk_id`, audio       
-                            metadata                
+  `assistant.audio.chunk`   `turn_id`, `chunk_id`,  Metadata của binary
+                            audio metadata          audio tiếp theo
 
   `assistant.audio.done`    `turn_id`               Hoàn tất audio của lượt
 
@@ -117,7 +115,6 @@ Event audio metadata (binary payload kế tiếp là audio chunk):
   "type": "assistant.audio.chunk",
   "session_id": "session_001",
   "turn_id": "turn_001",
-  "segment_id": 1,
   "chunk_id": 1,
   "format": "pcm_s16le",
   "sample_rate": 48000,

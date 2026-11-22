@@ -27,7 +27,9 @@ from backend.voice import VoiceSession, VoiceState
 def test_config_defaults():
     assert settings.app_port > 0
     assert settings.stt_sample_rate == 16000
-    assert settings.smart_turn_silence_timeout_seconds == 2.5
+    assert settings.smart_turn_threshold == 0.70
+    assert settings.smart_turn_inference_timeout_seconds == 3.0
+    assert settings.smart_turn_fallback_seconds == 5.0
     warnings = settings.validate_config()
     assert isinstance(warnings, list)
 
@@ -445,8 +447,8 @@ def test_safe_send_closed_and_disconnect():
 def test_config_validation_ranges():
     bad_cfg = settings.__class__(
         smart_turn_threshold=1.5,
-        smart_turn_silence_timeout_seconds=-1.0,
-        max_sessions=0,
+        smart_turn_inference_timeout_seconds=-1.0,
+        smart_turn_fallback_seconds=-1.0,
         llm_timeout_seconds=0.0,
         tts_timeout_seconds=0.0,
         tts_split_limit=5,
@@ -456,8 +458,8 @@ def test_config_validation_ranges():
     )
     warnings = bad_cfg.validate_config()
     assert any("SMART_TURN_THRESHOLD" in w for w in warnings)
-    assert any("SMART_TURN_SILENCE_TIMEOUT_SECONDS" in w for w in warnings)
-    assert any("MAX_SESSIONS" in w for w in warnings)
+    assert any("SMART_TURN_INFERENCE_TIMEOUT_SECONDS" in w for w in warnings)
+    assert any("SMART_TURN_FALLBACK_SECONDS" in w for w in warnings)
     assert any("LLM_TIMEOUT_SECONDS" in w for w in warnings)
     assert any("TTS_TIMEOUT_SECONDS" in w for w in warnings)
     assert any("TTS_SPLIT_LIMIT" in w for w in warnings)
@@ -757,6 +759,47 @@ def test_process_turn_stt_timeout_fallback_to_partial():
     final_ev = next((ev for ev in events if ev.get("type") == "transcript.final"), None)
     assert final_ev is not None
     assert final_ev.get("text") == "Tôi cần gửi bưu phẩm"
+
+
+def test_process_turn_empty_transcript_responds_with_prompt():
+    session = VoiceSession(session_id="sess_empty_text")
+    session.current_turn_id = "turn_empty"
+    session.state = VoiceState.THINKING
+    session.last_partial_text = ""
+
+    class EmptySTT:
+        async def finish(self):
+            return ""
+
+    session.stt_client = EmptySTT()  # type: ignore
+
+    events = []
+
+    async def mock_send(ev):
+        events.append(ev)
+
+    session.send_json_cb = mock_send
+
+    filler_prompts = []
+
+    async def mock_filler(turn_id, prompt):
+        filler_prompts.append((turn_id, prompt))
+
+    session._respond_with_filler = mock_filler  # type: ignore
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    _step(session._process_turn("turn_empty"))
+
+    final_ev = next((ev for ev in events if ev.get("type") == "transcript.final"), None)
+    assert final_ev is not None
+    assert final_ev.get("text") == ""
+    assert len(filler_prompts) == 1
+    assert filler_prompts[0] == ("turn_empty", "Tôi chưa nghe rõ, bạn vui lòng nói lại nhé.")
 
 
 def test_process_turn_stt_timeout_no_partial_transitions_to_error():

@@ -1,6 +1,6 @@
 # Voicebot MVP (STT → LLM → SpeechFilter → TTS)
 
-Hệ thống trợ lý giọng nói đàm thoại thời gian thực độ trễ thấp, hỗ trợ tiếng Việt hoàn chỉnh với cơ chế phát hiện ngắt lượt nói hai tầng (Silero VAD + Smart Turn v3.2 ONNX), luồng kép Dual-channel Streaming và đàm thoại hai chiều liên tục.
+Hệ thống trợ lý giọng nói đàm thoại thời gian thực độ trễ thấp, hỗ trợ tiếng Việt với cơ chế phát hiện ngắt lượt nói hai tầng (Silero VAD + Smart Turn v3.2 ONNX), luồng kép Dual-channel Streaming và quản lý lượt thoại liên tục.
 
 ---
 
@@ -8,33 +8,39 @@ Hệ thống trợ lý giọng nói đàm thoại thời gian thực độ trễ
 
 ### 1. Kiến trúc phân tầng chuẩn hóa & Luồng kép (Dual-channel Streaming)
 
-- **Kênh hiển thị (Màn hình):** Stream toàn văn câu trả lời từ LLM tức thì (hỗ trợ đầy đủ Markdown, bảng biểu, danh sách, mã nguồn).
+- **Kênh hiển thị (Màn hình):** Stream toàn văn câu trả lời từ LLM tức thì đến giao diện người dùng.
 - **Kênh âm thanh (Thoại):** Xử lý song song qua mô hình Producer-Consumer không đồng bộ (`asyncio.Queue`). Tách câu thời gian thực và stream audio PCM 48 kHz (Mono 16-bit) lập tức từ Zero-TTS tới người dùng.
 - **Connection Pool tái sử dụng:** Persistent HTTP Client dùng chung kết nối keep-alive cho cả LLM và TTS, tối ưu latency tối đa.
 
-### 2. Xử lý & Chuẩn hóa văn bản Tiếng Việt 3 tầng
+### 2. Xử lý & Chuẩn hóa văn bản Tiếng Việt
 
-- **Tiền xử lý đầu vào STT (`text_processing.py`):**
-  - **Chuẩn hóa số ghép tiếng Việt (`normalize_compound_numbers`):** Xử lý linh hoạt số ghép (*"hai mươi mốt"* → `21`, *"mười hai nghìn năm trăm"* → `12500`).
-  - **Gom chuỗi số liên tiếp (`normalize_speech_input`):** Tự động nhận diện và gom các từ đọc số rời rạc liên tiếp thành chuỗi số hoàn chỉnh (hỗ trợ số điện thoại, CCCD, mã vận đơn bưu chính VNPost).
+- **Phát hiện từ đệm & transcript rỗng (`is_only_filler` trong `text_processing.py`):**
+  - Tự động nhận diện khi người dùng chỉ ngập ngừng phát ra từ đệm (*"ừ"*, *"ừm"*, *"ờ"*, *"à"*...) hoặc STT không nhận diện được văn bản (chuỗi rỗng).
+  - Phản hồi câu thoại ngắn nhắc nhở (*"Tôi đang lắng nghe..."* hoặc *"Tôi chưa nghe rõ, bạn vui lòng nói lại nhé."*) qua TTS và tự động kích hoạt lượt nghe tiếp theo mà không cần gọi LLM, giúp tiết kiệm tài nguyên và giữ luồng đàm thoại thông suốt.
+- **Bộ lọc làm sạch Markdown nội dòng (`clean_inline_markdown` trong `text_processing.py`):**
+  - Làm sạch các link Markdown (`[text](url)` → `text`) và loại bỏ URL (`https?://...`).
+  - Xóa các ký hiệu định dạng văn bản inline (`*`, `_`, `` ` ``, `~`, `#`) và các dấu đầu dòng (bullet points: `-`, `*`, `+`, `•`, `1.`, `1)`) để câu thoại được phát âm tự nhiên.
 - **Bộ lọc luồng LLM (`SpeechFilter` trong `text_processing.py`):**
-  - **Tách câu thời gian thực:** Nhận diện ranh giới câu tự nhiên theo dấu ngắt câu (`SENT_RE` bỏ qua các từ viết tắt `TP.`, `ThS.`, `BS.`, `Mr.`...).
-  - **Lược bỏ thành phần trực quan:** Bỏ qua code block (` ``` `), bảng Markdown (`|...|`), làm sạch link Markdown, emoji, URL, công thức KaTeX/LaTeX.
-  - **Capping an toàn:** Giới hạn tối đa 8 câu hoặc 600 ký tự thoại; tự động thêm thông báo thoại *"Phần còn lại đã được hiển thị trên màn hình."* khi đạt ngưỡng.
+  - **Tách câu thời gian thực:** Nhận diện ranh giới câu tự nhiên theo dấu ngắt câu (`.`, `!`, `?`, `…`, xuống dòng), bỏ qua các từ viết tắt phổ biến (`TP.`, `ThS.`, `BS.`, `Mr.`, `Dr.`...).
+  - **Capping an toàn:** Giới hạn tối đa số câu (mặc định 8 câu) hoặc độ dài (mặc định 600 ký tự thoại); tự động gắn thêm câu thông báo thoại *"Phần còn lại đã được hiển thị trên màn hình."* khi đạt ngưỡng.
 - **Hậu xử lý văn bản đọc TTS (`normalize_text_for_tts` trong `text_processing.py`):**
-  - Phân tách hàng nghìn (`1.500`), số thập phân (`0,007` → *"không phẩy không không bảy"*), tiền tệ (`VNĐ`, `đồng`, `k` → *"nghìn"*).
-  - Chuẩn hóa số điện thoại, ngày tháng `DD/MM/YYYY`, dịch vụ `24/7` (*"hai tư trên bảy"*), địa chỉ ngõ ngách `số 10/2` (*"số 10 xuyệt 2"*), đơn vị đo lường (`km`, `kg`, `ha`, `m²`...).
+  - Chuẩn hóa số điện thoại (hotline, quốc tế +84, số nội hạt), ngày tháng `DD/MM/YYYY`, dịch vụ `24/7` (*"hai tư trên bảy"*), phân số/ngõ ngách `10/2`.
+  - Đọc chuẩn tiền tệ (`đồng`, `tỷ`, `nghìn`), phân tách hàng nghìn, số thập phân (*"không phẩy..."*) và các đơn vị đo lường thông dụng (`km`, `kg`, `ha`, `m²`...).
 
 ### 3. Cơ chế kết thúc lượt nói thông minh (Smart Turn & VAD)
 
-- **Silero VAD (ASR Side / Local):** Phát hiện tiếng nói trong frame âm thanh thời gian thực.
-- **Smart Turn v3.2 ONNX:** Phân tích ngữ nghĩa âm học (cao độ, ngữ điệu kết thúc) trên cửa sổ trượt âm thanh 8s gần nhất từ mô hình [pipecat-ai/smart-turn-v3](https://huggingface.co/pipecat-ai/smart-turn-v3).
-- **Heuristics bảo vệ ngữ cảnh:** Tự động tăng thời gian chờ ngắt khi người dùng ngập ngừng (*"ừ"*, *"à"*, *"ờ"*), nói từ nối (*"và"*, *"thì"*, *"nhưng"*...) hoặc đọc dở dãy số điện thoại/mã vận đơn.
+- **Silero VAD (ASR Side):** Nhận diện tín hiệu bắt đầu/kết thúc giọng nói (`speech_started`, `speech_ended`) trong từng frame âm thanh truyền tới dịch vụ STT.
+- **Smart Turn v3.2 ONNX:** Khi VAD báo kết thúc giọng nói, hệ thống đưa đoạn âm thanh vào mô hình ONNX [pipecat-ai/smart-turn-v3](https://huggingface.co/pipecat-ai/smart-turn-v3) để dự đoán xác suất người dùng đã dứt câu hay còn nói tiếp.
+- **Cơ chế Fallback thời gian im lặng:** Tự động hoàn tất lượt nói khi thời gian im lặng vượt ngưỡng cấu hình (`smart_turn_silence_timeout_seconds`, mặc định 2.5s) hoặc khi mô hình Smart Turn xác nhận dứt lời (`smart_turn_threshold`, mặc định 0.5).
 
 ### 4. Giao diện Web Audio Hiện đại
 
-- **Web Audio API & AudioWorklet:** Thu âm micro, resample 16 kHz PCM16 gửi STT; phát stream PCM16 48 kHz mượt mà với cơ chế zero-copy.
-- **Anti-feedback & Barge-in:** Hỗ trợ ngắt lời tức thì (Barge-in) và cơ chế chống dội âm (Anti-feedback) tự động.
+- **Web Audio API & AudioWorklet:** Thu âm micro, resample 16 kHz PCM 16-bit gửi backend STT; phát stream PCM 16-bit 48 kHz từ Zero-TTS với cơ chế hàng đợi mượt mà.
+- **Chống dội âm (AEC Loopback):** Thiết lập loopback RTCPeerConnection để hỗ trợ Acoustic Echo Cancellation trên trình duyệt, giảm thiểu dội âm từ loa vào micro.
+- **Quản lý thu âm theo trạng thái & Ngắt lời thủ công:**
+  - Frontend tự động ngắt gửi dữ liệu micro khi bot đang trong trạng thái xử lý hoặc phát tiếng (`thinking` / `speaking`), tránh nhiễu âm.
+  - Người dùng có thể nhấn nút **Dừng nói** bất cứ lúc nào để dừng phát âm thanh ngay lập tức, hủy lượt hiện tại và giải phóng trạng thái hệ thống.
+  - Tự động kích hoạt nghe lượt tiếp theo sau khi bot đọc xong câu trả lời.
 
 ---
 
@@ -43,12 +49,11 @@ Hệ thống trợ lý giọng nói đàm thoại thời gian thực độ trễ
 ```text
 voice-bot/
 ├── backend/                    # Backend FastAPI & Voice Gateway
-│   ├── config.py               # Quản lý cấu hình & biến môi trường
+│   ├── config.py               # Quản lý cấu hình tập trung & biến môi trường
 │   ├── main.py                 # FastAPI app, static mount & WebSocket endpoint
-│   ├── patterns.py             # Regular expressions xử lý số, câu, đơn vị
-│   ├── services.py             # Client kết nối STT (ASR), LLM, Zero-TTS, Smart Turn
-│   ├── text_processing.py      # Chuẩn hóa văn bản STT/TTS và SpeechFilter
-│   ├── voice.py                # State machine, session, pipeline xử lý turn & barge-in
+│   ├── services.py             # Client kết nối STT (ASR), LLM, Zero-TTS, Smart Turn ONNX
+│   ├── text_processing.py      # Chuẩn hóa văn bản STT/TTS, SpeechFilter & regex
+│   ├── voice.py                # State machine, session, pipeline quản lý lượt thoại (turn)
 │   └── .env.example            # File mẫu cấu hình biến môi trường
 ├── frontend/                   # Giao diện Web demo
 │   ├── index.html              # HTML giao diện chat & voice controls
@@ -58,11 +63,11 @@ voice-bot/
 │   └── smart-turn-v3.2-cpu.onnx# Smart Turn v3.2 (tải từ Hugging Face pipecat-ai/smart-turn-v3)
 ├── docs/                       # Tài liệu chi tiết kiến trúc & giao thức
 │   ├── 01_architecture.md      # Cấu trúc hệ thống & nguyên tắc thiết kế
-│   ├── 02_voice_flow.md        # Luồng hội thoại, Smart Turn và barge-in
+│   ├── 02_voice_flow.md        # Luồng hội thoại, Smart Turn và ngắt lời
 │   ├── 03_api_protocol.md      # Hợp đồng WebSocket & API
 │   └── 04_implementation.md    # Checklist triển khai & nghiệm thu
 ├── tests/                      # Bộ kiểm thử tự động
-│   └── test_backend.py         # 37 test cases kiểm thử toàn diện backend
+│   └── test_backend.py         # 56 test cases kiểm thử toàn diện backend
 ├── requirements.txt            # Danh sách thư viện phụ thuộc (pip)
 ├── pyproject.toml              # Cấu hình dự án & linter (ruff)
 └── README.md                   # Tài liệu hướng dẫn dự án
@@ -74,13 +79,30 @@ voice-bot/
 
 Tạo file `.env` tại thư mục `backend/` (hoặc thư mục gốc dự án) dựa trên `backend/.env.example`:
 
-| Biến môi trường       | Mặc định                                                  | Mô tả                                           |
-| :------------------------ | :----------------------------------------------------------- | :------------------------------------------------ |
-| `STT_WS_URL`            | `wss://ai.vnpost.vn/qwen3-asr-1p7b/v1/stream`              | WebSocket endpoint của Qwen3-ASR                 |
-| `LLM_URL`               | `https://ai.vnpost.vn/vllm-qwen38-27b/v1/chat/completions` | OpenAI-compatible endpoint của LLM               |
-| `TTS_BASE_URL`          | `https://ai.vnpost.vn/zero-tts`                            | Endpoint dịch vụ Zero-TTS                       |
-| `TTS_VOICE`             | `maichi`                                                   | Giọng đọc mặc định của Zero-TTS            |
-| `SMART_TURN_MODEL_PATH` | `models/smart-turn-v3.2-cpu.onnx`                          | Đường dẫn file mô hình Smart Turn v3.2 ONNX ([Hugging Face](https://huggingface.co/pipecat-ai/smart-turn-v3)) |
+| Biến môi trường              | Mặc định                                                     | Mô tả                                                         |
+| :--------------------------- | :----------------------------------------------------------- | :------------------------------------------------------------ |
+| `APP_HOST`                   | `127.0.0.1`                                                  | Host chạy FastAPI server                                      |
+| `APP_PORT`                   | `8000`                                                       | Port chạy FastAPI server                                      |
+| `APP_LOG_LEVEL`              | `INFO`                                                       | Mức log hệ thống (`DEBUG`, `INFO`, `WARNING`, `ERROR`)        |
+| `LLM_CHAT_COMPLETIONS_URL`   | `https://ai.vnpost.vn/vllm-qwen38-27b/v1/chat/completions`    | OpenAI-compatible chat completions endpoint của LLM           |
+| `LLM_MODEL`                  | `""`                                                         | Tên model LLM (để trống nếu vLLM tự định tuyến)               |
+| `LLM_TEMPERATURE`            | `0`                                                          | Độ sáng tạo của câu trả lời LLM                               |
+| `LLM_TIMEOUT_SECONDS`        | `90`                                                         | Timeout tối đa cho lượt stream LLM                            |
+| `STT_WS_URL`                 | `wss://ai.vnpost.vn/qwen3-asr-1p7b/v1/stream`                 | WebSocket streaming endpoint của Qwen3-ASR                    |
+| `STT_MODEL`                  | `qwen3-asr-1p7b-ft`                                          | Tên mô hình nhận diện giọng nói                               |
+| `STT_LANGUAGE`               | `Vietnamese`                                                 | Ngôn ngữ nhận diện giọng nói                                  |
+| `STT_SAMPLE_RATE`            | `16000`                                                      | Tần số lấy mẫu âm thanh đầu vào cho STT (Hz)                  |
+| `STT_VAD`                    | `silero`                                                     | Cơ chế VAD phía STT server                                    |
+| `TTS_BASE_URL`               | `https://ai.vnpost.vn/zero-tts`                               | Base URL dịch vụ Zero-TTS                                     |
+| `TTS_STREAM_PATH`            | `/tts/stream`                                                | Đường dẫn API stream TTS                                      |
+| `TTS_VOICE`                  | `maichi`                                                     | Giọng đọc mặc định của Zero-TTS                               |
+| `TTS_SAMPLE_RATE`            | `48000`                                                      | Tần số âm thanh trả về từ TTS (Hz)                            |
+| `TTS_MAX_SENTENCES`          | `8`                                                          | Số câu thoại tối đa trước khi thực hiện capping               |
+| `TTS_MAX_CHARS`              | `600`                                                        | Số ký tự thoại tối đa trước khi thực hiện capping             |
+| `SMART_TURN_MODEL_PATH`      | `models/smart-turn-v3.2-cpu.onnx`                             | Đường dẫn file mô hình Smart Turn v3.2 ONNX                   |
+| `SMART_TURN_THRESHOLD`       | `0.70`                                                       | Ngưỡng xác suất kết thúc câu của mô hình Smart Turn (0.0 - 1.0)|
+| `SMART_TURN_INFERENCE_TIMEOUT_SECONDS` | `3.0`                                              | Thời gian tối đa (giây) chờ mô hình Smart Turn chạy suy luận   |
+| `SMART_TURN_FALLBACK_SECONDS`| `5.0`                                                        | Thời gian im lặng (giây) tối đa trước khi tự động kết thúc lượt|
 
 ---
 
@@ -141,7 +163,7 @@ huggingface-cli download pipecat-ai/smart-turn-v3 smart-turn-v3.2-cpu.onnx --loc
 
 #### Cách 5: Tải thủ công từ giao diện Hugging Face
 
-1. Truy cập [pipecat-ai/smart-turn-v3 Files](https://huggingface.co/pipecat-ai/smart-turn-v3/tree/main).
+1. Truy cập [pipecat-ai/smart-turn-v3 Files](https://huggingface.ai/pipecat-ai/smart-turn-v3/tree/main).
 2. Nhấn vào file **`smart-turn-v3.2-cpu.onnx`** và chọn **Download**.
 3. Lưu file vào đường dẫn `models/smart-turn-v3.2-cpu.onnx` trong thư mục dự án.
 
@@ -157,7 +179,7 @@ Chạy kiểm tra cú pháp và linter:
 .\.venv\Scripts\ruff check backend tests
 ```
 
-Chạy bộ 37 bài kiểm tra tự động:
+Chạy bộ 56 bài kiểm tra tự động:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest tests\test_backend.py -v
@@ -165,10 +187,16 @@ Chạy bộ 37 bài kiểm tra tự động:
 
 ### 4. Khởi động Web Server
 
-Chạy server FastAPI uvicorn:
+Sử dụng `uv` (khuyên dùng):
 
 ```powershell
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+uv run uvicorn backend.main:app --host 127.0.0.1 --port 8000
+```
+
+Hoặc sử dụng `python`:
+
+```powershell
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 ```
 
 Hoặc chạy trực tiếp qua module main:

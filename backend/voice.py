@@ -51,7 +51,6 @@ class VoiceState(StrEnum):
     LISTENING = "listening"
     THINKING = "thinking"
     SPEAKING = "speaking"
-    INTERRUPTED = "interrupted"
     ERROR = "error"
 
 
@@ -62,27 +61,27 @@ class VoiceState(StrEnum):
 class VoiceSession:
     """Phiên tương tác thoại trực tiếp gắn liền với một kết nối WebSocket."""
 
-    session_id: str
-    state: VoiceState = VoiceState.IDLE
-    history: list[dict[str, str]] = field(default_factory=list)
-    current_turn_id: str | None = None
-    active_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
-    closed: bool = False
-    _cleanup_done: bool = field(default=False, repr=False)
+    session_id: str  # ID duy nhất của phiên
+    state: VoiceState = VoiceState.IDLE  # Trạng thái hiện tại của phiên
+    history: list[dict[str, str]] = field(default_factory=list)  # Lịch sử hội thoại (gửi cho LLM)
+    current_turn_id: str | None = None  # ID của lượt thoại đang diễn ra
+    active_tasks: set[asyncio.Task[Any]] = field(default_factory=set)  # Tập hợp task bất đồng bộ đang chạy
+    closed: bool = False  # Cờ đánh dấu phiên đã đóng
+    _cleanup_done: bool = field(default=False, repr=False)  # Cờ đảm bảo chỉ giải phóng tài nguyên một lần
 
-    has_speech: bool = False
-    is_vad_speaking: bool = False
-    last_speech_time: float = 0.0
-    turn_audio_buffer: deque[bytes] = field(default_factory=deque)
-    turn_audio_bytes: int = 0
-    stt_client: services.STTClient | None = None
-    last_partial_text: str = ""
-    _smart_turn_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    has_speech: bool = False  # Đã phát hiện giọng nói trong lượt này chưa
+    is_vad_speaking: bool = False  # VAD thời gian thực (True nếu người dùng đang nói)
+    last_speech_time: float = 0.0  # Mốc thời gian lần cuối ghi nhận giọng nói
+    turn_audio_buffer: deque[bytes] = field(default_factory=deque)  # Bộ đệm PCM cho Smart Turn
+    turn_audio_bytes: int = 0  # Dung lượng byte âm thanh hiện có trong buffer
+    stt_client: services.STTClient | None = None  # Client kết nối WebSocket tới STT
+    last_partial_text: str = ""  # Transcript tạm thời gần nhất để tránh gửi trùng
+    _smart_turn_task: asyncio.Task[Any] | None = field(default=None, repr=False)  # Task chạy suy luận Smart Turn
 
-    send_json_cb: Callable[[dict[str, Any]], Awaitable[None]] | None = None
-    send_binary_cb: Callable[[bytes], Awaitable[None]] | None = None
-    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
-    turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    send_json_cb: Callable[[dict[str, Any]], Awaitable[None]] | None = None  # Callback gửi JSON/event về client
+    send_binary_cb: Callable[[bytes], Awaitable[None]] | None = None  # Callback gửi byte PCM âm thanh về client
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)  # Khóa chống xung đột khi ghi đồng thời vào WebSocket
+    turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)  # Khóa chống gọi chồng chéo start_turn()
 
     # -------------------------------------------------------------------------
     # Session & Audio Buffer
@@ -140,14 +139,13 @@ class VoiceSession:
         payload = {"type": event_type, "session_id": self.session_id, **kwargs}
         await self._safe_send(lambda: self.send_json_cb(payload))
 
-    async def emit_audio_chunk(self, turn_id: str, segment_id: int, chunk_id: int, audio_data: bytes) -> None:
+    async def emit_audio_chunk(self, turn_id: str, chunk_id: int, audio_data: bytes) -> None:
         if self.closed or not self.send_json_cb or not self.send_binary_cb:
             return
         meta = {
             "type": "assistant.audio.chunk",
             "session_id": self.session_id,
             "turn_id": turn_id,
-            "segment_id": segment_id,
             "chunk_id": chunk_id,
             "format": "pcm_s16le",
             "sample_rate": settings.tts_sample_rate,
@@ -302,7 +300,13 @@ class VoiceSession:
                             self.last_speech_time = time.monotonic()
                         await self.emit_event("transcript.partial", turn_id=turn_id, text=text)
                 elif event_type == "vad":
-                    await self._handle_vad(turn_id, event.get("state") or event.get("vad_type") or "activity")
+                    logger.info("STT VAD event: %s", event)
+                    await self._handle_vad(
+                        turn_id,
+                        event.get("state")
+                        or event.get("vad_type")
+                        or "activity",
+                    )
                 elif event_type == "error":
                     code = event.get("error_code") or event.get("code") or "STT_ERROR"
                     msg = event.get("message", "Lỗi STT")
@@ -322,10 +326,19 @@ class VoiceSession:
 
     async def _predict_and_trigger(self, turn_id: str) -> None:
         try:
+            await asyncio.sleep(0.3)
+            if not self.is_active_turn(turn_id) or self.is_vad_speaking:
+                return
             audio = self.get_turn_audio()
             prob = await asyncio.wait_for(
                 services.smart_turn_detector.predict(audio),
-                timeout=settings.smart_turn_silence_timeout_seconds,
+                timeout=settings.smart_turn_inference_timeout_seconds,
+            )
+            logger.info(
+                "Smart Turn [%s]: %.3f (threshold=%.2f)",
+                turn_id,
+                prob,
+                settings.smart_turn_threshold,
             )
             if (
                 prob >= settings.smart_turn_threshold
@@ -335,11 +348,11 @@ class VoiceSession:
             ):
                 await self.finish_turn()
         except TimeoutError:
-            logger.warning("Smart Turn inference bị quá hạn timeout turn [%s]", turn_id)
+            logger.warning("Smart Turn timeout: %s", turn_id)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.error("Lỗi Smart Turn turn [%s]: %s", turn_id, exc)
+        except Exception:
+            logger.exception("Smart Turn error: %s", turn_id)
         finally:
             if self._smart_turn_task is asyncio.current_task():
                 self._smart_turn_task = None
@@ -360,9 +373,14 @@ class VoiceSession:
                 self._smart_turn_task = self._spawn_task(self._predict_and_trigger(turn_id))
 
     def is_silence_timeout(self) -> bool:
-        if self.is_vad_speaking or not (self.has_speech and self.last_speech_time > 0):
+        if self.is_vad_speaking:
             return False
-        return (time.monotonic() - self.last_speech_time) >= settings.smart_turn_silence_timeout_seconds
+        return (
+            self.has_speech
+            and self.last_speech_time > 0
+            and time.monotonic() - self.last_speech_time
+            >= settings.smart_turn_fallback_seconds
+        )
 
     async def handle_audio_frame(self, pcm_data: bytes) -> None:
         if self.closed:
@@ -455,7 +473,7 @@ class VoiceSession:
         self._spawn_task(_fallback())
 
     async def _stream_tts_audio(self, turn_id: str, queue: asyncio.Queue[str | None]) -> None:
-        seg_id, chunk_id, total_bytes = 1, 1, 0
+        chunk_id, total_bytes = 1, 0
         try:
             while True:
                 sentence = await queue.get()
@@ -468,10 +486,8 @@ class VoiceSession:
                     if not self.is_active_turn(turn_id) or self.state == VoiceState.ERROR:
                         break
                     total_bytes += len(pcm_chunk)
-                    await self.emit_audio_chunk(turn_id, seg_id, chunk_id, pcm_chunk)
+                    await self.emit_audio_chunk(turn_id, chunk_id, pcm_chunk)
                     chunk_id += 1
-
-                seg_id += 1
 
             if self.is_active_turn(turn_id) and self.state != VoiceState.ERROR:
                 if self.state == VoiceState.SPEAKING:
@@ -560,7 +576,10 @@ class VoiceSession:
                 return
 
             if not final_text:
-                await self.set_state(VoiceState.IDLE)
+                await self.emit_event("transcript.final", turn_id=turn_id, text="")
+                await self._respond_with_filler(
+                    turn_id, "Tôi chưa nghe rõ, bạn vui lòng nói lại nhé."
+                )
                 return
 
             await self.emit_event("transcript.final", turn_id=turn_id, text=final_text)

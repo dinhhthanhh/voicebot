@@ -11,7 +11,6 @@
         listening: "Đang nghe...",
         thinking: "Đang suy nghĩ...",
         speaking: "Đang nói...",
-        interrupted: "Đã ngắt lời",
         error: "Lỗi hệ thống",
     };
 
@@ -233,6 +232,13 @@ registerProcessor('mic-processor', MicProcessor);
                 } else if (m.state === "error") {
                     clearAutoListenTimers();
                     recording = false;
+                } else if (m.state === "idle" && callActive && !recording && !isPlaying() && !waitAudioEndTimer && !autoListenTimer) {
+                    autoListenTimer = setTimeout(() => {
+                        autoListenTimer = null;
+                        if (callActive && !recording && (serverState === "idle" || serverState === "speaking")) {
+                            startListeningTurn();
+                        }
+                    }, 600);
                 }
                 refreshState();
                 break;
@@ -241,7 +247,11 @@ registerProcessor('mic-processor', MicProcessor);
                 break;
             case "transcript.final":
                 if (isMatchTurn) {
-                    youBox.textContent = m.text || "";
+                    if (m.text) {
+                        youBox.textContent = m.text;
+                    } else {
+                        setPlaceholder(youBox, "(Không nhận diện được giọng nói)");
+                    }
                     setPlaceholder(botBox, "Đang nhận phản hồi...");
                 }
                 break;
@@ -349,7 +359,10 @@ registerProcessor('mic-processor', MicProcessor);
             processorNode = new AudioWorkletNode(audioCtx, "mic-processor");
             processorNode.port.onmessage = (e) => {
                 const { flushed, pcm } = e.data || {};
-                if (pcm && (flushed || (callActive && !isBotBusy()))) {
+                if (
+                    pcm &&
+                    (flushed || (callActive && recording && !isBotBusy()))
+                ) {
                     sendBinary(pcm);
                 }
                 if (flushed && typeof onWorkletFlushed === "function") {
@@ -458,7 +471,9 @@ registerProcessor('mic-processor', MicProcessor);
                 }
                 autoListenTimer = setTimeout(() => {
                     autoListenTimer = null;
-                    if (callActive && !recording && serverState === "idle") startListeningTurn();
+                    if (callActive && !recording && (serverState === "idle" || serverState === "speaking")) {
+                        startListeningTurn();
+                    }
                 }, 600);
             }
         }, 100);

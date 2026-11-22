@@ -116,7 +116,7 @@ Frontend:
 - [x] Buffer audio cho turn hiện tại (`turn_audio_buffer`).
 - [x] Tích hợp mô hình ONNX Smart Turn v3.2 (`services.smart_turn_predict`).
 - [x] Tự động kích hoạt đánh giá Smart Turn khi vừa dứt lời (`prob >= 0.70`).
-- [x] Tự động kết thúc lượt khi im lặng vượt ngưỡng tối đa (`smart_turn_silence_timeout_seconds`).
+- [x] Tự động kết thúc lượt khi im lặng vượt ngưỡng tối đa (`smart_turn_fallback_seconds`).
 - [x] Khởi tạo lượt thoại mới tự động sau khi bot hoàn tất phát ngôn (`scheduleAutoListen`).
 
 **Điều kiện qua bước:** [x] Có thể nói nhiều câu liên tiếp mà không cần thao tác dừng thủ công; không cắt câu quá sớm.

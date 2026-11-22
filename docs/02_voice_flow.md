@@ -94,8 +94,8 @@ sequenceDiagram
    - Ngay khi VAD báo `speech_ended`, backend trích xuất `turn_audio_buffer` (tối đa 8 giây âm thanh gần nhất) và đưa vào mô hình **Smart Turn v3.2 ONNX**.
    - Nếu xác suất dứt câu `prob >= settings.smart_turn_threshold` (mặc định 0.70): Hệ thống kích hoạt kết thúc lượt nói ngay lập tức mà không cần chờ thêm.
 
-3. **Cơ chế Timeout dự phòng (Safety Silence Timeout):**
-   - Nếu Smart Turn đánh giá chưa hết câu nhưng người dùng im lặng kéo dài vượt ngưỡng `smart_turn_silence_timeout_seconds` (mặc định 2.5 giây), hệ thống sẽ tự động kích hoạt kết thúc lượt để tránh treo phiên.
+3. **Cơ chế Timeout dự phòng (Safety Silence Fallback):**
+   - Nếu Smart Turn đánh giá chưa hết câu nhưng người dùng im lặng kéo dài vượt ngưỡng `smart_turn_fallback_seconds` (mặc định 5.0 giây), hệ thống sẽ tự động kích hoạt kết thúc lượt để tránh treo phiên. Quá trình suy luận của Smart Turn có timeout riêng `smart_turn_inference_timeout_seconds` (mặc định 3.0 giây).
    - Tuyệt đối không kích hoạt timeout khi VAD vẫn đang báo trạng thái có tiếng nói (`is_vad_speaking = True`).
 
 ---
