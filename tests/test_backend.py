@@ -172,18 +172,21 @@ def test_session_lifecycle():
 
 
 def test_silence_timeout_logic():
+    import time
+
     session = VoiceSession(session_id="s_test")
     assert session.is_silence_timeout() is False
 
     session.current_turn = TurnState(turn_id="turn_test", has_speech=True, last_speech_time=0.0)
     assert session.is_silence_timeout() is False
 
-    # Giả lập thời gian nói cách đây lâu
-    session.current_turn.last_speech_time = 1.0
+    # Giả lập thời gian nói cách đây 6 giây (vượt fallback 5s)
+    session.current_turn.last_speech_time = time.monotonic() - 6.0
     assert session.is_silence_timeout() is True
 
-    # Khi VAD đang báo người dùng nói -> tuyệt đối không timeout
+    # Khi VAD đang báo người dùng nói và mới nói cách đây 1s -> tuyệt đối không timeout
     session.current_turn.is_vad_speaking = True
+    session.current_turn.last_speech_time = time.monotonic() - 1.0
     assert session.is_silence_timeout() is False
 
 
@@ -1242,6 +1245,88 @@ def test_new_config_fields():
     assert settings.stt_finish_timeout == 5.0
     assert settings.smart_turn_threads >= 1
     assert settings.smart_turn_max_workers >= 1
+
+
+def test_sentence_split_numbered_list():
+    streamer = TTSTextStreamer()
+    # Danh sách có số thứ tự "1. " không bị cắt rời ngay sau "1."
+    res = streamer.feed("1. Chuẩn bị hàng. 2. Đem ra bưu cục.") + streamer.flush()
+    assert len(res) == 2
+    assert "Chuẩn bị hàng." in res[0]
+    assert "Đem ra bưu cục." in res[1]
+
+
+def test_large_number_with_unit_tts():
+    # 10000000 đồng không được đọc thành "một không không...", mà phải đọc "mười triệu đồng"
+    res = normalize_text_for_tts("Tổng cộng 10000000 đồng")
+    assert "mười triệu đồng" in res
+
+
+def test_silence_timeout_stuck_vad():
+    import time
+    session = VoiceSession(session_id="s_stuck_vad")
+    session.current_turn = TurnState(turn_id="turn_stuck", has_speech=True, is_vad_speaking=True)
+    session.current_turn.last_speech_time = time.monotonic() - 5.0
+    # Chưa đủ 10s: vẫn giữ False vì VAD đang True
+    assert session.is_silence_timeout() is False
+
+    # Quá 11s (vượt max_stuck_vad): timeout ngay lập tức dù VAD vẫn là True
+    session.current_turn.last_speech_time = time.monotonic() - 11.0
+    assert session.is_silence_timeout() is True
+
+
+def test_process_turn_filler_tts_error_code():
+    session = VoiceSession(session_id="s_filler_err")
+    session.state = VoiceState.THINKING
+    session.current_turn = TurnState(turn_id="turn_fill")
+
+    class EmptySTT:
+        async def finish(self):
+            return ""
+
+    session.current_turn.stt_client = EmptySTT()  # type: ignore
+
+    async def mock_tts_stream(sentence):
+        raise services.TTSError("ZeroTTS sập", code="TTS_STREAM_ERROR")
+        yield b""  # Async generator
+
+    original_tts = services.tts_stream
+    services.tts_stream = mock_tts_stream
+
+    def _step(coro):
+        try:
+            coro.send(None)
+        except StopIteration as e:
+            return e.value
+
+    events = []
+
+    async def mock_send(ev):
+        events.append(ev)
+
+    session.send_json_cb = mock_send
+
+    try:
+        _step(session._process_turn("turn_fill"))
+        assert session.state == VoiceState.ERROR
+        err_ev = next((ev for ev in events if ev.get("type") == "session.error"), None)
+        assert err_ev is not None
+        assert err_ev.get("code") == "TTS_STREAM_ERROR"
+    finally:
+        services.tts_stream = original_tts
+
+
+def test_validate_config_new_rules():
+    assert settings.smart_turn_threads == 1
+    assert settings.smart_turn_max_workers == 2
+    orig_finish = settings.stt_finish_timeout
+    try:
+        object.__setattr__(settings, "stt_finish_timeout", -1.0)
+        warnings = settings.validate_config()
+        assert any("STT_FINISH_TIMEOUT" in w for w in warnings)
+    finally:
+        object.__setattr__(settings, "stt_finish_timeout", orig_finish)
+
 
 
 

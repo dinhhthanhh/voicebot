@@ -344,8 +344,6 @@ class VoiceSession:
                         if self.current_turn:
                             await self.current_turn.close()
                         await self._fail_turn(code, msg, turn_id=turn_id)
-                    else:
-                        await self.emit_event("session.error", code=code, message=msg)
                     break
         except asyncio.CancelledError:
             raise
@@ -411,13 +409,13 @@ class VoiceSession:
     def is_silence_timeout(self) -> bool:
         """Kiểm tra người dùng đã nói nhưng sau đó im lặng vượt quá thời gian fallback hay chưa."""
         turn = self.current_turn
-        if not turn or turn.is_vad_speaking:
+        if not turn or not turn.has_speech or turn.last_speech_time <= 0:
             return False
-        return (
-            turn.has_speech
-            and turn.last_speech_time > 0
-            and time.monotonic() - turn.last_speech_time >= settings.smart_turn_fallback_seconds
-        )
+        elapsed = time.monotonic() - turn.last_speech_time
+        if turn.is_vad_speaking:
+            max_stuck_vad = max(8.0, settings.smart_turn_fallback_seconds * 2)
+            return elapsed >= max_stuck_vad
+        return elapsed >= settings.smart_turn_fallback_seconds
 
     async def handle_audio_frame(self, pcm_data: bytes) -> None:
         """Xử lý frame âm thanh từ mic: đệm cho Smart Turn, stream sang STT và kiểm tra timeout im lặng."""
@@ -479,14 +477,13 @@ class VoiceSession:
 
                 await queue.put(None)
                 sentinel_sent = True
-        except services.LLMError:
-            _drain_queue(queue)
+        except services.LLMError as err:
+            logger.error("Lỗi LLM stream turn [%s]: %s", turn_id, err)
             raise
         except asyncio.CancelledError:
-            _drain_queue(queue)
             raise
         except Exception as exc:
-            _drain_queue(queue)
+            logger.exception("Lỗi LLM không xác định turn [%s]: %s", turn_id, exc)
             raise services.LLMError(f"Lỗi LLM stream: {exc}", code="LLM_STREAM_ERROR") from exc
         finally:
             if not sentinel_sent:
@@ -497,11 +494,13 @@ class VoiceSession:
     # -------------------------------------------------------------------------
     # TTS Consumer
     # -------------------------------------------------------------------------
-    async def _finish_speaking(self, turn_id: str, total_bytes: int) -> None:
+    async def _finish_speaking(self, turn_id: str, total_bytes: int, stream_elapsed: float = 0.0) -> None:
         """Báo audio.done về client và bật timer fallback để tự động chuyển về IDLE khi phát xong."""
         await self.emit_event("assistant.audio.done", turn_id=turn_id)
         bytes_per_sec = settings.tts_sample_rate * 2
-        delay = (total_bytes / bytes_per_sec) + 1.5 if total_bytes > 0 else 1.0
+        audio_duration = (total_bytes / bytes_per_sec) if total_bytes > 0 else 0.0
+        remaining_duration = max(0.0, audio_duration - stream_elapsed)
+        delay = remaining_duration + 0.8
 
         async def _fallback() -> None:
             await asyncio.sleep(delay)
@@ -513,6 +512,7 @@ class VoiceSession:
     async def _stream_tts_audio(self, turn_id: str, queue: asyncio.Queue[str | None]) -> None:
         """Rút câu từ queue, gọi tts_stream tạo âm thanh và stream từng chunk PCM về client."""
         chunk_id, total_bytes = 1, 0
+        stream_start_time: float | None = None
         try:
             while True:
                 sentence = await queue.get()
@@ -524,20 +524,25 @@ class VoiceSession:
                 async for pcm_chunk in services.tts_stream(sentence):
                     if not self.is_active_turn(turn_id) or self.state == VoiceState.ERROR:
                         break
+                    if stream_start_time is None:
+                        stream_start_time = time.monotonic()
                     total_bytes += len(pcm_chunk)
                     await self.emit_audio_chunk(turn_id, chunk_id, pcm_chunk)
                     chunk_id += 1
 
             if self.is_active_turn(turn_id) and self.state != VoiceState.ERROR:
+                stream_elapsed = (time.monotonic() - stream_start_time) if stream_start_time else 0.0
                 if self.state == VoiceState.SPEAKING:
-                    await self._finish_speaking(turn_id, total_bytes)
+                    await self._finish_speaking(turn_id, total_bytes, stream_elapsed)
                 elif self.state == VoiceState.THINKING:
                     await self.set_state(VoiceState.IDLE)
-        except services.TTSError:
+        except services.TTSError as err:
+            logger.error("Lỗi TTS stream turn [%s]: %s", turn_id, err)
             raise
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            logger.exception("Lỗi TTS không xác định turn [%s]: %s", turn_id, exc)
             raise services.TTSError(f"Lỗi TTS stream: {exc}", code="TTS_STREAM_ERROR") from exc
 
     async def _respond_with_filler(self, turn_id: str, prompt: str) -> None:
@@ -560,6 +565,7 @@ class VoiceSession:
         except* services.ServiceError as eg:
             first_err = eg.exceptions[0]
             code = getattr(first_err, "code", "PIPELINE_ERROR")
+            logger.error("Lỗi service trong TaskGroup turn [%s]: %s", turn_id, first_err)
             await self._fail_turn(code, str(first_err), turn_id=turn_id, stop_playback=True, queue=queue)
         except* Exception as eg:
             first_err = eg.exceptions[0]
@@ -591,13 +597,18 @@ class VoiceSession:
     # -------------------------------------------------------------------------
     # Event Handling
     # -------------------------------------------------------------------------
+    @staticmethod
+    async def _safe_close_stt(stt: services.STTClient | None) -> None:
+        """Đóng an toàn kết nối STT nếu có."""
+        if stt:
+            with contextlib.suppress(Exception):
+                await stt.close()
+
     async def _process_turn(self, turn_id: str, stt: services.STTClient | None = None) -> None:
         """Điều phối xử lý lượt thoại: chốt STT final_text, lọc từ đệm và kích hoạt pipeline LLM -> TTS."""
         try:
             if not self.is_active_turn(turn_id):
-                if stt:
-                    with contextlib.suppress(Exception):
-                        await stt.close()
+                await self._safe_close_stt(stt)
                 return
 
             final_text = ""
@@ -643,17 +654,14 @@ class VoiceSession:
 
             await self._run_turn_taskgroup(turn_id, final_text)
 
-        except services.STTError as err:
+        except services.ServiceError as err:
+            logger.error("Lỗi service turn [%s]: %s", turn_id, err)
             await self._fail_turn(err.code, str(err), turn_id=turn_id)
         except asyncio.CancelledError:
-            if stt:
-                with contextlib.suppress(Exception):
-                    await stt.close()
+            await self._safe_close_stt(stt)
             raise
         except Exception as exc:
-            if stt:
-                with contextlib.suppress(Exception):
-                    await stt.close()
+            await self._safe_close_stt(stt)
             logger.exception("Lỗi pipeline turn [%s]: %s", turn_id, exc)
             await self._fail_turn("PIPELINE_ERROR", str(exc), turn_id=turn_id)
 

@@ -9,7 +9,6 @@ Nhiệm vụ:
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from num2words import num2words
 
@@ -51,10 +50,11 @@ _INLINE_MARK_RE = re.compile(r"[*_`~#]+")
 _PREFIX_BULLET_RE = re.compile(r"^[-*+•]\s+|\d+[.)]\s+")
 
 # 5. Regex tách câu theo dấu kết thúc (. ! ? … hoặc xuống dòng \n)
-# Kết hợp Lookbehind (?<!) để tránh cắt nhầm ở các từ viết tắt có dấu chấm trong bưu chính
+# Kết hợp Lookbehind (?<!) để tránh cắt nhầm ở các từ viết tắt có dấu chấm trong bưu chính và số thứ tự (1., 2.)
 _SENT_SPLIT_RE = re.compile(
     r"(?<!\bTP\.)(?<!\bTp\.)"              # Tránh cắt tại "TP." (Thành phố)
     r"(?<!\b[A-Z]\.)(?<!\bv\.v\.)(?<!\.\.)" # Tránh cắt tại tên viết tắt (Nguyễn Văn A.), "v.v." và dấu "..."
+    r"(?<!\b\d\.)(?<!\b\d\d\.)"             # Tránh cắt tại số thứ tự danh sách (1., 2., 10.)
     r"(?<=[.!?…])\s+|\n+"                   # Cắt câu khi gặp dấu (. ! ? …) có khoảng trắng theo sau hoặc dấu xuống dòng
 )
 
@@ -120,9 +120,9 @@ UNIT_TOKEN_RE = re.compile(r"^([0-9][0-9.,]*)([a-zA-ZđĐ%²³]+[23]?|đồng)$"
 TTS_TOKEN_RE = re.compile(r"\b(?=[A-Za-z0-9.,²³]*\d)[A-Za-z0-9.,²³]+(?:%|[đĐ](?:ồng)?|vnd|vnđ)?", re.IGNORECASE)
 
 
-def _read_numeric_token(tok: str) -> str:
-    """Đọc số nguyên: đọc tách từng số nếu là SĐT/chuỗi dài (bắt đầu bằng 0 hoặc >= 8 số), ngược lại đọc thành chữ số đếm."""
-    if (tok.startswith("0") and len(tok) > 1) or len(tok) >= 8:
+def _read_numeric_token(tok: str, has_unit: bool = False) -> str:
+    """Đọc số nguyên: đọc tách từng số nếu là SĐT/chuỗi dài không có đơn vị, ngược lại đọc thành số đếm/tiền tệ."""
+    if (tok.startswith("0") and len(tok) > 1) or (len(tok) >= 8 and not has_unit):
         return " ".join(DIGITS_VI[c] for c in tok)
     return num2words(int(tok), lang="vi")
 
@@ -157,7 +157,7 @@ def _replace_token_for_tts(match: re.Match[str]) -> str:
         return " ".join(digits_or_letters) + unit + punct
 
     if tok.isdigit():
-        return _read_numeric_token(tok) + unit + punct
+        return _read_numeric_token(tok, has_unit=bool(unit)) + unit + punct
 
     if re.fullmatch(r"[1-9]\d{0,2}(?:\.\d{3})+|[1-9]\d{0,2}(?:,\d{3}){2,}", tok) or (
         unit.strip() in ("đồng", "nghìn") and re.fullmatch(r"[1-9]\d{0,2}[.,]\d{3}", tok)
@@ -240,6 +240,14 @@ class TTSTextStreamer:
             self.buf = parts[-1]
         return out
 
+    @staticmethod
+    def _format_chunks(sentences: list[str]) -> list[str]:
+        return [
+            chunk
+            for s in sentences
+            for chunk in split_for_tts(normalize_text_for_tts(s))
+        ]
+
     def flush(self) -> list[str]:
         """Vét cạn bộ đệm khi LLM kết thúc: ép xuất câu cuối cùng còn dở dang."""
         out: list[str] = []
@@ -249,11 +257,7 @@ class TTSTextStreamer:
         if self.hold:
             self._emit(self.hold, out, end=True, force=True)
             self.hold = ""
-        return [
-            chunk
-            for s in out
-            for chunk in split_for_tts(normalize_text_for_tts(s))
-        ]
+        return self._format_chunks(out)
 
     def _emit(self, text: str, out: list[str], end: bool = False, force: bool = False) -> None:
         """Làm sạch Markdown, ghép nối câu ngắn (hold), kiểm tra giới hạn an toàn (capping) rồi thêm câu vào danh sách out."""
@@ -282,9 +286,5 @@ class TTSTextStreamer:
         if delta is None:
             return self.flush()
         raw = self._feed_raw(delta)
-        return [
-            chunk
-            for s in raw
-            for chunk in split_for_tts(normalize_text_for_tts(s))
-        ]
+        return self._format_chunks(raw)
 

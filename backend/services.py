@@ -98,7 +98,8 @@ class STTClient:
         last_error: Exception | None = None
 
         for attempt in range(retries + 1):
-            client = cls(session_id=session_id, turn_id=turn_id, request_id=req_id)
+            attempt_req_id = f"{req_id}_{attempt}" if attempt > 0 else req_id
+            client = cls(session_id=session_id, turn_id=turn_id, request_id=attempt_req_id)
             try:
                 client.websocket = await websockets.connect(settings.stt_ws_url, max_size=10 * 1024 * 1024)
                 client.recv_task = asyncio.create_task(client._recv_loop())
@@ -398,7 +399,10 @@ def _find_wav_data_offset(header_buf: bytearray) -> int | None:
     # Nếu có đúng cấu trúc tiêu chuẩn RIFF....WAVE, duyệt qua từng subchunk
     if buf_len >= 12 and header_buf[8:12] == b"WAVE":
         offset = 12
-        while offset + 8 <= buf_len:
+        while True:
+            if offset + 8 > buf_len:
+                # Chưa nhận đủ 8 byte header của subchunk tiếp theo
+                return None
             chunk_id = bytes(header_buf[offset : offset + 4])
             chunk_size = int.from_bytes(header_buf[offset + 4 : offset + 8], "little")
             if chunk_id == b"data":
@@ -406,6 +410,9 @@ def _find_wav_data_offset(header_buf: bytearray) -> int | None:
             next_offset = offset + 8 + chunk_size + (chunk_size % 2)
             if next_offset <= offset:
                 break
+            if next_offset > buf_len:
+                # Subchunk chưa nhận đủ byte dữ liệu trong buffer
+                return None
             offset = next_offset
 
     # Fallback cho streaming WAV hoặc các định dạng RIFF có header mở rộng / mock test
