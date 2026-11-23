@@ -40,6 +40,122 @@ flowchart TB
     ADAPTER <--> TURN
 ```
 
+## 2.1 Luồng xử lý chi tiết (Event Flow & Audio Bytes Flow)
+
+Hệ thống phân tách thành hai luồng dữ liệu độc lập qua kết nối WebSocket: **Luồng sự kiện JSON (Control Plane)** và **Luồng dữ liệu byte âm thanh (Data Plane)**.
+
+### A. Luồng nhận sự kiện JSON (Control Plane)
+Điều phối trạng thái phiên thoại và kiểm soát vòng đời lượt thoại (`session.start`, `turn.start`, `turn.finish`, `playback.done`, `session.cancel`).
+
+``` mermaid
+flowchart TD
+    Client["Client / Frontend (app.js)"] -- "Gửi JSON qua WebSocket" --> WS["_handle_ws_message (main.py)"]
+    WS -- "json.loads(text)" --> HandleEvent["session.handle_event(payload) (voice.py)"]
+
+    HandleEvent --> Switch{"Loại sự kiện (type)?"}
+
+    %% session.start
+    Switch -- "session.start" --> SStart["Khởi tạo phiên"]
+    SStart --> EmitReady["emit_event('session.ready')\nset_state(IDLE)"]
+
+    %% turn.start
+    Switch -- "turn.start" --> StartTurn["start_turn()"]
+    StartTurn --> ST1["1. Sinh turn_id mới\n2. reset_audio_buffers()"]
+    ST1 --> ST2["3. STTClient.connect()\n4. Bật ngầm _forward_stt_events"]
+    ST2 --> ST3["5. set_state(LISTENING)\n(Sẵn sàng nhận tiếng nói)"]
+
+    %% turn.finish
+    Switch -- "turn.finish" --> FinishTurn["finish_turn()"]
+    FinishTurn --> FT1["set_state(THINKING)\n(Khóa mic, bắt đầu xử lý AI)"]
+    FT1 --> FT2["_spawn_task(_process_turn)\n(Chuyển sang luồng LLM -> TTS)"]
+
+    %% playback.done
+    Switch -- "playback.done" --> PlaybackDone["Loa Client đã phát xong"]
+    PlaybackDone --> SetIdle["set_state(IDLE)\n(Mở đường cho lượt nói tiếp theo)"]
+
+    %% session.cancel
+    Switch -- "session.cancel" --> Cancel["_handle_cancel()"]
+    Cancel --> Can1["Hủy mọi task, đóng STT\nemit_event('playback.stop')\nset_state(IDLE)"]
+```
+
+### B. Luồng nhận byte âm thanh từ Micro (Data Plane)
+Hàm `handle_audio_frame` tiếp nhận frame âm thanh thô (PCM 16kHz Mono) từ micro gửi lên, chỉ làm đúng 3 việc:
+1. Lưu vào kho đệm trượt `turn_audio_buffer` (tối đa ~8s).
+2. Chuyển tiếp ngay sang STT Server (Qwen3-ASR) qua WebSocket nội bộ.
+3. Kiểm tra đồng hồ đếm ngược im lặng dự phòng (5.0s).
+
+``` mermaid
+flowchart TD
+    Micro["Micro Client (app.js)"] -- "Gửi Binary PCM 16kHz" --> WS["_handle_ws_message (main.py)"]
+    WS -- "message['bytes']" --> AudioFrame["handle_audio_frame(pcm_data) (voice.py)"]
+
+    AudioFrame --> Check{"Kiểm tra điều kiện:\n- Byte có chẵn không?\n- State có phải LISTENING?"}
+    Check -- "Sai" --> Drop["Bỏ qua frame âm thanh này"]
+    Check -- "Đúng" --> Action["Thực hiện 3 tác vụ song song:"]
+
+    %% Tác vụ 1
+    Action --> Task1["1. buffer_audio(pcm_data)\n(Lưu tích lũy vào kho turn_audio_buffer)"]
+
+    %% Tác vụ 2
+    Action --> Task2["2. stt_client.send_audio(pcm_data)\n(Bắn thẳng byte sang STT Server)"]
+
+    %% Tác vụ 3
+    Action --> Task3["3. is_silence_timeout()?\n(Nếu im lặng >= 5.0s)"]
+    Task3 -- "Đúng" --> FinishFallback["finish_turn()\n(Kích hoạt dừng nghe dự phòng)"]
+```
+
+### C. Luồng nhận sự kiện JSON từ STT Server (STT & VAD Event Flow)
+Sau khi STT Server nhận được âm thanh từ Luồng B, mô hình AI bên trong STT Server sẽ phân tích và trả về các gói tin JSON qua kết nối WebSocket nội bộ. **Chính tại đây mới là nơi nhận sự kiện VAD (`speech_ended`) để kích hoạt Smart Turn:**
+
+``` mermaid
+flowchart TD
+    STTServer["STT Server (Qwen3-ASR + Silero VAD)"] -- "Gửi gói tin JSON" --> RecvLoop["_recv_loop() (services.py)"]
+    RecvLoop --> Queue["stt_client.event_queue"]
+    Queue --> Forward["_forward_stt_events() (voice.py)"]
+
+    Forward --> EventType{"Loại sự kiện STT?"}
+
+    %% partial
+    EventType -- "type == 'partial'" --> Partial["emit_event('transcript.partial')\n(Hiển thị chữ đang nói lên màn hình Client)"]
+
+    %% vad
+    EventType -- "type == 'vad'" --> HandleVAD["_handle_vad(turn_id, state)"]
+    HandleVAD --> VADState{"state là gì?"}
+
+    VADState -- "'speech_started'\n(Đang nói)" --> CancelST["Hủy _smart_turn_task đang chờ (nếu có)\nĐánh dấu is_vad_speaking = True"]
+
+    VADState -- "'speech_ended'\n(Vừa ngừng nói)" --> TriggerST["_predict_and_trigger()"]
+    TriggerST --> PullAudio["get_turn_audio()\n(Rút toàn bộ audio đã tích lũy ở Kho Luồng B)"]
+    PullAudio --> STModel["smart_turn_detector.predict(audio)"]
+    STModel -- "prob >= 0.70\n(AI tự tin dứt câu)" --> FinishSmartTurn["finish_turn()\n(Chuyển sang trả lời)"]
+    STModel -- "prob < 0.70\n(Ngập ngừng)" --> WaitMore["Tiếp tục giữ LISTENING để nghe tiếp"]
+
+    %% error
+    EventType -- "type == 'error'" --> STTErr["Báo lỗi session.error\nChuyển state -> ERROR"]
+```
+
+### D. Điểm hội tụ chuyển giao: Pipeline Trả lời (LLM → TTS)
+Khi lượt nghe kết thúc (`finish_turn`), toàn bộ câu nói được chốt và kích hoạt đường ống xử lý song song Producer - Consumer:
+
+``` mermaid
+flowchart TD
+    FT["finish_turn()"] --> PT["_process_turn(turn_id)"]
+    PT --> STTFinish["1. stt.finish() chốt final_text\n2. emit_event('transcript.final')"]
+    STTFinish --> TG["3. _run_turn_taskgroup(turn_id, final_text)"]
+
+    subgraph Pipeline["Đường ống Producer - Consumer song song (TaskGroup)"]
+        TG --> Q["asyncio.Queue (maxsize=8)"]
+        TG --> Producer["Producer: _produce_tts_text()"]
+        TG --> Consumer["Consumer: _stream_tts_audio()"]
+
+        Producer -- "1. LLM Stream sinh text\n2. TTSTextStreamer tách câu &\nchuẩn hóa SĐT, ngày tháng" --> Q
+        Q -- "3. Rút câu hoàn chỉnh (sentence)" --> Consumer
+        Consumer -- "4. tts_stream(sentence)\n(Gọt WAV header & căn chẵn 16-bit)" --> EmitChunk["emit_audio_chunk()"]
+    end
+
+    EmitChunk --> Play["Trình duyệt Client nhận PCM chunk\nAudioContext phát ra loa ngay lập tức"]
+```
+
 ## 3. Ranh giới trách nhiệm
 
 ### 3.1 `main.py` -- Gateway

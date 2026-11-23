@@ -38,15 +38,24 @@ def is_only_filler(text: str) -> bool:
 # ---------------------------------------------------------------------------
 REMAINDER_NOTE = "Phần còn lại đã được hiển thị trên màn hình."
 
+# 1. Regex nhận diện link Markdown [text](url) -> để bóc tách lấy lại phần 'text'
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^\)]+\)")
+
+# 2. Regex nhận diện đường dẫn website (http://, https://) -> để xóa bỏ, tránh TTS đọc URL
 _URL_RE = re.compile(r"https?://\S+")
+
+# 3. Regex nhận diện ký hiệu định dạng chữ: in đậm/nghiêng (*, _), code (`), gạch ngang (~), tiêu đề (#)
 _INLINE_MARK_RE = re.compile(r"[*_`~#]+")
+
+# 4. Regex nhận diện ký hiệu gạch đầu dòng (-, *, +, •) hoặc số thứ tự đầu dòng (1., 2)...)
 _PREFIX_BULLET_RE = re.compile(r"^[-*+•]\s+|\d+[.)]\s+")
+
+# 5. Regex tách câu theo dấu kết thúc (. ! ? … hoặc xuống dòng \n)
+# Kết hợp Lookbehind (?<!) để tránh cắt nhầm ở các từ viết tắt có dấu chấm trong bưu chính
 _SENT_SPLIT_RE = re.compile(
-    r"(?<!\bTP\.)(?<!\bTp\.)(?<!\bMr\.)(?<!\bMrs\.)(?<!\bMs\.)(?<!\bDr\.)"
-    r"(?<!\bThS\.)(?<!\bTS\.)(?<!\bBS\.)(?<!\bGS\.)(?<!\bPGS\.)"
-    r"(?<!\b[A-Z]\.)(?<!\bv\.v\.)(?<!\.\.)"
-    r"(?<=[.!?…])\s+|\n+"
+    r"(?<!\bTP\.)(?<!\bTp\.)"              # Tránh cắt tại "TP." (Thành phố)
+    r"(?<!\b[A-Z]\.)(?<!\bv\.v\.)(?<!\.\.)" # Tránh cắt tại tên viết tắt (Nguyễn Văn A.), "v.v." và dấu "..."
+    r"(?<=[.!?…])\s+|\n+"                   # Cắt câu khi gặp dấu (. ! ? …) có khoảng trắng theo sau hoặc dấu xuống dòng
 )
 
 
@@ -54,10 +63,15 @@ def clean_inline_markdown(text: str) -> str:
     """Làm sạch ký hiệu Markdown, link, URL khỏi văn bản thoại."""
     if not text:
         return ""
+    # Bước 1: Giữ lại text hiển thị, loại bỏ link: [VNPost](https://...) -> "VNPost"
     s = _MD_LINK_RE.sub(r"\1", text)
+    # Bước 2: Xóa các đường dẫn web độc lập (https://...)
     s = _URL_RE.sub(" ", s)
+    # Bước 3: Xóa các ký hiệu in đậm, in nghiêng, code block (*, _, `, ~, #)
     s = _INLINE_MARK_RE.sub("", s)
+    # Bước 4: Xóa ký hiệu gạch đầu dòng (- , * , 1. ) để câu thoại tự nhiên
     s = _PREFIX_BULLET_RE.sub("", s)
+    # Bước 5: Gom các khoảng trắng thừa liên tiếp thành 1 dấu cách đơn và cắt 2 đầu
     return " ".join(s.split())
 
 
@@ -80,6 +94,7 @@ class SpeechFilter:
         self.capped = False
 
     def feed(self, delta: str) -> list[str]:
+        """Nạp mẩu chữ mới từ LLM, nếu gom đủ câu hoàn chỉnh (có dấu ngắt câu) thì tách và trả về danh sách câu."""
         if self.capped:
             return []
         self.buf += delta
@@ -92,6 +107,7 @@ class SpeechFilter:
         return out
 
     def flush(self) -> list[str]:
+        """Vét cạn bộ đệm khi LLM kết thúc: ép xuất câu cuối cùng còn dở dang và câu ngắn đang giữ trong hold."""
         out: list[str] = []
         if self.buf:
             self._emit(self.buf, out, end=True)
@@ -102,6 +118,7 @@ class SpeechFilter:
         return out
 
     def _emit(self, text: str, out: list[str], end: bool = False, force: bool = False) -> None:
+        """Làm sạch Markdown, ghép nối câu ngắn (hold), kiểm tra giới hạn an toàn (capping) rồi thêm câu vào danh sách out."""
         if self.capped:
             return
         cleaned = clean_inline_markdown(text) # Xóa các ký hiệu [link](url), URL, bullet points (-, *), in đậm **...
@@ -169,12 +186,14 @@ TTS_TOKEN_RE = re.compile(r"\b(?=[A-Za-z0-9.,²³]*\d)[A-Za-z0-9.,²³]+(?:%|[đ
 
 
 def _read_numeric_token(tok: str) -> str:
+    """Đọc số nguyên: đọc tách từng số nếu là SĐT/chuỗi dài (bắt đầu bằng 0 hoặc >= 8 số), ngược lại đọc thành chữ số đếm."""
     if (tok.startswith("0") and len(tok) > 1) or len(tok) >= 8:
         return " ".join(DIGITS_VI[c] for c in tok)
     return num2words(int(tok), lang="vi")
 
 
 def _read_decimal_token(tok: str) -> str:
+    """Đọc số thập phân: đổi dấu chấm hoặc phẩy thành chữ 'phẩy' (ví dụ: 3.5 -> 'ba phẩy năm')."""
     parts = DECIMAL_SEP_RE.split(tok)
     dec_val = parts[1].lstrip("0")
     zero_prefix = "không " * (len(parts[1]) - len(dec_val))
@@ -183,6 +202,7 @@ def _read_decimal_token(tok: str) -> str:
 
 
 def _replace_token_for_tts(match: re.Match[str]) -> str:
+    """Chuyển đổi từng token chứa số (thuật ngữ 5G/3D, đơn vị kg/km, số tiền, mã số) thành chữ phát âm tự nhiên."""
     tok = match.group(0)
     clean_tok = tok.rstrip(".,;!?")
     punct = tok[len(clean_tok):]
@@ -216,6 +236,7 @@ def _replace_token_for_tts(match: re.Match[str]) -> str:
 
 
 def _normalize_dates(text: str) -> str:
+    """Chuẩn hóa ngày tháng (25/12/2024 -> ngày... tháng... năm...), địa chỉ nhà (ngõ 12/34 -> 12 xuyệt 34) và 24/7."""
     text = re.sub(r"\b24\s*/\s*7\b", "hai tư trên bảy", text)
     text = re.sub(r"\b(số|ngõ|ngách|hẻm|địa chỉ)\s+(\d+)\s*/\s*(\d+)\b", r"\1 \2 xuyệt \3", text, flags=re.I)
     text = DATE_DMY_RE.sub(lambda m: f"ngày {int(m.group(1))} tháng {int(m.group(2))} năm {m.group(3)}", text)
@@ -225,7 +246,7 @@ def _normalize_dates(text: str) -> str:
 
 
 def normalize_text_for_tts(text: str) -> str:
-    """Chuẩn hóa văn bản thành câu phát âm tự nhiên trước khi đưa vào mô hình TTS."""
+    """Chuẩn hóa toàn bộ câu văn bản (SĐT, ngày tháng, tiền tệ, đơn vị đo) thành chữ phát âm tự nhiên cho TTS."""
     text = HOTLINE_RE.sub(lambda m: " ".join(DIGITS_VI[c] for c in re.sub(r"\D", "", m.group(0))), text)
     text = PHONE_INTL_RE.sub(r"0\1\2\3", text)
     text = PHONE_LOCAL_RE.sub(lambda m: f"{'0' + m.group(1) if m.group(1) else m.group(2)}{m.group(3)}{m.group(4)}", text)
@@ -237,7 +258,7 @@ def normalize_text_for_tts(text: str) -> str:
 
 
 def split_for_tts(text: str, limit: int | None = None) -> list[str]:
-    """Tách câu văn bản dài tại dấu phẩy hoặc khoảng trắng gần nhất."""
+    """Cắt câu văn bản dài thành các đoạn nhỏ vừa miệng đọc cho TTS tại dấu phẩy hoặc khoảng trắng gần nhất."""
     max_len = limit if limit is not None else settings.tts_split_limit
     parts: list[str] = []
     while len(text) > max_len:
