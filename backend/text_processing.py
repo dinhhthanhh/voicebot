@@ -84,7 +84,7 @@ class SpeechFilter:
             return []
         self.buf += delta
         out: list[str] = []
-        parts = _SENT_SPLIT_RE.split(self.buf)
+        parts = _SENT_SPLIT_RE.split(self.buf) # Quét tìm dấu ngắt câu (., !, ?, …, \n).
         if len(parts) > 1:
             for part in parts[:-1]:
                 self._emit(part, out)
@@ -104,7 +104,7 @@ class SpeechFilter:
     def _emit(self, text: str, out: list[str], end: bool = False, force: bool = False) -> None:
         if self.capped:
             return
-        cleaned = clean_inline_markdown(text)
+        cleaned = clean_inline_markdown(text) # Xóa các ký hiệu [link](url), URL, bullet points (-, *), in đậm **...
         if not re.search(r"\w", cleaned):
             return
         if self.hold:
