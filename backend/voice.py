@@ -55,37 +55,22 @@ class VoiceState(StrEnum):
 
 
 # =============================================================================
-# VoiceSession
+# TurnState & VoiceSession
 # =============================================================================
 @dataclass
-class VoiceSession:
-    """Phiên tương tác thoại trực tiếp gắn liền với một kết nối WebSocket."""
+class TurnState:
+    """Quản lý toàn bộ trạng thái và tài nguyên gắn liền với một lượt thoại (turn)."""
 
-    session_id: str  # ID duy nhất của phiên
-    state: VoiceState = VoiceState.IDLE  # Trạng thái hiện tại của phiên
-    history: list[dict[str, str]] = field(default_factory=list)  # Lịch sử hội thoại (gửi cho LLM)
-    current_turn_id: str | None = None  # ID của lượt thoại đang diễn ra
-    active_tasks: set[asyncio.Task[Any]] = field(default_factory=set)  # Tập hợp task bất đồng bộ đang chạy
-    closed: bool = False  # Cờ đánh dấu phiên đã đóng
-    _cleanup_done: bool = field(default=False, repr=False)  # Cờ đảm bảo chỉ giải phóng tài nguyên một lần
+    turn_id: str
+    stt_client: services.STTClient | None = None
+    has_speech: bool = False
+    is_vad_speaking: bool = False
+    last_speech_time: float = 0.0
+    turn_audio_buffer: deque[bytes] = field(default_factory=deque)
+    turn_audio_bytes: int = 0
+    last_partial_text: str = ""
+    smart_turn_task: asyncio.Task[Any] | None = field(default=None, repr=False)
 
-    has_speech: bool = False  # Đã phát hiện giọng nói trong lượt này chưa
-    is_vad_speaking: bool = False  # VAD thời gian thực (True nếu người dùng đang nói)
-    last_speech_time: float = 0.0  # Mốc thời gian lần cuối ghi nhận giọng nói
-    turn_audio_buffer: deque[bytes] = field(default_factory=deque)  # Bộ đệm PCM cho Smart Turn
-    turn_audio_bytes: int = 0  # Dung lượng byte âm thanh hiện có trong buffer
-    stt_client: services.STTClient | None = None  # Client kết nối WebSocket tới STT
-    last_partial_text: str = ""  # Transcript tạm thời gần nhất để tránh gửi trùng
-    _smart_turn_task: asyncio.Task[Any] | None = field(default=None, repr=False)  # Task chạy suy luận Smart Turn
-
-    send_json_cb: Callable[[dict[str, Any]], Awaitable[None]] | None = None  # Callback gửi JSON/event về client
-    send_binary_cb: Callable[[bytes], Awaitable[None]] | None = None  # Callback gửi byte PCM âm thanh về client
-    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)  # Khóa chống xung đột khi ghi đồng thời vào WebSocket
-    turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)  # Khóa đồng bộ hóa vòng đời turn (start, finish, cancel)
-
-    # -------------------------------------------------------------------------
-    # Session & Audio Buffer
-    # -------------------------------------------------------------------------
     def buffer_audio(self, pcm: bytes, max_bytes: int | None = None) -> None:
         """Đệm âm thanh O(1) qua deque và xả frame cũ khi vượt giới hạn."""
         limit = max_bytes if max_bytes is not None else settings.turn_max_audio_bytes
@@ -94,14 +79,158 @@ class VoiceSession:
         while self.turn_audio_bytes > limit and self.turn_audio_buffer:
             self.turn_audio_bytes -= len(self.turn_audio_buffer.popleft())
 
-    def get_turn_audio(self) -> bytes:
+    def get_audio(self) -> bytes:
         """Nối toàn bộ các mẩu PCM trong bộ đệm thành mảng byte âm thanh hoàn chỉnh."""
         return b"".join(self.turn_audio_buffer)
 
-    def reset_audio_buffers(self) -> None:
+    def reset_audio(self) -> None:
         """Xóa sạch bộ đệm âm thanh."""
         self.turn_audio_buffer.clear()
         self.turn_audio_bytes = 0
+
+    def cancel_smart_turn(self) -> None:
+        """Hủy an toàn task Smart Turn đang chạy nếu không phải task hiện tại."""
+        if not self.smart_turn_task or self.smart_turn_task.done():
+            self.smart_turn_task = None
+            return
+        current_task = None
+        with contextlib.suppress(RuntimeError):
+            current_task = asyncio.current_task()
+        if self.smart_turn_task is not current_task:
+            self.smart_turn_task.cancel()
+        self.smart_turn_task = None
+
+    async def close(self) -> None:
+        """Đóng an toàn STT client, hủy Smart Turn và xóa bộ đệm âm thanh."""
+        self.cancel_smart_turn()
+        stt = self.stt_client
+        self.stt_client = None
+        if stt:
+            with contextlib.suppress(Exception):
+                await stt.close()
+        self.reset_audio()
+
+
+@dataclass
+class VoiceSession:
+    """Phiên tương tác thoại trực tiếp gắn liền với một kết nối WebSocket."""
+
+    session_id: str  # ID duy nhất của phiên
+    state: VoiceState = VoiceState.IDLE  # Trạng thái hiện tại của phiên
+    history: list[dict[str, str]] = field(default_factory=list)  # Lịch sử hội thoại (gửi cho LLM)
+    current_turn: TurnState | None = None  # Trạng thái của lượt thoại hiện tại
+    active_tasks: set[asyncio.Task[Any]] = field(default_factory=set)  # Tập hợp task bất đồng bộ đang chạy
+    closed: bool = False  # Cờ đánh dấu phiên đã đóng
+    _cleanup_done: bool = field(default=False, repr=False)  # Cờ đảm bảo chỉ giải phóng tài nguyên một lần
+
+    send_json_cb: Callable[[dict[str, Any]], Awaitable[None]] | None = None  # Callback gửi JSON/event về client
+    send_binary_cb: Callable[[bytes], Awaitable[None]] | None = None  # Callback gửi byte PCM âm thanh về client
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)  # Khóa chống xung đột khi ghi đồng thời vào WebSocket
+    turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)  # Khóa đồng bộ hóa vòng đời turn (start, finish, cancel)
+
+    # -------------------------------------------------------------------------
+    # Properties tương thích ngược ủy quyền sang current_turn
+    # -------------------------------------------------------------------------
+    def _ensure_turn(self) -> TurnState:
+        if self.current_turn is None:
+            self.current_turn = TurnState(turn_id=f"turn_{uuid.uuid4().hex[:8]}")
+        return self.current_turn
+
+    @property
+    def current_turn_id(self) -> str | None:
+        return self.current_turn.turn_id if self.current_turn else None
+
+    @current_turn_id.setter
+    def current_turn_id(self, val: str | None) -> None:
+        if val is None:
+            self.current_turn = None
+        elif self.current_turn:
+            self.current_turn.turn_id = val
+        else:
+            self.current_turn = TurnState(turn_id=val)
+
+    @property
+    def stt_client(self) -> services.STTClient | None:
+        return self.current_turn.stt_client if self.current_turn else None
+
+    @stt_client.setter
+    def stt_client(self, val: services.STTClient | None) -> None:
+        if val is not None or self.current_turn:
+            self._ensure_turn().stt_client = val
+
+    @property
+    def has_speech(self) -> bool:
+        return self.current_turn.has_speech if self.current_turn else False
+
+    @has_speech.setter
+    def has_speech(self, val: bool) -> None:
+        if val or self.current_turn:
+            self._ensure_turn().has_speech = val
+
+    @property
+    def is_vad_speaking(self) -> bool:
+        return self.current_turn.is_vad_speaking if self.current_turn else False
+
+    @is_vad_speaking.setter
+    def is_vad_speaking(self, val: bool) -> None:
+        if val or self.current_turn:
+            self._ensure_turn().is_vad_speaking = val
+
+    @property
+    def last_speech_time(self) -> float:
+        return self.current_turn.last_speech_time if self.current_turn else 0.0
+
+    @last_speech_time.setter
+    def last_speech_time(self, val: float) -> None:
+        self._ensure_turn().last_speech_time = val
+
+    @property
+    def last_partial_text(self) -> str:
+        return self.current_turn.last_partial_text if self.current_turn else ""
+
+    @last_partial_text.setter
+    def last_partial_text(self, val: str) -> None:
+        if val or self.current_turn:
+            self._ensure_turn().last_partial_text = val
+
+    @property
+    def turn_audio_buffer(self) -> deque[bytes]:
+        return self._ensure_turn().turn_audio_buffer
+
+    @property
+    def turn_audio_bytes(self) -> int:
+        return self.current_turn.turn_audio_bytes if self.current_turn else 0
+
+    @turn_audio_bytes.setter
+    def turn_audio_bytes(self, val: int) -> None:
+        if val or self.current_turn:
+            self._ensure_turn().turn_audio_bytes = val
+
+    @property
+    def _smart_turn_task(self) -> asyncio.Task[Any] | None:
+        return self.current_turn.smart_turn_task if self.current_turn else None
+
+    @_smart_turn_task.setter
+    def _smart_turn_task(self, val: asyncio.Task[Any] | None) -> None:
+        if val is not None or self.current_turn:
+            self._ensure_turn().smart_turn_task = val
+
+    # -------------------------------------------------------------------------
+    # Session & Audio Buffer
+    # -------------------------------------------------------------------------
+    def buffer_audio(self, pcm: bytes, max_bytes: int | None = None) -> None:
+        """Đệm âm thanh O(1) vào lượt thoại hiện tại."""
+        if self.current_turn:
+            self.current_turn.buffer_audio(pcm, max_bytes)
+
+    def get_turn_audio(self) -> bytes:
+        """Nối toàn bộ các mẩu PCM trong bộ đệm thành mảng byte âm thanh hoàn chỉnh."""
+        return self.current_turn.get_audio() if self.current_turn else b""
+
+    def reset_audio_buffers(self) -> None:
+        """Xóa sạch bộ đệm âm thanh của lượt hiện tại."""
+        if self.current_turn:
+            self.current_turn.reset_audio()
 
     async def close(self) -> None:
         """Đóng toàn bộ phiên thoại và giải phóng tài nguyên."""
@@ -109,10 +238,10 @@ class VoiceSession:
             return
         self.closed = True
         self._cleanup_done = True
-        self.current_turn_id = None
-        await self._close_stt()
+        if self.current_turn:
+            await self.current_turn.close()
+            self.current_turn = None
         await self.cancel_active_tasks()
-        self.reset_audio_buffers()
         self.history.clear()
 
     # -------------------------------------------------------------------------
@@ -257,17 +386,14 @@ class VoiceSession:
         async with self.turn_lock:
             turn_id = f"turn_{uuid.uuid4().hex[:8]}"
             await self.cancel_active_tasks()
-            self.current_turn_id = turn_id
-            self.reset_audio_buffers()
-            self.has_speech = False
-            self.is_vad_speaking = False
-            self.last_speech_time = 0.0
-            self.last_partial_text = ""
-            await self._close_stt()
+            if self.current_turn:
+                await self.current_turn.close()
+            new_turn = TurnState(turn_id=turn_id)
+            self.current_turn = new_turn
 
             try:
-                self.stt_client = await services.STTClient.connect(self.session_id, turn_id)
-                self._spawn_task(self._forward_stt_events(self.stt_client, turn_id))
+                new_turn.stt_client = await services.STTClient.connect(self.session_id, turn_id)
+                self._spawn_task(self._forward_stt_events(new_turn.stt_client, turn_id))
                 await self.set_state(VoiceState.LISTENING, force=True)
             except Exception as exc:
                 logger.exception("Lỗi khởi tạo STT turn [%s]: %s", turn_id, exc)
@@ -282,10 +408,11 @@ class VoiceSession:
             if not active_turn_id or self.state != VoiceState.LISTENING:
                 return
 
-            self._cancel_smart_turn()
-
-            stt = self.stt_client
-            self.stt_client = None
+            stt = None
+            if self.current_turn:
+                self.current_turn.cancel_smart_turn()
+                stt = self.current_turn.stt_client
+                self.current_turn.stt_client = None
 
             await self.set_state(VoiceState.THINKING)
             self._spawn_task(self._process_turn(active_turn_id, stt))
@@ -295,12 +422,12 @@ class VoiceSession:
         async with self.turn_lock:
             if self._match_turn(turn_id, allow_empty=True):
                 old_turn_id = self.current_turn_id
-                await self._close_stt()
+                if self.current_turn:
+                    await self.current_turn.close()
+                    self.current_turn = None
                 await self.cancel_active_tasks()
                 await self.emit_event("playback.stop", turn_id=old_turn_id)
                 await self.set_state(VoiceState.IDLE, force=True)
-                self.reset_audio_buffers()
-                self.current_turn_id = None
 
     # -------------------------------------------------------------------------
     # STT & Smart Turn

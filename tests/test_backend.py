@@ -17,7 +17,7 @@ from backend.text_processing import (
     normalize_text_for_tts,
     split_for_tts,
 )
-from backend.voice import VoiceSession, VoiceState
+from backend.voice import TurnState, VoiceSession, VoiceState
 
 
 # ---------------------------------------------------------------------------
@@ -1217,6 +1217,47 @@ async def test_finish_turn_ignores_stale_turn_id():
     # State không được chuyển sang THINKING, turn_2 vẫn đang LISTENING
     assert session.state == VoiceState.LISTENING
     assert session.current_turn_id == "turn_2"
+
+
+def test_turn_state_dataclass():
+    turn = TurnState(turn_id="turn_abc")
+    assert turn.turn_id == "turn_abc"
+    assert turn.has_speech is False
+    assert turn.is_vad_speaking is False
+    assert turn.last_speech_time == 0.0
+
+    # Buffer audio
+    turn.buffer_audio(b"\x00\x01" * 10)
+    assert len(turn.get_audio()) == 20
+    assert turn.turn_audio_bytes == 20
+
+    turn.reset_audio()
+    assert turn.get_audio() == b""
+    assert turn.turn_audio_bytes == 0
+
+
+@pytest.mark.anyio
+async def test_turn_state_close_releases_stt():
+    class DummySTT:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    dummy = DummySTT()
+    turn = TurnState(turn_id="turn_xyz", stt_client=dummy)  # type: ignore
+    await turn.close()
+    assert dummy.closed is True
+    assert turn.stt_client is None
+
+
+def test_new_config_fields():
+    assert isinstance(settings.app_reload, bool)
+    assert settings.stt_finish_timeout == 5.0
+    assert settings.smart_turn_threads >= 1
+    assert settings.smart_turn_max_workers >= 1
+
 
 
 

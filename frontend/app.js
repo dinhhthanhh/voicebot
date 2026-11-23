@@ -221,16 +221,9 @@ registerProcessor('mic-processor', MicProcessor);
                 } else if (m.state === "thinking" || m.state === "speaking") {
                     recording = false;
                     resetAudioInputState();
-                } else if (m.state === "error") {
+                } else if (m.state === "error" || m.state === "idle") {
                     clearAutoListenTimers();
                     recording = false;
-                } else if (m.state === "idle" && callActive && !recording && !isPlaying() && !waitAudioEndTimer && !autoListenTimer) {
-                    autoListenTimer = setTimeout(() => {
-                        autoListenTimer = null;
-                        if (callActive && !recording && (serverState === "idle" || serverState === "speaking")) {
-                            startListeningTurn();
-                        }
-                    }, 600);
                 }
                 refreshState();
                 break;
@@ -483,7 +476,6 @@ registerProcessor('mic-processor', MicProcessor);
 
     function startListeningTurn() {
         resetAudioInputState();
-        recording = true;
         sendJson({ type: "turn.start" });
         setCallButtons(true);
         refreshState();

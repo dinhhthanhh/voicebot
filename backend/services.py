@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
@@ -222,7 +223,7 @@ class STTClient:
                 break
 
     async def finish(self, timeout: float | None = None) -> str:
-        wait_timeout = timeout if timeout is not None else settings.stt_connect_timeout
+        wait_timeout = timeout if timeout is not None else settings.stt_finish_timeout
         timed_out = False
         try:
             if self.websocket and self.is_active:
@@ -496,6 +497,10 @@ class SmartTurnDetector:
         self._load_lock = threading.Lock()
         self._predict_lock = threading.Lock()
         self._attempted = False
+        self._executor = ThreadPoolExecutor(
+            max_workers=settings.smart_turn_max_workers,
+            thread_name_prefix="smart-turn-worker",
+        )
 
     def load_model(self) -> None:
         with self._load_lock:
@@ -509,7 +514,7 @@ class SmartTurnDetector:
                 so = ort.SessionOptions()
                 so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
                 so.inter_op_num_threads = 1
-                so.intra_op_num_threads = 1
+                so.intra_op_num_threads = settings.smart_turn_threads
                 so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 self.session = ort.InferenceSession(str(self.model_path), sess_options=so)
                 self.feature_extractor = WhisperFeatureExtractor(chunk_length=8)
@@ -547,7 +552,8 @@ class SmartTurnDetector:
         if self.session is None or self.feature_extractor is None or len(audio_bytes) < 3200:
             return 0.0
         try:
-            return await asyncio.to_thread(self._sync_predict, audio_bytes, sample_rate)
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(self._executor, self._sync_predict, audio_bytes, sample_rate)
         except Exception as exc:
             logger.warning(
                 "Lỗi suy luận Smart Turn (audio_len=%d): %s",

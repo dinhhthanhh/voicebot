@@ -35,6 +35,9 @@ class Settings:
     app_host: str = field(default_factory=lambda: os.getenv("APP_HOST", "127.0.0.1"))
     app_port: int = field(default_factory=lambda: int(os.getenv("APP_PORT", "8000")))
     app_log_level: str = field(default_factory=lambda: os.getenv("APP_LOG_LEVEL", "INFO"))
+    app_reload: bool = field(
+        default_factory=lambda: os.getenv("APP_RELOAD", "true").lower() in ("true", "1", "yes")
+    )
     cors_allow_origins: list[str] = field(
         default_factory=lambda: [
             o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()
@@ -73,6 +76,9 @@ class Settings:
     stt_max_retries: int = field(default_factory=lambda: int(os.getenv("STT_MAX_RETRIES", "2")))
     stt_connect_timeout: float = field(
         default_factory=lambda: float(os.getenv("STT_CONNECT_TIMEOUT", "10.0"))
+    )
+    stt_finish_timeout: float = field(
+        default_factory=lambda: float(os.getenv("STT_FINISH_TIMEOUT", "5.0"))
     )
     stt_max_duration_seconds: float = field(
         default_factory=lambda: float(os.getenv("STT_MAX_DURATION_SECONDS", "600"))
@@ -118,6 +124,12 @@ class Settings:
     )
     smart_turn_fallback_seconds: float = field(
         default_factory=lambda: float(os.getenv("SMART_TURN_FALLBACK_SECONDS", "5.0"))
+    )
+    smart_turn_threads: int = field(
+        default_factory=lambda: int(os.getenv("SMART_TURN_THREADS", "2"))
+    )
+    smart_turn_max_workers: int = field(
+        default_factory=lambda: int(os.getenv("SMART_TURN_MAX_WORKERS", "4"))
     )
 
     def validate_config(self) -> list[str]:

@@ -76,9 +76,9 @@ async def health_check():
 async def _handle_ws_message(session: VoiceSession, message: Mapping[str, Any]) -> None:
     if session.closed:
         return
-    if "text" in message:
+    if (text := message.get("text")) is not None:
         try:
-            payload = json.loads(message["text"])
+            payload = json.loads(text)
             if not isinstance(payload, dict):
                 await session.emit_event(
                     "session.error", code="INVALID_PAYLOAD", message="Payload phải là JSON object."
@@ -87,8 +87,8 @@ async def _handle_ws_message(session: VoiceSession, message: Mapping[str, Any]) 
             await session.handle_event(payload)
         except json.JSONDecodeError:
             await session.emit_event("session.error", code="INVALID_JSON", message="JSON không hợp lệ.")
-    elif "bytes" in message:
-        await session.handle_audio_frame(message["bytes"])
+    elif (pcm_bytes := message.get("bytes")) is not None:
+        await session.handle_audio_frame(pcm_bytes)
 
 
 @app.websocket("/ws/voice")
@@ -133,6 +133,6 @@ if __name__ == "__main__":
         host=settings.app_host,
         port=settings.app_port,
         log_level=settings.app_log_level.lower(),
-        reload=True,
+        reload=settings.app_reload,
         app_dir=str(_ROOT_DIR),
     )
