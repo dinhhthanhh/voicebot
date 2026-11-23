@@ -495,12 +495,15 @@ class SmartTurnDetector:
         self.session: ort.InferenceSession | None = None
         self.feature_extractor: WhisperFeatureExtractor | None = None
         self._load_lock = threading.Lock()
-        self._predict_lock = threading.Lock()
         self._attempted = False
         self._executor = ThreadPoolExecutor(
             max_workers=settings.smart_turn_max_workers,
             thread_name_prefix="smart-turn-worker",
         )
+
+    def shutdown(self) -> None:
+        """Giải phóng ThreadPoolExecutor khi ứng dụng tắt."""
+        self._executor.shutdown(wait=False)
 
     def load_model(self) -> None:
         with self._load_lock:
@@ -530,21 +533,20 @@ class SmartTurnDetector:
     def _sync_predict(self, audio_bytes: bytes, sample_rate: int = 16000) -> float:
         if self.session is None or self.feature_extractor is None:
             return 0.0
-        with self._predict_lock:
-            audio_f32 = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            max_samples = 8 * sample_rate
-            if len(audio_f32) > max_samples:
-                audio_f32 = audio_f32[-max_samples:]
-            if len(audio_f32) > 0:
-                std = np.std(audio_f32)
-                audio_f32 = (audio_f32 - np.mean(audio_f32)) / np.sqrt(std**2 + 1e-7)
-            if len(audio_f32) < max_samples:
-                audio_f32 = np.pad(audio_f32, (max_samples - len(audio_f32), 0), mode="constant")
-            inputs = self.feature_extractor(
-                audio_f32, sampling_rate=sample_rate, return_tensors="np", padding="do_not_pad", truncation=False, do_normalize=False
-            )
-            outputs = cast(list[np.ndarray], self.session.run(None, {"input_features": inputs.input_features.astype(np.float32)}))
-            return max(0.0, min(1.0, float(outputs[0][0].item())))
+        audio_f32 = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        max_samples = 8 * sample_rate
+        if len(audio_f32) > max_samples:
+            audio_f32 = audio_f32[-max_samples:]
+        if len(audio_f32) > 0:
+            std = np.std(audio_f32)
+            audio_f32 = (audio_f32 - np.mean(audio_f32)) / np.sqrt(std**2 + 1e-7)
+        if len(audio_f32) < max_samples:
+            audio_f32 = np.pad(audio_f32, (max_samples - len(audio_f32), 0), mode="constant")
+        inputs = self.feature_extractor(
+            audio_f32, sampling_rate=sample_rate, return_tensors="np", padding="do_not_pad", truncation=False, do_normalize=False
+        )
+        outputs = cast(list[np.ndarray], self.session.run(None, {"input_features": inputs.input_features.astype(np.float32)}))
+        return max(0.0, min(1.0, float(outputs[0][0].item())))
 
     async def predict(self, audio_bytes: bytes, sample_rate: int = 16000) -> float:
         if not self._attempted:

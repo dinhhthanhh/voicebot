@@ -221,8 +221,10 @@ registerProcessor('mic-processor', MicProcessor);
                 } else if (m.state === "thinking" || m.state === "speaking") {
                     recording = false;
                     resetAudioInputState();
-                } else if (m.state === "error" || m.state === "idle") {
+                } else if (m.state === "error") {
                     clearAutoListenTimers();
+                    recording = false;
+                } else if (m.state === "idle") {
                     recording = false;
                 }
                 refreshState();

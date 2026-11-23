@@ -175,16 +175,15 @@ def test_silence_timeout_logic():
     session = VoiceSession(session_id="s_test")
     assert session.is_silence_timeout() is False
 
-    session.has_speech = True
-    session.last_speech_time = 0.0
+    session.current_turn = TurnState(turn_id="turn_test", has_speech=True, last_speech_time=0.0)
     assert session.is_silence_timeout() is False
 
     # Giả lập thời gian nói cách đây lâu
-    session.last_speech_time = 1.0
+    session.current_turn.last_speech_time = 1.0
     assert session.is_silence_timeout() is True
 
     # Khi VAD đang báo người dùng nói -> tuyệt đối không timeout
-    session.is_vad_speaking = True
+    session.current_turn.is_vad_speaking = True
     assert session.is_silence_timeout() is False
 
 
@@ -232,7 +231,7 @@ def test_wav_chunk_advanced():
 
 def test_thinking_to_idle_when_empty_or_filtered():
     session = VoiceSession(session_id="test_thinking_idle")
-    session.current_turn_id = "turn_123"
+    session.current_turn = TurnState(turn_id="turn_123")
     session.state = VoiceState.THINKING
     # Kiểm tra nhánh Bug 3 trong _stream_tts_audio: nếu kết thúc mà state đang là THINKING thì chuyển về IDLE
     if session.current_turn_id == "turn_123" and not session.closed and session.state == VoiceState.THINKING:
@@ -307,7 +306,7 @@ def test_drain_queue():
 def test_smart_turn_task_lifecycle():
     session = VoiceSession(session_id="test_vad_lifecycle")
     session.state = VoiceState.LISTENING
-    session.current_turn_id = "turn_vad"
+    session.current_turn = TurnState(turn_id="turn_vad")
 
     def _step(coro):
         try:
@@ -317,26 +316,27 @@ def test_smart_turn_task_lifecycle():
 
     # speech_started: VAD bật, hủy task cũ nếu có
     _step(session._handle_vad("turn_vad", "speech_started"))
-    assert session.is_vad_speaking is True
-    assert session.has_speech is True
-    assert session._smart_turn_task is None
+    assert session.current_turn.is_vad_speaking is True
+    assert session.current_turn.has_speech is True
+    assert session.current_turn.smart_turn_task is None
 
     # speech_ended khi has_speech = False: không kích hoạt inference
-    session.has_speech = False
+    session.current_turn.has_speech = False
     _step(session._handle_vad("turn_vad", "speech_ended"))
-    assert session.is_vad_speaking is False
-    assert session._smart_turn_task is None
+    assert session.current_turn.is_vad_speaking is False
+    assert session.current_turn.smart_turn_task is None
 
 
 def test_close_session_safe_on_error():
     session = VoiceSession(session_id="sess_err_cleanup")
-    session.buffer_audio(b"\x00" * 320)
+    session.current_turn = TurnState(turn_id="turn_err")
+    session.current_turn.buffer_audio(b"\x00" * 320)
 
     class FailingSTT:
         async def close(self):
             raise RuntimeError("Network failed on close")
 
-    session.stt_client = FailingSTT()
+    session.current_turn.stt_client = FailingSTT()  # type: ignore
 
     def _step(coro):
         try:
@@ -346,8 +346,7 @@ def test_close_session_safe_on_error():
 
     _step(session.close())
     assert session.closed is True
-    assert session.turn_audio_bytes == 0
-    assert session.stt_client is None
+    assert session.current_turn is None
 
 
 def test_add_history_zero_limit():
@@ -363,15 +362,15 @@ def test_add_history_zero_limit():
 
 def test_handle_cancel_safe_when_stt_close_fails():
     session = VoiceSession(session_id="sess_cancel_test")
-    session.current_turn_id = "turn_cancel_01"
+    session.current_turn = TurnState(turn_id="turn_cancel_01")
     session.state = VoiceState.SPEAKING
-    session.buffer_audio(b"\x00" * 320)
+    session.current_turn.buffer_audio(b"\x00" * 320)
 
     class FailingSTT:
         async def close(self):
             raise RuntimeError("STT close failed")
 
-    session.stt_client = FailingSTT()
+    session.current_turn.stt_client = FailingSTT()  # type: ignore
 
     def _step(coro):
         try:
@@ -380,14 +379,13 @@ def test_handle_cancel_safe_when_stt_close_fails():
             return e.value
 
     _step(session._handle_cancel("turn_cancel_01"))
-    assert session.stt_client is None
+    assert session.current_turn is None
     assert session.state == VoiceState.IDLE
-    assert session.turn_audio_bytes == 0
 
 
 def test_pipeline_error_isolated_to_turn():
     session = VoiceSession(session_id="sess_turn_isolation")
-    session.current_turn_id = "turn_B"
+    session.current_turn = TurnState(turn_id="turn_B")
     session.state = VoiceState.LISTENING
 
     import asyncio
@@ -401,7 +399,7 @@ def test_pipeline_error_isolated_to_turn():
             return e.value
 
     # Error from old turn A must be ignored, session state must remain LISTENING
-    _step(session._handle_pipeline_error("turn_A", q, "ERR_CODE", "Error from turn A"))
+    _step(session._fail_turn("ERR_CODE", "Error from turn A", turn_id="turn_A", stop_playback=True, queue=q))
     assert session.state == VoiceState.LISTENING
     assert not q.empty()
 
@@ -505,8 +503,8 @@ def test_match_turn_strict_and_empty_handling():
     assert session._match_turn(None, allow_empty=True) is False
     assert session._match_turn(None, allow_empty=False) is False
 
-    # Khi có current_turn_id
-    session.current_turn_id = "turn_active"
+    # Khi có current_turn
+    session.current_turn = TurnState(turn_id="turn_active")
     assert session._match_turn("turn_active") is True
     assert session._match_turn("turn_old") is False
     assert session._match_turn(None, allow_empty=False) is False
@@ -517,7 +515,7 @@ def test_match_turn_strict_and_empty_handling():
 
 def test_handle_cancel_clears_current_turn_id():
     session = VoiceSession(session_id="test_cancel_id")
-    session.current_turn_id = "turn_to_cancel"
+    session.current_turn = TurnState(turn_id="turn_to_cancel")
     session.state = VoiceState.SPEAKING
 
     def _step(coro):
@@ -533,7 +531,7 @@ def test_handle_cancel_clears_current_turn_id():
 
 def test_playback_done_and_cancel_isolation():
     session = VoiceSession(session_id="test_isolation")
-    session.current_turn_id = "turn_current"
+    session.current_turn = TurnState(turn_id="turn_current")
     session.state = VoiceState.SPEAKING
 
     def _step(coro):
@@ -598,7 +596,6 @@ def test_smart_turn_logs_warning_on_exception(caplog):
 
 def test_stt_error_event_transitions_session_to_error():
     session = VoiceSession(session_id="test_stt_err")
-    session.current_turn_id = "turn_err_1"
     session.state = VoiceState.LISTENING
 
     class MockSTTWithError:
@@ -612,7 +609,7 @@ def test_stt_error_event_transitions_session_to_error():
             self.closed = True
 
     mock_stt = MockSTTWithError()
-    session.stt_client = mock_stt  # type: ignore
+    session.current_turn = TurnState(turn_id="turn_err_1", stt_client=mock_stt)  # type: ignore
 
     events_emitted = []
 
@@ -629,14 +626,13 @@ def test_stt_error_event_transitions_session_to_error():
 
     _step(session._forward_stt_events(mock_stt, "turn_err_1"))  # type: ignore
     assert session.state == VoiceState.ERROR
-    assert session.stt_client is None
+    assert session.current_turn.stt_client is None
     assert mock_stt.closed is True
     assert any(ev.get("type") == "session.error" and ev.get("code") == "AUDIO_TOO_LONG" for ev in events_emitted)
 
 
 def test_handle_audio_frame_stt_error():
     session = VoiceSession(session_id="test_stt_send_err")
-    session.current_turn_id = "turn_send_err"
     session.state = VoiceState.LISTENING
 
     class MockFailingSTT:
@@ -648,7 +644,7 @@ def test_handle_audio_frame_stt_error():
         async def close(self):
             self.is_active = False
 
-    session.stt_client = MockFailingSTT()  # type: ignore
+    session.current_turn = TurnState(turn_id="turn_send_err", stt_client=MockFailingSTT())  # type: ignore
 
     def _step(coro):
         try:
@@ -658,14 +654,14 @@ def test_handle_audio_frame_stt_error():
 
     _step(session.handle_audio_frame(b"\x00\x00" * 160))
     assert session.state == VoiceState.ERROR
-    assert session.stt_client is None
+    assert session.current_turn.stt_client is None
 
 
 def test_producer_preserves_queue_on_normal_completion():
     import asyncio
 
     session = VoiceSession(session_id="test_prod_queue")
-    session.current_turn_id = "turn_prod"
+    session.current_turn = TurnState(turn_id="turn_prod")
     session.state = VoiceState.THINKING
 
     async def fake_llm(messages):
@@ -718,15 +714,13 @@ async def test_stt_finish_timeout_raises_stt_error():
 
 def test_process_turn_stt_timeout_fallback_to_partial():
     session = VoiceSession(session_id="sess_fallback")
-    session.current_turn_id = "turn_fb"
     session.state = VoiceState.THINKING
-    session.last_partial_text = "Tôi cần gửi bưu phẩm"
 
     class TimeoutSTT:
         async def finish(self):
             raise services.STTError("Timeout STT", code="STT_TIMEOUT")
 
-    session.stt_client = TimeoutSTT()  # type: ignore
+    session.current_turn = TurnState(turn_id="turn_fb", last_partial_text="Tôi cần gửi bưu phẩm", stt_client=TimeoutSTT())  # type: ignore
 
     events = []
 
@@ -757,15 +751,13 @@ def test_process_turn_stt_timeout_fallback_to_partial():
 
 def test_process_turn_empty_transcript_responds_with_prompt():
     session = VoiceSession(session_id="sess_empty_text")
-    session.current_turn_id = "turn_empty"
     session.state = VoiceState.THINKING
-    session.last_partial_text = ""
 
     class EmptySTT:
         async def finish(self):
             return ""
 
-    session.stt_client = EmptySTT()  # type: ignore
+    session.current_turn = TurnState(turn_id="turn_empty", last_partial_text="", stt_client=EmptySTT())  # type: ignore
 
     events = []
 
@@ -798,15 +790,13 @@ def test_process_turn_empty_transcript_responds_with_prompt():
 
 def test_process_turn_stt_timeout_no_partial_transitions_to_error():
     session = VoiceSession(session_id="sess_timeout_err")
-    session.current_turn_id = "turn_to_err"
     session.state = VoiceState.THINKING
-    session.last_partial_text = ""
 
     class TimeoutSTT:
         async def finish(self):
             raise services.STTError("Timeout STT", code="STT_TIMEOUT")
 
-    session.stt_client = TimeoutSTT()  # type: ignore
+    session.current_turn = TurnState(turn_id="turn_to_err", last_partial_text="", stt_client=TimeoutSTT())  # type: ignore
 
     def _step(coro):
         try:
@@ -959,7 +949,7 @@ def test_tts_stream_odd_byte_leftover_warning_and_pad(caplog):
 # ---------------------------------------------------------------------------
 def test_produce_tts_text_order_text_done_before_sentinel():
     session = VoiceSession(session_id="test_order")
-    session.current_turn_id = "turn_order"
+    session.current_turn = TurnState(turn_id="turn_order")
     session.state = VoiceState.THINKING
 
     events_emitted = []
@@ -1041,10 +1031,11 @@ def test_stt_recv_loop_detects_clean_disconnect_without_final():
 
 def test_smart_turn_detector_predict_lock_and_finish_turn_cancels_task():
     detector = services.SmartTurnDetector()
-    assert hasattr(detector, "_predict_lock")
+    assert hasattr(detector, "_executor")
+    assert hasattr(detector, "shutdown")
 
     session = VoiceSession(session_id="test_st_cancel")
-    session.current_turn_id = "turn_st"
+    session.current_turn = TurnState(turn_id="turn_st")
     session.state = VoiceState.LISTENING
 
     cancelled = False
@@ -1057,7 +1048,7 @@ def test_smart_turn_detector_predict_lock_and_finish_turn_cancels_task():
             nonlocal cancelled
             cancelled = True
 
-    session._smart_turn_task = DummyTask()  # type: ignore
+    session.current_turn.smart_turn_task = DummyTask()  # type: ignore
     session._spawn_task = lambda coro: coro.close()  # type: ignore
 
     def _step(coro):
@@ -1068,15 +1059,15 @@ def test_smart_turn_detector_predict_lock_and_finish_turn_cancels_task():
 
     _step(session.finish_turn())
     assert cancelled is True
-    assert session._smart_turn_task is None
+    assert session.current_turn.smart_turn_task is None
     assert session.state == VoiceState.THINKING
 
 
 def test_close_session_cleans_up_even_if_closed_flag_already_set():
     session = VoiceSession(session_id="test_cleanup_after_send_fail")
     session.closed = True  # Giả lập _safe_send phát hiện lỗi và đặt closed=True trước
-    session.current_turn_id = "turn_leak_check"
-    session.buffer_audio(b"\x00" * 320)
+    session.current_turn = TurnState(turn_id="turn_leak_check")
+    session.current_turn.buffer_audio(b"\x00" * 320)
     session.history.append({"role": "user", "content": "hello"})
 
     stt_closed = False
@@ -1086,7 +1077,7 @@ def test_close_session_cleans_up_even_if_closed_flag_already_set():
             nonlocal stt_closed
             stt_closed = True
 
-    session.stt_client = MockSTT()  # type: ignore
+    session.current_turn.stt_client = MockSTT()  # type: ignore
 
     def _step(coro):
         try:
@@ -1097,19 +1088,15 @@ def test_close_session_cleans_up_even_if_closed_flag_already_set():
     # Gọi close() phải thực hiện dọn dẹp đầy đủ chứ không return sớm do self.closed == True
     _step(session.close())
     assert session._cleanup_done is True
-    assert session.current_turn_id is None
-    assert session.turn_audio_bytes == 0
+    assert session.current_turn is None
     assert len(session.history) == 0
     assert stt_closed is True
-    assert session.stt_client is None
 
 
 def test_set_state_error_resets_audio_and_smart_turn_flags():
     session = VoiceSession(session_id="test_error_state_reset")
-    session.current_turn_id = "turn_err"
+    session.current_turn = TurnState(turn_id="turn_err", has_speech=True, is_vad_speaking=True)
     session.state = VoiceState.LISTENING
-    session.has_speech = True
-    session.is_vad_speaking = True
 
     cancelled = False
 
@@ -1121,7 +1108,7 @@ def test_set_state_error_resets_audio_and_smart_turn_flags():
             nonlocal cancelled
             cancelled = True
 
-    session._smart_turn_task = DummyTask()  # type: ignore
+    session.current_turn.smart_turn_task = DummyTask()  # type: ignore
 
     def _step(coro):
         try:
@@ -1131,10 +1118,10 @@ def test_set_state_error_resets_audio_and_smart_turn_flags():
 
     _step(session.set_state(VoiceState.ERROR))
     assert session.state == VoiceState.ERROR
-    assert session.has_speech is False
-    assert session.is_vad_speaking is False
+    assert session.current_turn.has_speech is False
+    assert session.current_turn.is_vad_speaking is False
     assert cancelled is True
-    assert session._smart_turn_task is None
+    assert session.current_turn.smart_turn_task is None
     # current_turn_id vẫn được giữ lại để phục vụ nhận diện turn lỗi
     assert session.current_turn_id == "turn_err"
 
@@ -1142,14 +1129,14 @@ def test_set_state_error_resets_audio_and_smart_turn_flags():
 @pytest.mark.anyio
 async def test_smart_turn_self_cancellation_prevention():
     session = VoiceSession(session_id="test_self_cancel")
-    session.current_turn_id = "turn_sc"
+    session.current_turn = TurnState(turn_id="turn_sc")
     session.state = VoiceState.LISTENING
 
     spawned_turns = []
     session._spawn_task = lambda coro: spawned_turns.append(coro) or coro.close()  # type: ignore
 
     async def _mock_smart_turn():
-        session._smart_turn_task = asyncio.current_task()
+        session.current_turn.smart_turn_task = asyncio.current_task()
         await session.finish_turn("turn_sc")
 
     # Chạy _mock_smart_turn như 1 task
@@ -1165,7 +1152,6 @@ async def test_smart_turn_self_cancellation_prevention():
 @pytest.mark.anyio
 async def test_finish_turn_stt_client_decoupling_prevents_stealing():
     session = VoiceSession(session_id="test_stt_decouple")
-    session.current_turn_id = "turn_old"
     session.state = VoiceState.LISTENING
 
     class MockSTT:
@@ -1184,23 +1170,22 @@ async def test_finish_turn_stt_client_decoupling_prevents_stealing():
     old_stt = MockSTT("old")
     new_stt = MockSTT("new")
 
-    session.stt_client = old_stt  # type: ignore
+    session.current_turn = TurnState(turn_id="turn_old", stt_client=old_stt)  # type: ignore
 
     # finish_turn cho turn_old
     await session.finish_turn("turn_old")
-    # self.stt_client phải được gỡ bỏ khỏi session ngay lập tức
-    assert session.stt_client is None
+    # stt_client phải được gỡ bỏ khỏi turn_old ngay lập tức
+    assert session.current_turn.stt_client is None
 
     # Giả lập turn mới chen vào tạo stt_client mới
-    session.current_turn_id = "turn_new"
-    session.stt_client = new_stt  # type: ignore
+    session.current_turn = TurnState(turn_id="turn_new", stt_client=new_stt)  # type: ignore
 
     # Chạy _process_turn của turn_old (với old_stt đã được bàn giao)
     # Vì turn_old không còn là active_turn, nó phải đóng old_stt và KHÔNG đụng chạm new_stt
     await session._process_turn("turn_old", old_stt)  # type: ignore
 
     assert old_stt.closed is True
-    assert session.stt_client is new_stt
+    assert session.current_turn.stt_client is new_stt
     assert new_stt.closed is False
     assert new_stt.finished is False
 
@@ -1208,7 +1193,7 @@ async def test_finish_turn_stt_client_decoupling_prevents_stealing():
 @pytest.mark.anyio
 async def test_finish_turn_ignores_stale_turn_id():
     session = VoiceSession(session_id="test_stale_turn")
-    session.current_turn_id = "turn_2"
+    session.current_turn = TurnState(turn_id="turn_2")
     session.state = VoiceState.LISTENING
 
     # Gọi finish_turn với turn_id cũ đã hết hiệu lực

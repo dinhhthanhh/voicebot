@@ -44,6 +44,7 @@ async def lifespan(_app: FastAPI):
     await asyncio.to_thread(services.smart_turn_detector.load_model)
     yield
     logger.info("Tắt Voicebot Gateway.")
+    services.smart_turn_detector.shutdown()
     await services.close_http_client()
 
 
