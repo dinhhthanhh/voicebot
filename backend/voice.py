@@ -95,6 +95,7 @@ class VoiceSession:
             self.turn_audio_bytes -= len(self.turn_audio_buffer.popleft())
 
     def get_turn_audio(self) -> bytes:
+        """Nối toàn bộ các mẩu PCM trong bộ đệm thành mảng byte âm thanh hoàn chỉnh."""
         return b"".join(self.turn_audio_buffer)
 
     def reset_audio_buffers(self) -> None:
@@ -118,6 +119,7 @@ class VoiceSession:
     # WebSocket Communication
     # -------------------------------------------------------------------------
     async def _safe_send(self, send: Callable[[], Awaitable[None]]) -> None:
+        """Gửi dữ liệu WebSocket an toàn qua khóa chống xung đột ghi đồng thời."""
         if self.closed:
             return
         try:
@@ -134,12 +136,14 @@ class VoiceSession:
                 logger.warning("Lỗi gửi WebSocket (%s): %s", type(exc).__name__, exc)
 
     async def emit_event(self, event_type: str, **kwargs: Any) -> None:
+        """Gửi sự kiện JSON về client qua WebSocket."""
         if self.closed or not self.send_json_cb:
             return
         payload = {"type": event_type, "session_id": self.session_id, **kwargs}
         await self._safe_send(lambda: self.send_json_cb(payload))
 
     async def emit_audio_chunk(self, turn_id: str, chunk_id: int, audio_data: bytes) -> None:
+        """Gửi gói metadata JSON kèm khối byte âm thanh PCM về client để phát ra loa."""
         if self.closed or not self.send_json_cb or not self.send_binary_cb:
             return
         meta = {
@@ -160,6 +164,7 @@ class VoiceSession:
         await self._safe_send(_send)
 
     async def set_state(self, new_state: VoiceState, force: bool = False) -> None:
+        """Chuyển trạng thái phiên thoại và gửi sự kiện voice.state về client."""
         if self.state == new_state and not force:
             return
         if self.state == VoiceState.ERROR and not force:
@@ -177,6 +182,7 @@ class VoiceSession:
     # Task Management
     # -------------------------------------------------------------------------
     async def cancel_active_tasks(self) -> None:
+        """Hủy an toàn toàn bộ các tác vụ bất đồng bộ đang chạy nền trong phiên."""
         current_task = None
         with contextlib.suppress(RuntimeError):
             current_task = asyncio.current_task()
@@ -189,6 +195,7 @@ class VoiceSession:
         self._smart_turn_task = None
 
     def _spawn_task(self, target: Coroutine[Any, Any, Any] | asyncio.Task[Any]) -> asyncio.Task[Any]:
+        """Khởi tạo và quản lý task chạy nền, tự xóa khỏi active_tasks khi hoàn thành."""
         task = target if isinstance(target, asyncio.Task) else asyncio.create_task(target)
         self.active_tasks.add(task)
         task.add_done_callback(self.active_tasks.discard)
@@ -198,6 +205,7 @@ class VoiceSession:
     # Conversation History
     # -------------------------------------------------------------------------
     def add_history(self, role: str, content: str) -> None:
+        """Thêm tin nhắn vào lịch sử hội thoại và giới hạn số lượng theo cấu hình."""
         max_messages = max(0, settings.voice_max_history_pairs * 2)
         if max_messages == 0:
             self.history.clear()
@@ -207,6 +215,7 @@ class VoiceSession:
             self.history = self.history[-max_messages:]
 
     def build_messages(self) -> list[dict[str, str]]:
+        """Xây dựng danh sách tin nhắn hoàn chỉnh (kèm system prompt) để gửi cho LLM."""
         messages: list[dict[str, str]] = []
         if settings.llm_system_prompt:
             messages.append({"role": "system", "content": settings.llm_system_prompt})
@@ -234,6 +243,7 @@ class VoiceSession:
         return allow_empty
 
     async def start_turn(self) -> None:
+        """Bắt đầu một lượt thoại mới: reset bộ đệm, kết nối STT và chuyển sang LISTENING."""
         async with self.turn_lock:
             turn_id = f"turn_{uuid.uuid4().hex[:8]}"
             await self.cancel_active_tasks()
@@ -255,6 +265,7 @@ class VoiceSession:
                 await self.set_state(VoiceState.ERROR)
 
     async def finish_turn(self) -> None:
+        """Kết thúc lượt nghe: chuyển sang THINKING và kích hoạt tác vụ xử lý LLM -> TTS."""
         turn_id = self.current_turn_id
         if not turn_id or self.state != VoiceState.LISTENING:
             return
@@ -265,6 +276,7 @@ class VoiceSession:
         self._spawn_task(self._process_turn(turn_id))
 
     async def _handle_cancel(self, turn_id: str | None = None) -> None:
+        """Xử lý hủy lượt thoại: dừng phát loa, đóng STT, hủy task và đưa về IDLE."""
         if self._match_turn(turn_id, allow_empty=True):
             old_turn_id = self.current_turn_id
             await self._close_stt()
@@ -286,6 +298,7 @@ class VoiceSession:
                 await stt.close()
 
     async def _forward_stt_events(self, stt: services.STTClient, turn_id: str) -> None:
+        """Lắng nghe sự kiện từ STTClient (partial, vad, error) và chuyển tiếp về client/hệ thống."""
         try:
             async for event in stt.events():
                 if not self.is_active_turn(turn_id):
@@ -325,6 +338,7 @@ class VoiceSession:
                 await self.set_state(VoiceState.ERROR)
 
     async def _predict_and_trigger(self, turn_id: str) -> None:
+        """Chạy mô hình Smart Turn dự đoán dứt câu, nếu prob >= threshold thì gọi finish_turn()."""
         try:
             await asyncio.sleep(0.3)
             if not self.is_active_turn(turn_id) or self.is_vad_speaking:
@@ -358,6 +372,7 @@ class VoiceSession:
                 self._smart_turn_task = None
 
     async def _handle_vad(self, turn_id: str, vad_state: str) -> None:
+        """Xử lý sự kiện giọng nói (speech_started / speech_ended) để hủy hoặc kích hoạt Smart Turn."""
         if vad_state == "speech_started":
             self.is_vad_speaking, self.has_speech = True, True
             self.last_speech_time = time.monotonic()
@@ -373,6 +388,7 @@ class VoiceSession:
                 self._smart_turn_task = self._spawn_task(self._predict_and_trigger(turn_id))
 
     def is_silence_timeout(self) -> bool:
+        """Kiểm tra người dùng đã nói nhưng sau đó im lặng vượt quá thời gian fallback hay chưa."""
         if self.is_vad_speaking:
             return False
         return (
@@ -383,6 +399,7 @@ class VoiceSession:
         )
 
     async def handle_audio_frame(self, pcm_data: bytes) -> None:
+        """Xử lý frame âm thanh từ mic: đệm cho Smart Turn, stream sang STT và kiểm tra timeout im lặng."""
         if self.closed:
             return
         if len(pcm_data) % 2 != 0:
@@ -409,6 +426,7 @@ class VoiceSession:
     # LLM Producer
     # -------------------------------------------------------------------------
     async def _produce_tts_text(self, turn_id: str, queue: asyncio.Queue[str | None], user_text: str) -> None:
+        """Gọi LLM streaming sinh text, stream delta về client và tách câu nạp vào queue cho TTS."""
         streamer = TTSTextStreamer()
         chunks: list[str] = []
         sentinel_sent = False
@@ -461,6 +479,7 @@ class VoiceSession:
     # TTS Consumer
     # -------------------------------------------------------------------------
     async def _finish_speaking(self, turn_id: str, total_bytes: int) -> None:
+        """Báo audio.done về client và bật timer fallback để tự động chuyển về IDLE khi phát xong."""
         await self.emit_event("assistant.audio.done", turn_id=turn_id)
         bytes_per_sec = settings.tts_sample_rate * 2
         delay = (total_bytes / bytes_per_sec) + 1.5 if total_bytes > 0 else 1.0
@@ -473,6 +492,7 @@ class VoiceSession:
         self._spawn_task(_fallback())
 
     async def _stream_tts_audio(self, turn_id: str, queue: asyncio.Queue[str | None]) -> None:
+        """Rút câu từ queue, gọi tts_stream tạo âm thanh và stream từng chunk PCM về client."""
         chunk_id, total_bytes = 1, 0
         try:
             while True:
@@ -507,6 +527,7 @@ class VoiceSession:
             raise
 
     async def _respond_with_filler(self, turn_id: str, prompt: str) -> None:
+        """Phát câu nhắc thoại mặc định (chưa nghe rõ / đang lắng nghe) qua TTS mà không gọi LLM."""
         if not self.is_active_turn(turn_id):
             return
         await self.emit_event("assistant.text.done", turn_id=turn_id, text=prompt)
@@ -516,6 +537,7 @@ class VoiceSession:
         await self._stream_tts_audio(turn_id, queue)
 
     async def _run_turn_taskgroup(self, turn_id: str, final_text: str) -> None:
+        """Chạy song song Producer (LLM) và Consumer (TTS) qua TaskGroup và hàng đợi queue."""
         queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=8)
         try:
             async with asyncio.TaskGroup() as tg:
@@ -530,6 +552,7 @@ class VoiceSession:
     # Error Handling
     # -------------------------------------------------------------------------
     async def _handle_pipeline_error(self, turn_id: str, queue: asyncio.Queue[Any], code: str, msg: str) -> None:
+        """Xử lý lỗi pipeline: xả sạch queue, dừng phát loa, báo lỗi về client và đổi state sang ERROR."""
         if not self.is_active_turn(turn_id):
             return
         _drain_queue(queue)
@@ -538,6 +561,7 @@ class VoiceSession:
         await self.set_state(VoiceState.ERROR)
 
     async def _handle_turn_exception(self, turn_id: str, exc: Exception) -> None:
+        """Phân loại ngoại lệ trong turn, ghi log, bắn sự kiện session.error và chuyển sang ERROR."""
         if not self.is_active_turn(turn_id):
             return
         if isinstance(exc, services.STTError):
@@ -552,6 +576,7 @@ class VoiceSession:
     # Event Handling
     # -------------------------------------------------------------------------
     async def _process_turn(self, turn_id: str) -> None:
+        """Điều phối xử lý lượt thoại: chốt STT final_text, lọc từ đệm và kích hoạt pipeline LLM -> TTS."""
         try:
             final_text = ""
             if self.stt_client:
@@ -602,6 +627,7 @@ class VoiceSession:
             await self._handle_turn_exception(turn_id, exc)
 
     async def handle_event(self, event: dict[str, Any]) -> None:
+        """Điều phối và xử lý các sự kiện điều khiển nhận từ client qua WebSocket."""
         event_type = event.get("type")
         if event_type == "session.start":
             await self.emit_event("session.ready")
