@@ -145,12 +145,6 @@ button.btn-ctrl {
     margin-top: 4px;
 }
 
-pre.box {
-    font-family: ui-monospace, Consolas, monospace;
-    font-size: 14px;
-    margin: 4px 0 0 0;
-    background: #fdfdfd;
-}
 
 .placeholder-text {
     color: #888;

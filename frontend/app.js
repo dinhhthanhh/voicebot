@@ -10,7 +10,7 @@
         idle: "Rảnh",
         listening: "Đang nghe...",
         thinking: "Đang suy nghĩ...",
-        speaking: "Đang nói...",
+        speaking: "Bot đang nói...",
         error: "Lỗi hệ thống",
     };
 
@@ -73,19 +73,22 @@ class MicProcessor extends AudioWorkletProcessor {
       }
     };
   }
-  flush() {
-    if (this.fill > 0) {
-      const pcm = new ArrayBuffer(this.fill * 2);
-      const view = new DataView(pcm);
-      for (let i = 0; i < this.fill; i++) {
-        const s = Math.max(-1, Math.min(1, this.buf[i]));
-        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-      }
-      this.port.postMessage({ flushed: true, pcm }, [pcm]);
-      this.fill = 0;
-    } else {
-      this.port.postMessage({ flushed: true, pcm: null });
+  _sendPcm(flushed) {
+    if (this.fill === 0) {
+      if (flushed) this.port.postMessage({ flushed: true, pcm: null });
+      return;
     }
+    const pcm = new ArrayBuffer(this.fill * 2);
+    const view = new DataView(pcm);
+    for (let i = 0; i < this.fill; i++) {
+      const s = Math.max(-1, Math.min(1, this.buf[i]));
+      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    this.port.postMessage({ flushed, pcm }, [pcm]);
+    this.fill = 0;
+  }
+  flush() {
+    this._sendPcm(true);
   }
   process(inputs) {
     const chunk = inputs[0]?.[0];
@@ -98,14 +101,7 @@ class MicProcessor extends AudioWorkletProcessor {
       const frac = pos < 0 ? pos + 1 : pos - Math.floor(pos);
       this.buf[this.fill++] = p0 + (p1 - p0) * frac;
       if (this.fill === 1600) {
-        const pcm = new ArrayBuffer(3200);
-        const view = new DataView(pcm);
-        for (let j = 0; j < 1600; j++) {
-          const v = Math.max(-1, Math.min(1, this.buf[j]));
-          view.setInt16(j * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
-        }
-        this.port.postMessage({ flushed: false, pcm }, [pcm]);
-        this.fill = 0;
+        this._sendPcm(false);
       }
       pos += ratio;
     }
@@ -141,11 +137,6 @@ registerProcessor('mic-processor', MicProcessor);
         if (isWsOpen()) ws.send(data);
     }
 
-    function getWsEndpointUrl() {
-        const proto = location.protocol === "https:" ? "wss://" : "ws://";
-        return proto + location.host + "/ws/voice";
-    }
-
     function connect() {
         if (ws) {
             ws.onopen = null;
@@ -159,7 +150,8 @@ registerProcessor('mic-processor', MicProcessor);
         currentTurnId = null;
         pendingChunkMeta = null;
 
-        const url = getWsEndpointUrl();
+        const proto = location.protocol === "https:" ? "wss://" : "ws://";
+        const url = `${proto}${location.host}/ws/voice`;
         log(`Đang kết nối tới ${url}...`, "info");
         stateEl.textContent = "Đang kết nối...";
         connectionBadge.classList.remove("connected");
@@ -446,9 +438,9 @@ registerProcessor('mic-processor', MicProcessor);
     function refreshState() {
         btnFinish.disabled = (serverState !== "listening");
         if (!isWsOpen()) { stateEl.textContent = "Mất kết nối"; return; }
-        if (isPlaying() || serverState === "speaking") { stateEl.textContent = "Bot đang nói..."; return; }
-        if (serverState === "thinking") { stateEl.textContent = "Đang suy nghĩ..."; return; }
-        if (recording || serverState === "listening") { stateEl.textContent = "Đang nghe..."; return; }
+        if (isPlaying() || serverState === "speaking") { stateEl.textContent = STATE_LABELS.speaking; return; }
+        if (serverState === "thinking") { stateEl.textContent = STATE_LABELS.thinking; return; }
+        if (recording || serverState === "listening") { stateEl.textContent = STATE_LABELS.listening; return; }
         if (serverState === "idle" && callActive && !recording) { stateEl.textContent = "Chờ nghe tiếp..."; return; }
         stateEl.textContent = STATE_LABELS[serverState] || serverState;
     }

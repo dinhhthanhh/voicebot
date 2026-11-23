@@ -2,7 +2,7 @@
 
 Nhiệm vụ:
 - Lọc từ đệm đơn thuần (ừ, à, ờ...) để tránh gọi LLM vô ích.
-- Tách câu streaming từ LLM (SpeechFilter) cho Zero-TTS.
+- Tách câu streaming từ LLM (TTSTextStreamer) cho Zero-TTS.
 - Chuẩn hóa văn bản tiếng Việt sang lời nói tự nhiên cho TTS (ngày tháng, số tiền, đơn vị, mã).
 """
 
@@ -19,7 +19,7 @@ from backend.config import settings
 # 1. Lọc từ đệm nhận dạng giọng nói (ASR Filler Filter)
 # ---------------------------------------------------------------------------
 FILLER_WORDS = {
-    "ừ", "ừm", "ờ", "ờm", "à", "ư", "hử", "hả", "ơ", "ớ", "ể", "à mà", "ừ thì", "ờ thì",
+    "ừ", "ừm", "ờ", "ờm", "à", "ư", "hử", "hả", "ơ", "ớ", "ể",
 }
 _CLEAN_RE = re.compile(r"[^\w\s]")
 _SPACES_RE = re.compile(r"\s+")
@@ -34,7 +34,7 @@ def is_only_filler(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 2. Bộ đệm tách câu từ LLM Streaming cho TTS (SpeechFilter)
+# 2. Bộ đệm tách câu từ LLM Streaming cho TTS (TTSTextStreamer)
 # ---------------------------------------------------------------------------
 REMAINDER_NOTE = "Phần còn lại đã được hiển thị trên màn hình."
 
@@ -73,71 +73,6 @@ def clean_inline_markdown(text: str) -> str:
     s = _PREFIX_BULLET_RE.sub("", s)
     # Bước 5: Gom các khoảng trắng thừa liên tiếp thành 1 dấu cách đơn và cắt 2 đầu
     return " ".join(s.split())
-
-
-class SpeechFilter:
-    """Bộ tách câu gọn nhẹ từ luồng LLM streaming cho TTS."""
-
-    def __init__(
-        self,
-        min_chars: int | None = None,
-        max_sentences: int | None = None,
-        max_chars: int | None = None,
-    ) -> None:
-        self.min_chars = min_chars if min_chars is not None else settings.tts_min_chars
-        self.max_sentences = max_sentences if max_sentences is not None else settings.tts_max_sentences
-        self.max_chars = max_chars if max_chars is not None else settings.tts_max_chars
-        self.buf = ""
-        self.hold = ""
-        self.sent_count = 0
-        self.total_chars = 0
-        self.capped = False
-
-    def feed(self, delta: str) -> list[str]:
-        """Nạp mẩu chữ mới từ LLM, nếu gom đủ câu hoàn chỉnh (có dấu ngắt câu) thì tách và trả về danh sách câu."""
-        if self.capped:
-            return []
-        self.buf += delta
-        out: list[str] = []
-        parts = _SENT_SPLIT_RE.split(self.buf) # Quét tìm dấu ngắt câu (., !, ?, …, \n).
-        if len(parts) > 1:
-            for part in parts[:-1]:
-                self._emit(part, out)
-            self.buf = parts[-1]
-        return out
-
-    def flush(self) -> list[str]:
-        """Vét cạn bộ đệm khi LLM kết thúc: ép xuất câu cuối cùng còn dở dang và câu ngắn đang giữ trong hold."""
-        out: list[str] = []
-        if self.buf:
-            self._emit(self.buf, out, end=True)
-            self.buf = ""
-        if self.hold:
-            self._emit(self.hold, out, end=True, force=True)
-            self.hold = ""
-        return out
-
-    def _emit(self, text: str, out: list[str], end: bool = False, force: bool = False) -> None:
-        """Làm sạch Markdown, ghép nối câu ngắn (hold), kiểm tra giới hạn an toàn (capping) rồi thêm câu vào danh sách out."""
-        if self.capped:
-            return
-        cleaned = clean_inline_markdown(text) # Xóa các ký hiệu [link](url), URL, bullet points (-, *), in đậm **...
-        if not re.search(r"\w", cleaned):
-            return
-        if self.hold:
-            cleaned, self.hold = f"{self.hold} {cleaned}", ""
-        if not force and len(cleaned) < self.min_chars and not end:
-            self.hold = cleaned
-            return
-        if self.sent_count >= self.max_sentences or (
-            (self.total_chars + len(cleaned)) > self.max_chars and self.sent_count > 0
-        ):
-            self.capped, self.hold = True, ""
-            out.append(REMAINDER_NOTE)
-            return
-        self.sent_count += 1
-        self.total_chars += len(cleaned)
-        out.append(cleaned)
 
 
 # ---------------------------------------------------------------------------
@@ -272,17 +207,81 @@ def split_for_tts(text: str, limit: int | None = None) -> list[str]:
 
 
 class TTSTextStreamer:
-    """Đóng gói toàn bộ luồng xử lý văn bản thoại từ LLM đến TTS:
+    """Bộ tách câu và chuẩn hóa luồng văn bản thoại từ LLM đến TTS:
 
-    Lọc ký hiệu Markdown -> Tách câu (SpeechFilter) -> Chuẩn hóa phát âm (normalize_text_for_tts)
+    Lọc ký hiệu Markdown -> Tách câu -> Chuẩn hóa phát âm (normalize_text_for_tts)
     -> Cắt ngắn theo giới hạn TTS (split_for_tts).
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self.speech_filter = SpeechFilter(*args, **kwargs)
+    def __init__(
+        self,
+        min_chars: int | None = None,
+        max_sentences: int | None = None,
+        max_chars: int | None = None,
+    ) -> None:
+        self.min_chars = min_chars if min_chars is not None else settings.tts_min_chars
+        self.max_sentences = max_sentences if max_sentences is not None else settings.tts_max_sentences
+        self.max_chars = max_chars if max_chars is not None else settings.tts_max_chars
+        self.buf = ""
+        self.hold = ""
+        self.sent_count = 0
+        self.total_chars = 0
+        self.capped = False
+
+    def _feed_raw(self, delta: str) -> list[str]:
+        if self.capped:
+            return []
+        self.buf += delta
+        out: list[str] = []
+        parts = _SENT_SPLIT_RE.split(self.buf)
+        if len(parts) > 1:
+            for part in parts[:-1]:
+                self._emit(part, out)
+            self.buf = parts[-1]
+        return out
+
+    def flush(self) -> list[str]:
+        """Vét cạn bộ đệm khi LLM kết thúc: ép xuất câu cuối cùng còn dở dang."""
+        out: list[str] = []
+        if self.buf:
+            self._emit(self.buf, out, end=True)
+            self.buf = ""
+        if self.hold:
+            self._emit(self.hold, out, end=True, force=True)
+            self.hold = ""
+        return [
+            chunk
+            for s in out
+            for chunk in split_for_tts(normalize_text_for_tts(s))
+        ]
+
+    def _emit(self, text: str, out: list[str], end: bool = False, force: bool = False) -> None:
+        """Làm sạch Markdown, ghép nối câu ngắn (hold), kiểm tra giới hạn an toàn (capping) rồi thêm câu vào danh sách out."""
+        if self.capped:
+            return
+        cleaned = clean_inline_markdown(text)
+        if not re.search(r"\w", cleaned):
+            return
+        if self.hold:
+            cleaned, self.hold = f"{self.hold} {cleaned}", ""
+        if not force and len(cleaned) < self.min_chars and not end:
+            self.hold = cleaned
+            return
+        if self.sent_count >= self.max_sentences or (
+            (self.total_chars + len(cleaned)) > self.max_chars and self.sent_count > 0
+        ):
+            self.capped, self.hold = True, ""
+            out.append(REMAINDER_NOTE)
+            return
+        self.sent_count += 1
+        self.total_chars += len(cleaned)
+        out.append(cleaned)
 
     def feed(self, delta: str | None = None) -> list[str]:
-        raw = self.speech_filter.feed(delta) if delta is not None else self.speech_filter.flush()
+        """Nạp mẩu chữ từ LLM, nếu đủ câu thì chuẩn hóa và trả về danh sách câu cho TTS."""
+        if delta is None:
+            return self.flush()
+        raw = self._feed_raw(delta)
         return [
             chunk
             for s in raw

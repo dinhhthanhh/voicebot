@@ -11,7 +11,6 @@ from backend import services
 from backend.config import settings
 from backend.text_processing import (
     REMAINDER_NOTE,
-    SpeechFilter,
     TTSTextStreamer,
     clean_inline_markdown,
     is_only_filler,
@@ -53,22 +52,22 @@ def test_clean_inline_markdown():
     assert clean_inline_markdown("Định dạng `inline code` và ~~gạch ngang~~ xong") == "Định dạng inline code và gạch ngang xong"
 
 
-def test_speech_filter_streaming():
-    sf = SpeechFilter(max_sentences=8, max_chars=600)
+def test_tts_text_streamer_streaming():
+    streamer = TTSTextStreamer(max_sentences=8, max_chars=600)
     text = (
         "Dạ chào bạn! Tôi là trợ lý ảo VNPost. "
         "Tôi có thể hỗ trợ gì cho bạn hôm nay?"
     )
-    sentences = sf.feed(text) + sf.flush()
+    sentences = streamer.feed(text) + streamer.flush()
     joined = " ".join(sentences)
     assert "Dạ chào bạn!" in joined
     assert "Tôi là trợ lý ảo VNPost." in joined
 
 
-def test_speech_filter_capping():
-    sf = SpeechFilter(max_sentences=2, max_chars=50)
+def test_tts_text_streamer_capping():
+    streamer = TTSTextStreamer(max_sentences=2, max_chars=50)
     text = "Câu thứ nhất rất là dài. Câu thứ hai tiếp tục dài. Câu thứ ba không được đọc."
-    sentences = sf.feed(text) + sf.flush()
+    sentences = streamer.feed(text) + streamer.flush()
     assert len(sentences) == 3
     assert sentences[-1] == REMAINDER_NOTE
 
@@ -699,7 +698,8 @@ def test_producer_preserves_queue_on_normal_completion():
         services.llm_stream = original_llm
 
 
-def test_stt_finish_timeout_raises_stt_error():
+@pytest.mark.anyio
+async def test_stt_finish_timeout_raises_stt_error():
     class HangingWS:
         async def send(self, data):
             pass
@@ -708,14 +708,8 @@ def test_stt_finish_timeout_raises_stt_error():
     stt.websocket = HangingWS()  # type: ignore
     stt.is_active = True
 
-    def _step(coro):
-        try:
-            coro.send(None)
-        except StopIteration as e:
-            return e.value
-
     with pytest.raises(services.STTError) as exc_info:
-        _step(stt.finish(timeout=0.01))
+        await stt.finish(timeout=0.01)
 
     assert exc_info.value.code == "STT_TIMEOUT"
     assert stt.is_active is False
@@ -1143,6 +1137,87 @@ def test_set_state_error_resets_audio_and_smart_turn_flags():
     assert session._smart_turn_task is None
     # current_turn_id vẫn được giữ lại để phục vụ nhận diện turn lỗi
     assert session.current_turn_id == "turn_err"
+
+
+@pytest.mark.anyio
+async def test_smart_turn_self_cancellation_prevention():
+    session = VoiceSession(session_id="test_self_cancel")
+    session.current_turn_id = "turn_sc"
+    session.state = VoiceState.LISTENING
+
+    spawned_turns = []
+    session._spawn_task = lambda coro: spawned_turns.append(coro) or coro.close()  # type: ignore
+
+    async def _mock_smart_turn():
+        session._smart_turn_task = asyncio.current_task()
+        await session.finish_turn("turn_sc")
+
+    # Chạy _mock_smart_turn như 1 task
+    task = asyncio.create_task(_mock_smart_turn())
+    await task
+
+    # Task không bị CancelledError và hoàn tất thành công
+    assert task.done() and not task.cancelled()
+    assert session.state == VoiceState.THINKING
+    assert len(spawned_turns) == 1
+
+
+@pytest.mark.anyio
+async def test_finish_turn_stt_client_decoupling_prevents_stealing():
+    session = VoiceSession(session_id="test_stt_decouple")
+    session.current_turn_id = "turn_old"
+    session.state = VoiceState.LISTENING
+
+    class MockSTT:
+        def __init__(self, name):
+            self.name = name
+            self.closed = False
+            self.finished = False
+
+        async def finish(self):
+            self.finished = True
+            return f"result_{self.name}"
+
+        async def close(self):
+            self.closed = True
+
+    old_stt = MockSTT("old")
+    new_stt = MockSTT("new")
+
+    session.stt_client = old_stt  # type: ignore
+
+    # finish_turn cho turn_old
+    await session.finish_turn("turn_old")
+    # self.stt_client phải được gỡ bỏ khỏi session ngay lập tức
+    assert session.stt_client is None
+
+    # Giả lập turn mới chen vào tạo stt_client mới
+    session.current_turn_id = "turn_new"
+    session.stt_client = new_stt  # type: ignore
+
+    # Chạy _process_turn của turn_old (với old_stt đã được bàn giao)
+    # Vì turn_old không còn là active_turn, nó phải đóng old_stt và KHÔNG đụng chạm new_stt
+    await session._process_turn("turn_old", old_stt)  # type: ignore
+
+    assert old_stt.closed is True
+    assert session.stt_client is new_stt
+    assert new_stt.closed is False
+    assert new_stt.finished is False
+
+
+@pytest.mark.anyio
+async def test_finish_turn_ignores_stale_turn_id():
+    session = VoiceSession(session_id="test_stale_turn")
+    session.current_turn_id = "turn_2"
+    session.state = VoiceState.LISTENING
+
+    # Gọi finish_turn với turn_id cũ đã hết hiệu lực
+    await session.finish_turn("turn_1")
+
+    # State không được chuyển sang THINKING, turn_2 vẫn đang LISTENING
+    assert session.state == VoiceState.LISTENING
+    assert session.current_turn_id == "turn_2"
+
 
 
 

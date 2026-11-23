@@ -227,15 +227,10 @@ class STTClient:
         try:
             if self.websocket and self.is_active:
                 await self.websocket.send(json.dumps({"type": "finish"}))
-                wait_coro = self.is_done.wait()
                 try:
-                    await asyncio.wait_for(wait_coro, timeout=wait_timeout)
+                    await asyncio.wait_for(self.is_done.wait(), timeout=wait_timeout)
                 except TimeoutError:
                     timed_out = True
-                except RuntimeError:
-                    wait_coro.close()
-                    if not self.is_done.is_set():
-                        timed_out = True
             elif not self.final_text:
                 if self.error_payload:
                     err_code = self.error_payload.get("error_code") or self.error_payload.get("code") or "CONNECTION_CLOSED"
@@ -433,23 +428,17 @@ def _process_tts_chunk(
     """Tách WAV header ở chunk đầu và căn chỉnh chẵn byte 16-bit."""
     if not header_parsed:
         header_buf.extend(raw_chunk)
-        if len(header_buf) < 4:
+        data_offset = _find_wav_data_offset(header_buf)
+        if data_offset is None:
             return b"", False, leftover
-        if not header_buf.startswith(b"RIFF"):
-            raw_chunk, header_parsed = bytes(header_buf), True
+        elif data_offset == 0:
+            raw_chunk = bytes(header_buf)
             header_buf.clear()
+            header_parsed = True
         else:
-            data_offset = _find_wav_data_offset(header_buf)
-            if data_offset is None:
-                return b"", False, leftover
-            elif data_offset == 0:
-                raw_chunk = bytes(header_buf)
-                header_buf.clear()
-                header_parsed = True
-            else:
-                raw_chunk = bytes(header_buf[data_offset:])
-                header_buf.clear()
-                header_parsed = True
+            raw_chunk = bytes(header_buf[data_offset:])
+            header_buf.clear()
+            header_parsed = True
 
     if leftover:
         raw_chunk, leftover = leftover + raw_chunk, b""
@@ -537,30 +526,20 @@ class SmartTurnDetector:
         if self.session is None or self.feature_extractor is None:
             return 0.0
         with self._predict_lock:
-            try:
-                audio_f32 = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                max_samples = 8 * sample_rate
-                if len(audio_f32) > max_samples:
-                    audio_f32 = audio_f32[-max_samples:]
-                if len(audio_f32) > 0:
-                    std = np.std(audio_f32)
-                    audio_f32 = (audio_f32 - np.mean(audio_f32)) / np.sqrt(std**2 + 1e-7)
-                if len(audio_f32) < max_samples:
-                    audio_f32 = np.pad(audio_f32, (max_samples - len(audio_f32), 0), mode="constant")
-                inputs = self.feature_extractor(
-                    audio_f32, sampling_rate=sample_rate, return_tensors="np", padding="do_not_pad", truncation=False, do_normalize=False
-                )
-                outputs = cast(list[np.ndarray], self.session.run(None, {"input_features": inputs.input_features.astype(np.float32)}))
-                return max(0.0, min(1.0, float(outputs[0][0].item())))
-            except Exception as exc:
-                logger.warning(
-                    "Lỗi suy luận Smart Turn ONNX (audio_len=%d, sr=%d): %s",
-                    len(audio_bytes),
-                    sample_rate,
-                    exc,
-                    exc_info=True,
-                )
-                return 0.0
+            audio_f32 = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            max_samples = 8 * sample_rate
+            if len(audio_f32) > max_samples:
+                audio_f32 = audio_f32[-max_samples:]
+            if len(audio_f32) > 0:
+                std = np.std(audio_f32)
+                audio_f32 = (audio_f32 - np.mean(audio_f32)) / np.sqrt(std**2 + 1e-7)
+            if len(audio_f32) < max_samples:
+                audio_f32 = np.pad(audio_f32, (max_samples - len(audio_f32), 0), mode="constant")
+            inputs = self.feature_extractor(
+                audio_f32, sampling_rate=sample_rate, return_tensors="np", padding="do_not_pad", truncation=False, do_normalize=False
+            )
+            outputs = cast(list[np.ndarray], self.session.run(None, {"input_features": inputs.input_features.astype(np.float32)}))
+            return max(0.0, min(1.0, float(outputs[0][0].item())))
 
     async def predict(self, audio_bytes: bytes, sample_rate: int = 16000) -> float:
         if not self._attempted:
