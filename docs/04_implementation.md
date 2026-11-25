@@ -28,7 +28,7 @@ Việc cần làm:
 ### Bước 1 -- Khởi tạo backend và frontend [x]
 
 Backend:
-- [x] Tạo `main.py`, `voice.py`, `services.py`, `config.py`.
+- [x] Tạo `main.py`, `voice.py`, `services.py`, `text_processing.py`, `config.py`, `prompt.txt`.
 - [x] Tạo FastAPI app.
 - [x] Tạo `/ws/voice`.
 - [x] Xử lý connect/disconnect.
@@ -46,7 +46,7 @@ Frontend:
 
 ### Bước 2 -- Tích hợp STT độc lập [x]
 
-- [x] Tạo STT adapter (`STTSession`, `stt_open`, `stt_send_audio`, `stt_events`, `stt_finish`, `stt_cancel`).
+- [x] Tạo STT adapter (`STTClient`: `connect`, `send_audio`, `events`, `finish`, `close`).
 - [x] Gửi `start` trước audio.
 - [x] Chờ `ready`.
 - [x] Gửi PCM16LE mono 16 kHz.
@@ -76,7 +76,7 @@ Frontend:
 
 - [x] Xác minh format response (`audio/wav`, `48000 Hz`, `pcm_s16le` mono).
 - [x] Tạo adapter đọc HTTP stream (`services.tts_stream`).
-- [x] Bóc tách 44-byte WAV header ở chunk đầu tiên để chuyển sang raw PCM16LE mono 48 kHz.
+- [x] Phân tích RIFF/WAVE header động (`_wav_data_offset`) ở chunk đầu tiên (hỗ trợ cả header mở rộng) để chuyển sang raw PCM16LE mono 48 kHz.
 - [x] Đảm bảo căn chỉnh 16-bit (số byte chẵn cho mỗi chunk).
 - [x] Gửi từng audio chunk về frontend theo quy tắc bắt buộc: JSON metadata đi trước, binary payload liền kề ngay sau dưới `send_lock`.
 - [x] Frontend buffer và phát tuần tự qua Web Audio API không có độ trễ.
@@ -92,7 +92,7 @@ Frontend:
 - [x] Resample về 16 kHz mono (bộ lọc khử răng cưa Butterworth 4th-order).
 - [x] Chuyển Float32 sample sang PCM16LE.
 - [x] Gửi binary frames về backend.
-- [x] Nhấn dừng hoặc dứt câu → gửi `turn.finish`.
+- [x] Nhấn Gửi (`btnFinish`) hoặc Smart Turn/im lặng tự ngắt → gửi `turn.finish`.
 - [x] Chờ STT final → LLM stream → TTS stream.
 - [x] Hiển thị transcript và câu trả lời trực quan trên giao diện.
 
@@ -100,7 +100,7 @@ Frontend:
 
 ### Bước 6 -- Quản lý history và session [x]
 
-- [x] Tạo session registry trong RAM (`VoiceOrchestrator.sessions`).
+- [x] Khởi tạo `VoiceSession` độc lập theo từng kết nối WebSocket trong RAM.
 - [x] Mỗi session có history và active tasks riêng biệt.
 - [x] Chỉ commit user final và assistant response hoàn chỉnh.
 - [x] Giới hạn history 8 cặp gần nhất (`VOICE_MAX_HISTORY_PAIRS`).
@@ -114,21 +114,19 @@ Frontend:
 - [x] Giữ microphone capture liên tục cho đàm thoại thời gian thực hai chiều.
 - [x] Tích hợp STT VAD (`speech_started`, `speech_ended`).
 - [x] Buffer audio cho turn hiện tại (`turn_audio_buffer`).
-- [x] Tích hợp mô hình ONNX Smart Turn v3.2 (`services.smart_turn_predict`).
+- [x] Tích hợp mô hình ONNX Smart Turn v3.2 (`services.smart_turn_detector.predict`).
 - [x] Tự động kích hoạt đánh giá Smart Turn khi vừa dứt lời (`prob >= 0.70`).
 - [x] Tự động kết thúc lượt khi im lặng vượt ngưỡng tối đa (`smart_turn_fallback_seconds`).
 - [x] Khởi tạo lượt thoại mới tự động sau khi bot hoàn tất phát ngôn (`scheduleAutoListen`).
 
 **Điều kiện qua bước:** [x] Có thể nói nhiều câu liên tiếp mà không cần thao tác dừng thủ công; không cắt câu quá sớm.
 
-### Bước 8 -- Barge-in và ổn định [x]
+### Bước 8 -- Hủy lượt chủ động và ổn định [x]
 
-- [x] Phát hiện người dùng bắt đầu nói khi bot đang xử lý (`THINKING`) hoặc phát âm thanh (`SPEAKING`).
-- [x] Hủy tức thì các tác vụ LLM/TTS đang stream (`session.cancel_active_tasks()`).
-- [x] Gửi lệnh dừng playback khẩn cấp về client (`playback.stop`).
-- [x] Đánh dấu turn cũ bị ngắt (`VoiceState.INTERRUPTED`).
-- [x] Cấp phát `turn_id` mới và mở STT session mới ngay lập tức.
-- [x] Frontend xóa queue và dừng phát ngay khi nhận `playback.stop`.
+- [x] Cho phép người dùng bấm **Dừng nói** (`session.cancel`) khi bot đang nghe (`LISTENING`), xử lý (`THINKING`) hoặc phát âm thanh (`SPEAKING`).
+- [x] Hủy tức thì các tác vụ STT/LLM/TTS đang chạy (`session.cancel_tasks()`).
+- [x] Gửi lệnh dừng playback khẩn cấp về client (`playback.stop`) và đưa phiên về `IDLE`.
+- [x] Frontend xóa hàng đợi audio và dừng phát ngay khi hủy lượt hoặc nhận `playback.stop`.
 
 **Điều kiện qua bước:** [x] Người dùng ngắt lời thì audio cũ dừng ngay lập tức; không phát lại chunk cũ sau khi lượt mới bắt đầu.
 

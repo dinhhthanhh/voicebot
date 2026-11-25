@@ -31,6 +31,7 @@
     let onWorkletFlushed = null;
     let ttsStreamDest = null;
     let ttsAudioEl = null;
+    let aecPcs = [];
 
     // Playback scheduling
     let ttsSampleRate = DEFAULT_TTS_SR;
@@ -46,13 +47,19 @@
     const connectionText = $("connectionText");
     const stateEl = $("state");
     const errEl = $("err");
+    const buttonsRow = document.querySelector(".buttons-row");
     const btnTalk = $("btnTalk");
     const btnFinish = $("btnFinish");
     const btnStop = $("btnStop");
     const btnReset = $("btnReset");
     const youBox = $("you");
     const botBox = $("bot");
-    const setPlaceholder = (el, text) => { el.innerHTML = `<span class="placeholder-text">${text}</span>`; };
+    const DEFAULT_YOU_HINT = youBox.dataset.placeholder || "";
+    const DEFAULT_BOT_HINT = botBox.dataset.placeholder || "";
+    const setPlaceholder = (el, text) => {
+        el.textContent = "";
+        el.dataset.placeholder = text;
+    };
 
     // AudioWorklet Processor đa luồng resample 16kHz + đệm 100ms
     const WORKLET_CODE = `
@@ -96,9 +103,10 @@ class MicProcessor extends AudioWorkletProcessor {
     const ratio = sampleRate / 16000;
     let pos = this.resamplePhase;
     while (pos < chunk.length - 1) {
-      const p0 = pos < 0 ? (this.resamplePrevSample ?? chunk[0]) : chunk[Math.floor(pos)];
-      const p1 = pos < 0 ? chunk[0] : chunk[Math.floor(pos) + 1];
-      const frac = pos < 0 ? pos + 1 : pos - Math.floor(pos);
+      const idx = Math.floor(pos);
+      const p0 = pos < 0 ? (this.resamplePrevSample ?? chunk[0]) : chunk[idx];
+      const p1 = pos < 0 ? chunk[0] : chunk[idx + 1];
+      const frac = pos < 0 ? pos + 1 : pos - idx;
       this.buf[this.fill++] = p0 + (p1 - p0) * frac;
       if (this.fill === 1600) {
         this._sendPcm(false);
@@ -133,10 +141,6 @@ registerProcessor('mic-processor', MicProcessor);
         }
     }
 
-    function sendBinary(data) {
-        if (isWsOpen()) ws.send(data);
-    }
-
     function connect() {
         if (ws) {
             ws.onopen = null;
@@ -149,6 +153,8 @@ registerProcessor('mic-processor', MicProcessor);
 
         currentTurnId = null;
         pendingChunkMeta = null;
+        serverState = "idle";
+        discarding = false;
 
         const proto = location.protocol === "https:" ? "wss://" : "ws://";
         const url = `${proto}${location.host}/ws/voice`;
@@ -209,7 +215,8 @@ registerProcessor('mic-processor', MicProcessor);
             case "session.ready":
                 refreshState();
                 break;
-            case "voice.state":
+            case "voice.state": {
+                const prevState = serverState;
                 serverState = m.state;
                 if (m.turn_id) {
                     currentTurnId = m.turn_id;
@@ -226,9 +233,14 @@ registerProcessor('mic-processor', MicProcessor);
                     recording = false;
                 } else if (m.state === "idle") {
                     recording = false;
+                    // Nếu TTS không phát âm thanh (không có assistant.audio.done), tự mở lại lượt nghe tiếp
+                    if (prevState === "thinking" && !isPlaying() && !waitAudioEndTimer) {
+                        queueNextTurn();
+                    }
                 }
                 refreshState();
                 break;
+            }
             case "transcript.partial":
                 if (isMatchTurn) youBox.textContent = m.text || "";
                 break;
@@ -244,7 +256,6 @@ registerProcessor('mic-processor', MicProcessor);
                 break;
             case "assistant.text.delta":
                 if (isMatchTurn) {
-                    if (botBox.querySelector(".placeholder-text")) botBox.textContent = "";
                     let delta = m.text || "";
                     if (!botBox.textContent) delta = delta.replace(/^[\r\n\s]+/, "");
                     if (delta) botBox.textContent += delta;
@@ -257,6 +268,8 @@ registerProcessor('mic-processor', MicProcessor);
                 if (isMatchTurn) {
                     pendingChunkMeta = m;
                     if (m.sample_rate) ttsSampleRate = m.sample_rate;
+                } else {
+                    pendingChunkMeta = null;
                 }
                 break;
             case "assistant.audio.done":
@@ -274,20 +287,22 @@ registerProcessor('mic-processor', MicProcessor);
 
     async function setupAecLoopback() {
         if (ttsAudioEl || !audioCtx) return;
+        let pc1 = null;
+        let pc2 = null;
         try {
             ttsStreamDest = audioCtx.createMediaStreamDestination();
-            const pc1 = new RTCPeerConnection();
-            const pc2 = new RTCPeerConnection();
+            pc1 = new RTCPeerConnection();
+            pc2 = new RTCPeerConnection();
 
             pc1.onicecandidate = (e) => e.candidate && pc2.addIceCandidate(e.candidate);
             pc2.onicecandidate = (e) => e.candidate && pc1.addIceCandidate(e.candidate);
 
-            ttsAudioEl = document.createElement("audio");
-            ttsAudioEl.autoplay = true;
+            const audioEl = document.createElement("audio");
+            audioEl.autoplay = true;
 
             pc2.ontrack = (e) => {
-                ttsAudioEl.srcObject = e.streams[0];
-                ttsAudioEl.play().catch(() => { });
+                audioEl.srcObject = e.streams[0];
+                audioEl.play().catch(() => { });
             };
 
             ttsStreamDest.stream.getTracks().forEach((track) => pc1.addTrack(track, ttsStreamDest.stream));
@@ -299,14 +314,19 @@ registerProcessor('mic-processor', MicProcessor);
             const answer = await pc2.createAnswer();
             await pc2.setLocalDescription(answer);
             await pc1.setRemoteDescription(answer);
+            aecPcs = [pc1, pc2];
+            ttsAudioEl = audioEl;
         } catch (e) {
             console.warn("Không thể khởi tạo AEC loopback, dùng audioCtx.destination dự phòng:", e);
+            try { pc1?.close(); } catch (_) { }
+            try { pc2?.close(); } catch (_) { }
             ttsStreamDest = null;
+            ttsAudioEl = null;
         }
     }
 
     async function ensureAudio() {
-        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (!audioCtx) audioCtx = new AudioContext();
         if (audioCtx.state === "suspended") await audioCtx.resume();
         await setupAecLoopback();
         if (!micStream) {
@@ -348,9 +368,10 @@ registerProcessor('mic-processor', MicProcessor);
                 const { flushed, pcm } = e.data || {};
                 if (
                     pcm &&
+                    isWsOpen() &&
                     (flushed || (callActive && recording && !isBotBusy()))
                 ) {
-                    sendBinary(pcm);
+                    ws.send(pcm);
                 }
                 if (flushed && typeof onWorkletFlushed === "function") {
                     const cb = onWorkletFlushed;
@@ -387,8 +408,9 @@ registerProcessor('mic-processor', MicProcessor);
     }
 
     function playPcm(arrayBuf) {
-        if (!audioCtx || discarding || !arrayBuf || arrayBuf.byteLength < 2) return;
-        const i16 = new Int16Array(arrayBuf);
+        const evenLen = arrayBuf ? arrayBuf.byteLength & ~1 : 0;
+        if (!audioCtx || discarding || evenLen < 2) return;
+        const i16 = new Int16Array(arrayBuf, 0, evenLen / 2);
         const audioBuf = audioCtx.createBuffer(1, i16.length, ttsSampleRate);
         const channelData = audioBuf.getChannelData(0);
         for (let i = 0; i < i16.length; i++) channelData[i] = i16[i] / 32768;
@@ -412,6 +434,7 @@ registerProcessor('mic-processor', MicProcessor);
 
     function stopPlayback() {
         clearAutoListenTimers();
+        pendingChunkMeta = null;
         for (const src of playingSources) {
             try { src.stop(); } catch (_) { }
         }
@@ -425,9 +448,7 @@ registerProcessor('mic-processor', MicProcessor);
     function isBotBusy() { return serverState === "thinking" || serverState === "speaking" || isPlaying(); }
 
     function setCallButtons(inCall) {
-        btnTalk.style.display = inCall ? "none" : "inline-flex";
-        btnFinish.style.display = inCall ? "inline-flex" : "none";
-        btnStop.style.display = inCall ? "inline-flex" : "none";
+        buttonsRow?.classList.toggle("in-call", inCall);
     }
 
     function refreshState() {
@@ -445,6 +466,16 @@ registerProcessor('mic-processor', MicProcessor);
         if (autoListenTimer) { clearTimeout(autoListenTimer); autoListenTimer = null; }
     }
 
+    function queueNextTurn() {
+        if (autoListenTimer || !callActive || recording) return;
+        autoListenTimer = setTimeout(() => {
+            autoListenTimer = null;
+            if (callActive && !recording && (serverState === "idle" || serverState === "speaking")) {
+                startListeningTurn();
+            }
+        }, 600);
+    }
+
     function scheduleAutoListen() {
         recording = false;
         resetAudioInputState();
@@ -456,12 +487,7 @@ registerProcessor('mic-processor', MicProcessor);
                 if (isWsOpen() && currentTurnId) {
                     sendJson({ type: "playback.done", turn_id: currentTurnId });
                 }
-                autoListenTimer = setTimeout(() => {
-                    autoListenTimer = null;
-                    if (callActive && !recording && (serverState === "idle" || serverState === "speaking")) {
-                        startListeningTurn();
-                    }
-                }, 600);
+                queueNextTurn();
             }
         }, 100);
     }
@@ -470,13 +496,13 @@ registerProcessor('mic-processor', MicProcessor);
         onWorkletFlushed = null;
         callActive = false;
         recording = false;
-        resetAudioInputState();
         stopPlayback();
         releaseMicrophone();
         setCallButtons(false);
     }
 
     function startListeningTurn() {
+        currentTurnId = null;
         resetAudioInputState();
         sendJson({ type: "turn.start" });
         setCallButtons(true);
@@ -512,10 +538,13 @@ registerProcessor('mic-processor', MicProcessor);
     btnTalk.onclick = async () => {
         if (!isWsOpen()) return setErr("Chưa kết nối được máy chủ. Bấm Hội thoại mới.");
         if (isBotBusy()) return setErr("Bot đang nói. Vui lòng chờ hoặc bấm Dừng nói.");
+        btnTalk.disabled = true;
         try {
             await ensureAudio();
         } catch (e) {
             return setErr("Không thể truy cập microphone: " + e.message);
+        } finally {
+            btnTalk.disabled = false;
         }
         setErr("");
         setPlaceholder(youBox, "Đang nghe...");
@@ -531,11 +560,15 @@ registerProcessor('mic-processor', MicProcessor);
     };
     btnReset.onclick = () => {
         teardownCallState();
-        setPlaceholder(youBox, "Nội dung giọng nói của bạn sẽ hiển thị tại đây...");
-        setPlaceholder(botBox, "Câu trả lời từ trợ lý sẽ hiển thị tại đây...");
+        setPlaceholder(youBox, DEFAULT_YOU_HINT);
+        setPlaceholder(botBox, DEFAULT_BOT_HINT);
         setErr("");
         connect();
     };
 
+    window.addEventListener("pagehide", () => {
+        aecPcs.forEach((pc) => { try { pc.close(); } catch (_) { } });
+        aecPcs = [];
+    });
     connect();
 })();

@@ -7,7 +7,7 @@
 Xây dựng Voicebot độc lập với chatbot hiện tại. Người dùng có thể nói
 qua microphone, hệ thống nhận dạng tiếng Việt thời gian thực, gửi nội dung sang LLM và
 phát câu trả lời bằng giọng nói trực tiếp. Hệ thống tích hợp cơ chế phát hiện ngắt lượt
-tự động (Silero VAD + Smart Turn v3.2 ONNX) và hỗ trợ ngắt lời tức thì (Barge-in).
+tự động (Silero VAD + Smart Turn v3.2 ONNX) và hỗ trợ hủy lượt thoại tức thì (`session.cancel`).
 
 Kiến trúc phải cho phép thay thế từng nhà cung cấp STT/LLM/TTS mà không
 phải viết lại toàn bộ luồng hội thoại.
@@ -16,13 +16,13 @@ phải viết lại toàn bộ luồng hội thoại.
 
 ``` mermaid
 flowchart TB
-    FE["Frontend Demo<br/>index.html / style.css / app.js"]
-    GW["main.py<br/>FastAPI + WebSocket Gateway"]
-    ORCH["voice.py<br/>Session / Turn Orchestrator"]
-    NLP["text_processing.py<br/>SpeechFilter & TTS Normalizer"]
-    ADAPTER["services.py<br/>STT / LLM / TTS / Smart Turn adapters"]
-    CFG["config.py<br/>Settings"]
-    STT["Qwen3-ASR WebSocket<br/>Silero VAD tích hợp"]
+    FE["Frontend Demo\nindex.html / style.css / app.js"]
+    GW["main.py\nFastAPI + WebSocket Gateway"]
+    ORCH["voice.py\nSession / Turn Orchestrator"]
+    NLP["text_processing.py\nTTSStreamer & TTS Normalizer"]
+    ADAPTER["services.py\nSTT / LLM / TTS / Smart Turn adapters"]
+    CFG["config.py\nSettings"]
+    STT["Qwen3-ASR WebSocket\nSilero VAD tích hợp"]
     LLM["Qwen 27B Chat Completions"]
     TTS["ZeroTTS HTTP Chunked Streaming"]
     TURN["Smart Turn v3.2"]
@@ -60,8 +60,8 @@ flowchart TD
 
     %% turn.start
     Switch -- "turn.start" --> StartTurn["start_turn()"]
-    StartTurn --> ST1["1. Sinh turn_id mới\n2. reset_audio_buffers()"]
-    ST1 --> ST2["3. STTClient.connect()\n4. Bật ngầm _forward_stt_events"]
+    StartTurn --> ST1["1. Sinh turn_id mới\n2. Dọn turn cũ"]
+    ST1 --> ST2["3. STTClient.connect()\n4. Bật ngầm _forward_stt"]
     ST2 --> ST3["5. set_state(LISTENING)\n(Sẵn sàng nhận tiếng nói)"]
 
     %% turn.finish
@@ -74,7 +74,7 @@ flowchart TD
     PlaybackDone --> SetIdle["set_state(IDLE)\n(Mở đường cho lượt nói tiếp theo)"]
 
     %% session.cancel
-    Switch -- "session.cancel" --> Cancel["_handle_cancel()"]
+    Switch -- "session.cancel" --> Cancel["cancel_turn()"]
     Cancel --> Can1["Hủy mọi task, đóng STT\nemit_event('playback.stop')\nset_state(IDLE)"]
 ```
 
@@ -111,7 +111,7 @@ Sau khi STT Server nhận được âm thanh từ Luồng B, mô hình AI bên t
 flowchart TD
     STTServer["STT Server (Qwen3-ASR + Silero VAD)"] -- "Gửi gói tin JSON" --> RecvLoop["_recv_loop() (services.py)"]
     RecvLoop --> Queue["stt_client.event_queue"]
-    Queue --> Forward["_forward_stt_events() (voice.py)"]
+    Queue --> Forward["_forward_stt() (voice.py)"]
 
     Forward --> EventType{"Loại sự kiện STT?"}
 
@@ -122,10 +122,10 @@ flowchart TD
     EventType -- "type == 'vad'" --> HandleVAD["_handle_vad(turn_id, state)"]
     HandleVAD --> VADState{"state là gì?"}
 
-    VADState -- "'speech_started'\n(Đang nói)" --> CancelST["Hủy _smart_turn_task đang chờ (nếu có)\nĐánh dấu is_vad_speaking = True"]
+    VADState -- "'speech_started'\n(Đang nói)" --> CancelST["Hủy smart_turn_task đang chờ (nếu có)\nĐánh dấu is_vad_speaking = True"]
 
-    VADState -- "'speech_ended'\n(Vừa ngừng nói)" --> TriggerST["_predict_and_trigger()"]
-    TriggerST --> PullAudio["get_turn_audio()\n(Rút toàn bộ audio đã tích lũy ở Kho Luồng B)"]
+    VADState -- "'speech_ended'\n(Vừa ngừng nói)" --> TriggerST["_run_smart_turn()"]
+    TriggerST --> PullAudio["get_audio()\n(Rút toàn bộ audio đã tích lũy ở Kho Luồng B)"]
     PullAudio --> STModel["smart_turn_detector.predict(audio)"]
     STModel -- "prob >= 0.70\n(AI tự tin dứt câu)" --> FinishSmartTurn["finish_turn()\n(Chuyển sang trả lời)"]
     STModel -- "prob < 0.70\n(Ngập ngừng)" --> WaitMore["Tiếp tục giữ LISTENING để nghe tiếp"]
@@ -141,14 +141,14 @@ Khi lượt nghe kết thúc (`finish_turn`), toàn bộ câu nói được ch�
 flowchart TD
     FT["finish_turn()"] --> PT["_process_turn(turn_id)"]
     PT --> STTFinish["1. stt.finish() chốt final_text\n2. emit_event('transcript.final')"]
-    STTFinish --> TG["3. _run_turn_taskgroup(turn_id, final_text)"]
+    STTFinish --> TG["3. _run_pipeline(turn_id, final_text)"]
 
     subgraph Pipeline["Đường ống Producer - Consumer song song (TaskGroup)"]
         TG --> Q["asyncio.Queue (maxsize=8)"]
-        TG --> Producer["Producer: _produce_tts_text()"]
-        TG --> Consumer["Consumer: _stream_tts_audio()"]
+        TG --> Producer["Producer: _produce_llm()"]
+        TG --> Consumer["Consumer: _stream_tts()"]
 
-        Producer -- "1. LLM Stream sinh text\n2. TTSTextStreamer tách câu &\nchuẩn hóa SĐT, ngày tháng" --> Q
+        Producer -- "1. LLM Stream sinh text\n2. TTSStreamer tách câu &\nchuẩn hóa SĐT, ngày tháng" --> Q
         Q -- "3. Rút câu hoàn chỉnh (sentence)" --> Consumer
         Consumer -- "4. tts_stream(sentence)\n(Gọt WAV header & căn chẵn 16-bit)" --> EmitChunk["emit_audio_chunk()"]
     end
@@ -173,8 +173,8 @@ thời điểm kết thúc lượt nói. - Quản lý lịch sử hội thoại 
 
 **Chịu trách nhiệm** - Tạo, quản lý và đóng session. - Duy trì state và
 history trong RAM. - Điều phối STT → LLM → TTS. - Kết hợp VAD event từ STT
-với Smart Turn v3.2 để tự động phát hiện dứt câu. - Quản lý ngắt lời (Barge-in)
-và hủy tác vụ an toàn khi người dùng nói đè. - Kiểm tra `session_id`/`turn_id` để
+với Smart Turn v3.2 để tự động phát hiện dứt câu. - Quản lý hủy lượt thoại
+(`session.cancel`) và dọn dẹp tác vụ an toàn. - Kiểm tra `session_id`/`turn_id` để
 loại bỏ kết quả cũ.
 
 **Không chịu trách nhiệm** - Tự xây dựng HTTP request cụ thể cho từng
@@ -191,14 +191,19 @@ class STTClient:
     async def connect(cls, session_id: str, turn_id: str) -> STTClient: ...
     async def send_audio(self, pcm_bytes: bytes) -> None: ...
     async def events(self) -> AsyncIterator[dict[str, Any]]: ...
-    async def finish(self, timeout: float = 10.0) -> str: ...
+    async def finish(self, timeout: float | None = None) -> str: ...
     async def close(self) -> None: ...
 
-async def llm_stream(messages: list[dict[str, str]]) -> AsyncIterator[str]: ...
+async def llm_stream(messages: list[dict[str, str]], timeout: float | None = None) -> AsyncIterator[str]: ...
 
-async def tts_stream(text: str, voice: str | None = None) -> AsyncIterator[TTSAudioChunk]: ...
+async def tts_stream(text: str, voice: str | None = None, timeout: float | None = None) -> AsyncIterator[bytes]: ...
 
-async def smart_turn_predict(audio_data: bytes) -> float: ...
+class SmartTurnDetector:
+    def load_model(self) -> None: ...
+    @property
+    def is_ready(self) -> bool: ...
+    async def predict(self, audio_bytes: bytes, sample_rate: int = 16000) -> float: ...
+    def shutdown(self) -> None: ...
 ```
 
 Adapter cần: - Quản lý kết nối, timeout và parse response. - Chuẩn hóa
@@ -212,12 +217,12 @@ Không quyết định state của Voicebot.
 -   Cung cấp settings cho các file còn lại.
 -   Không ghi secret vào log.
 
-### 3.5 `text_processing.py` -- Text Processing & SpeechFilter
+### 3.5 `text_processing.py` -- Text Processing & `TTSStreamer`
 
--   Lọc từ đệm đơn thuần (`is_only_filler`) để tránh gọi LLM khi người dùng chỉ ngập ngừng (ừ, à, ờ...).
--   Làm sạch văn bản (`clean_inline_markdown`): bóc tách code block, KaTeX, Markdown link, URL, ký hiệu Markdown và bullet points.
--   Tách câu thời gian thực từ luồng LLM streaming (`SpeechFilter`) cho Zero-TTS kèm cơ chế capping an toàn tối đa 8 câu hoặc 600 ký tự.
--   Chuẩn hóa văn bản tiếng Việt sang ngữ điệu đọc tự nhiên cho TTS (`normalize_text_for_tts`: số điện thoại, tổng đài 1900/1800, ngày tháng `DD/MM/YYYY`, tiền tệ, số thập phân, đơn vị đo lường, từ công nghệ 5G/24h, mã vận đơn).
+-   Lọc từ đệm đơn thuần (`is_filler`) để tránh gọi LLM khi người dùng chỉ ngập ngừng (ừ, à, ờ...).
+-   Làm sạch văn bản (`clean_md`): giữ text từ Markdown link, loại bỏ URL, ký hiệu inline (`*`, `_`, `` ` ``, `~`, `#`) và gạch đầu dòng.
+-   Tách câu thời gian thực từ luồng LLM streaming (`TTSStreamer`) cho Zero-TTS kèm cơ chế capping an toàn tối đa 8 câu hoặc 600 ký tự.
+-   Chuẩn hóa văn bản tiếng Việt sang ngữ điệu đọc tự nhiên cho TTS (`normalize_tts`: số điện thoại, tổng đài 1900/1800, ngày tháng `DD/MM/YYYY`, tiền tệ, số thập phân, đơn vị đo lường, từ công nghệ 5G/24h, mã vận đơn).
 
 ## 4. Quản lý session
 
@@ -229,9 +234,9 @@ Cấu trúc dữ liệu logic:
 VoiceSession:
     session_id: str
     state: VoiceState
-    history: list[Message]
-    current_turn_id: str | None
-    active_tasks: set[Task]
+    history: list[dict[str, str]]
+    current_turn: TurnState | None  # cung cấp @property current_turn_id
+    active_tasks: set[asyncio.Task[Any]]
     closed: bool
 ```
 
@@ -247,12 +252,12 @@ History gồm message theo chuẩn Chat Completions:
 Quy tắc: - Chỉ lưu `transcript.final`, không lưu partial. - Chỉ lưu
 assistant response khi lượt LLM hoàn tất bình thường. - Khi assistant bị
 ngắt giữa chừng, không lưu phần trả lời chưa hoàn tất như một message
-hoàn chỉnh. - Khi session đóng, hủy task, đóng stream và xóa session
-khỏi registry RAM. - MVP không đảm bảo giữ session nếu backend restart.
+hoàn chỉnh. - Khi session đóng, hủy task, đóng STT/HTTP stream và dọn session khỏi RAM.
+- MVP không đảm bảo giữ session nếu backend restart.
 
-`MAX_HISTORY` cần được định nghĩa rõ. Đề xuất giới hạn 8 cặp
-user/assistant gần nhất, không tính system prompt. Nếu cần giới hạn
-token, bổ sung cơ chế cắt theo token ở giai đoạn tối ưu.
+`VOICE_MAX_HISTORY_PAIRS` giới hạn mặc định 8 cặp user/assistant gần nhất
+(không tính system prompt). Nếu cần giới hạn theo token, bổ sung cơ chế
+cắt theo token ở giai đoạn tối ưu.
 
 ## 5. Session, turn và request
 
@@ -272,7 +277,6 @@ Các state công khai:
 -   `listening`: đang nhận audio từ người dùng.
 -   `thinking`: đang chờ hoặc nhận LLM response.
 -   `speaking`: đang tạo/phát audio TTS.
--   `interrupted`: lượt trả lời bị người dùng ngắt.
 -   `error`: lỗi cần hiển thị.
 
 State phải được chuyển đổi tập trung trong `voice.py`, không để frontend
@@ -283,10 +287,11 @@ tự suy đoán trạng thái backend.
 Đầu vào STT theo tài liệu: - PCM signed 16-bit little-endian. - Mono. -
 16,000 Hz. - Binary frames, không Base64.
 
-Đầu ra TTS: - Tài liệu endpoint `/tts` full audio mô tả WAV, 48 kHz, PCM
-16-bit mono. - Định dạng thực tế của `/tts/stream` phải xác minh trước
-khi phát. - Chỉ chuẩn hóa audio sau khi xác định rõ chunk là WAV
-container hay PCM raw.
+Đầu ra TTS: - `/tts/stream` trả luồng WAV (RIFF/WAVE, 48 kHz, PCM 16-bit
+mono). - Adapter `services.tts_stream` duyệt chunk động qua
+`_wav_data_offset` để bóc header WAV ở gói đầu (hỗ trợ cả extended
+header) và căn chẵn bội số 2 byte bằng `_process_tts_chunk` trước khi
+stream raw PCM16LE về frontend.
 
 Frontend nên thu bằng AudioWorklet và chuyển sample rate về 16 kHz mono
 PCM16LE. Không giả định sample rate microphone luôn là 16 kHz.

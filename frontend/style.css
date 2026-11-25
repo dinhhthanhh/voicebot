@@ -79,6 +79,8 @@ h3 {
 }
 
 button.btn-ctrl {
+    display: inline-flex;
+    align-items: center;
     font-size: 15px;
     padding: 8px 18px;
     cursor: pointer;
@@ -100,7 +102,6 @@ button.btn-ctrl {
 }
 
 #btnFinish {
-    display: none;
     background: #2e7d32;
     color: #fff;
     border-color: #1b5e20;
@@ -111,7 +112,6 @@ button.btn-ctrl {
 }
 
 #btnStop {
-    display: none;
     background: #d32f2f;
     color: #fff;
     border-color: #b71c1c;
@@ -119,6 +119,17 @@ button.btn-ctrl {
 
 #btnStop:hover {
     background: #b71c1c;
+}
+
+.buttons-row.in-call #btnTalk,
+#btnFinish,
+#btnStop {
+    display: none;
+}
+
+.buttons-row.in-call #btnFinish,
+.buttons-row.in-call #btnStop {
+    display: inline-flex;
 }
 
 #btnReset {
@@ -146,20 +157,21 @@ button.btn-ctrl {
 }
 
 
-.placeholder-text {
-    color: #888;
-    font-style: italic;
-}
+    .box:empty::before {
+        content: attr(data-placeholder);
+        color: #888;
+        font-style: italic;
+    }
 
-button.btn-ctrl:disabled {
-    opacity: 0.55;
-    cursor: not-allowed;
-}
+    button.btn-ctrl:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+    }
 
-/* Error Notice */
-#err {
-    color: #d32f2f;
-    font-weight: 500;
-    min-height: 20px;
-    font-size: 14px;
-}
+    /* Error Notice */
+    #err {
+        color: #d32f2f;
+        font-weight: 500;
+        min-height: 20px;
+        font-size: 14px;
+    }

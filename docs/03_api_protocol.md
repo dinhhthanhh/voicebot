@@ -30,7 +30,7 @@ tương ứng; frontend phải đọc hai message theo cặp.
   Event              Trường chính         Ý nghĩa
   ------------------ -------------------- ---------------------------------------------
   `session.start`    --                   Khởi tạo Voice session
-  `turn.start`       `turn_id` tùy chọn   Bắt đầu lượt nói mới
+  `turn.start`       --                   Bắt đầu lượt nói mới (backend tự sinh `turn_id`)
   `turn.finish`      `turn_id` tùy chọn   Kết thúc lượt nói của người dùng
   `playback.done`    `turn_id` tùy chọn   Client đã phát hết audio, chuyển bot về idle
   `session.stop`     --                   Đóng session
@@ -57,7 +57,7 @@ mono; - PCM16LE; - 16 kHz; - frame có số byte chẵn.
 
   `assistant.text.delta`    `turn_id`, `text`       Phần text mới từ LLM
 
-  `assistant.text.done`     `turn_id`               LLM hoàn tất
+  `assistant.text.done`     `turn_id`, `text`         LLM hoàn tất toàn văn
 
   `assistant.audio.chunk`   `turn_id`, `chunk_id`,  Metadata của binary
                             audio metadata          audio tiếp theo
@@ -122,10 +122,7 @@ Event audio metadata (binary payload kế tiếp là audio chunk):
 }
 ```
 
-**Lưu ý:** `format`, `sample_rate`, `channels` ở ví dụ trên chỉ là hợp
-đồng nội bộ mục tiêu. Chỉ phát audio raw PCM nếu adapter đã xác minh và
-loại bỏ/chuẩn hóa WAV container đúng cách. Nếu stream còn WAV header
-hoặc codec khác, protocol phải mô tả chính xác format thực tế.
+**Lưu ý:** Endpoint `/tts/stream` của ZeroTTS trả dữ liệu trong container WAV (`audio/wav`). Adapter `services.tts_stream` tự động bóc RIFF/WAVE header qua `_wav_data_offset()` và căn chẵn sample 16-bit qua `_process_tts_chunk()` trước khi gửi raw `pcm_s16le` 48 kHz mono về frontend.
 
 ### 2.4 Ghép metadata và binary
 
@@ -206,111 +203,73 @@ kết thúc. 6. Chờ `final`. 7. Đóng/giải phóng client socket.
 -   Khi lỗi, server gửi `error` rồi đóng connection (1008 với lỗi nghiệp
     vụ, 1011 với lỗi nội bộ theo tài liệu).
 
-### 3.5 URL cần xác minh
+### 3.5 Endpoint thực tế đã xác minh
 
-Tài liệu API có hai cách ghi: - `API.txt`:
-`wss://ai.vnpost.vn/qwen3-asr-1p7b/`. - `streaming-asr-v1.md`: endpoint
-chuẩn là `/v1/stream` sau reverse proxy TLS; ví dụ dùng
-`wss://{domain}/v1/stream`.
+Endpoint WebSocket mặc định trong cấu hình:
 
-Phải xác nhận URL thực tế từ môi trường đang chạy trước khi đưa vào
-`.env`.
+``` text
+wss://ai.vnpost.vn/qwen3-asr-1p7b/v1/stream
+```
 
 ## 4. LLM -- Qwen 27B Chat Completions
 
-Endpoint đã có trong `API.txt`:
+Endpoint thực tế (tương thích OpenAI Chat Completions SSE):
 
 ``` text
 https://ai.vnpost.vn/vllm-qwen38-27b/v1/chat/completions
 ```
 
-Request mẫu nguồn cung cấp:
+Request payload do `services._build_llm_payload()` gửi:
 
 ``` json
 {
   "messages": [
+    {"role": "system", "content": "..."},
     {"role": "user", "content": "xin chào bạn"}
   ],
   "temperature": 0,
+  "stream": true,
   "reasoning_effort": "low"
 }
 ```
 
-API mẫu hiện chưa xác nhận: - `model` có bắt buộc không; - cách bật
-streaming; - response streaming là SSE hay dạng khác; - trường JSON nào
-chứa text delta; - có yêu cầu authorization/header riêng không.
-
-Adapter chỉ được hoàn thiện parser sau khi có response thực tế từ
-request streaming thành công. Nếu endpoint tương thích OpenAI Chat
-Completions, kiểm tra `stream: true` và format chunk thực tế; không mặc
-định parser nếu chưa thử.
+Trường `model` được đính kèm nếu `LLM_MODEL` khác rỗng. Adapter `services.llm_stream()` đọc từng dòng `data:` chuẩn SSE, gọi `_parse_sse_delta()` để tách `choices[0].delta.content` (bỏ qua `reasoning_content`) và dừng tại `[DONE]`.
 
 ## 5. TTS -- ZeroTTS
 
-Base URL từ Postman collection:
+Base URL và endpoint streaming đang dùng:
 
 ``` text
-https://ai.vnpost.vn/zero-tts
+POST https://ai.vnpost.vn/zero-tts/tts/stream
 ```
 
-Streaming endpoint:
-
-``` text
-POST /tts/stream
-```
-
-Voice mẫu: `maichi`.
-
-Request body mẫu:
+Request body do `services.tts_stream()` gửi:
 
 ``` json
 {
   "text": "Xin chào, tôi có thể giúp gì cho bạn?",
-  "voice": "maichi",
-  "cfg_scale": 1.0,
-  "audio_temperature": 0.8,
-  "text_temperature": 1.0,
-  "audio_topk": 25,
-  "audio_topp": 0.95,
-  "audio_repetition_penalty": 1.2,
-  "min_frames": 4,
-  "max_frames": 1500
+  "voice": "maichi"
 }
 ```
 
-Postman collection mô tả HTTP Chunked Streaming, WAV chunks và audio bắt
-đầu có thể từ khoảng 0.3 giây. Endpoint `/tts` full audio được mô tả trả
-`audio/wav`, 48 kHz, PCM16 mono. Không được suy diễn cấu trúc chunk của
-`/tts/stream` từ endpoint `/tts`.
-
-Trước khi phát: 1. Gọi thử `/tts/stream` với câu ngắn. 2. Lưu response
-headers và bytes đầu của stream. 3. Xác định chunk có WAV header hay
-không. 4. Xác định sample rate, channels, bit depth, codec. 5. Xác định
-cách ghép hoặc tách chunk. 6. Viết adapter chuyển về format frontend hỗ
-trợ. 7. Kiểm tra audio không bị lặp header, rè, lệch tốc độ hoặc mất
-đoạn.
+Response trả stream WAV (`48 kHz`, `pcm_s16le`, `mono`). Adapter `services.tts_stream()` bóc header RIFF/WAVE ở chunk đầu tiên qua `_wav_data_offset()` (hỗ trợ cả extended WAV chunks), giữ/ghép byte lẻ qua `_process_tts_chunk()` để đảm bảo mỗi chunk truyền về frontend đều là raw PCM 16-bit chẵn byte.
 
 ## 6. Smart Turn v3.2
 
-Smart Turn chạy ở backend; không phải endpoint STT/LLM/TTS được mô tả
-trong các tài liệu API trên.
-
-Cần xác minh trước khi implement: - package/model source và phiên bản
-chính xác; - cách load model; - sample rate và định dạng input; - độ dài
-audio đầu vào; - output schema/threshold; - thiết bị chạy CPU/GPU; -
-latency khi inference.
-
-`services.py` cung cấp adapter `smart_turn_predict(...)`; `voice.py` chỉ
-nhận kết quả dự đoán, không phụ thuộc chi tiết thư viện.
+Smart Turn v3.2 ONNX chạy cục bộ ở backend qua `services.SmartTurnDetector` (singleton `smart_turn_detector`):
+- Đường dẫn model mặc định: `models/smart-turn-v3.2-cpu.onnx` (`SMART_TURN_MODEL_PATH`).
+- Đầu vào: tối đa 8 giây PCM 16-bit 16 kHz cuối cùng, chuẩn hóa zero-mean/unit-variance, pad trái và trích xuất đặc trưng log-mel qua `WhisperFeatureExtractor(chunk_length=8)`.
+- Đầu ra: xác suất `[0.0 .. 1.0]`; `voice.py` tự động gọi `finish_turn()` khi `prob >= SMART_TURN_THRESHOLD` (`0.70`), giới hạn suy luận `3.0s` trên `ThreadPoolExecutor` riêng.
 
 ## 7. Cấu hình môi trường
 
-`.env.example` đề xuất:
+Đồng bộ với `backend/.env.example`:
 
 ``` env
 APP_HOST=127.0.0.1
 APP_PORT=8000
 APP_LOG_LEVEL=INFO
+APP_RELOAD=false
 
 LLM_CHAT_COMPLETIONS_URL=https://ai.vnpost.vn/vllm-qwen38-27b/v1/chat/completions
 LLM_MODEL=
@@ -318,23 +277,38 @@ LLM_TEMPERATURE=0
 LLM_REASONING_EFFORT=low
 LLM_TIMEOUT_SECONDS=90
 
-STT_WS_URL=
+STT_WS_URL=wss://ai.vnpost.vn/qwen3-asr-1p7b/v1/stream
 STT_MODEL=qwen3-asr-1p7b-ft
 STT_LANGUAGE=Vietnamese
 STT_SAMPLE_RATE=16000
 STT_VAD=silero
+STT_MAX_RETRIES=2
+STT_CONNECT_TIMEOUT=10.0
+STT_FINISH_TIMEOUT=5.0
+STT_MAX_DURATION_SECONDS=600
 
 TTS_BASE_URL=https://ai.vnpost.vn/zero-tts
 TTS_STREAM_PATH=/tts/stream
 TTS_VOICE=maichi
 TTS_TIMEOUT_SECONDS=90
+TTS_SAMPLE_RATE=48000
+TTS_SPLIT_LIMIT=450
+TTS_MIN_CHARS=8
+TTS_MAX_SENTENCES=8
+TTS_MAX_CHARS=600
 
 VOICE_MAX_HISTORY_PAIRS=8
+TURN_MAX_AUDIO_BYTES=256000
+
+SMART_TURN_MODEL_PATH=models/smart-turn-v3.2-cpu.onnx
+SMART_TURN_THRESHOLD=0.70
+SMART_TURN_INFERENCE_TIMEOUT_SECONDS=3.0
+SMART_TURN_FALLBACK_SECONDS=5.0
+SMART_TURN_THREADS=1
+SMART_TURN_MAX_WORKERS=2
 ```
 
-Không commit `.env`; commit `.env.example` với secret/URL nhạy cảm đã
-loại bỏ hoặc để placeholder. Tên model và STT URL để trống đến khi xác
-minh.
+Không commit `.env`; chỉ commit `backend/.env.example` không chứa thông tin nhạy cảm.
 
 ## 8. Bảo mật và vận hành
 

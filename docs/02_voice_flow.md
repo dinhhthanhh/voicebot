@@ -27,10 +27,10 @@ sequenceDiagram
     participant LLM as Qwen 27B Chat
     participant TTS as Zero-TTS Streaming
 
-    U->>FE: Bắt đầu nói (hoặc bấm "Bắt đầu nói")
+    U->>FE: Bấm "Bắt đầu nói" (hoặc tự nghe lại lượt sau)
     FE->>GW: turn.start
-    GW->>VC: _start_turn()
-    VC->>STT: WebSocket Connect + start JSON
+    GW->>VC: start_turn()
+    VC->>STT: STTClient.connect() + start JSON
     STT-->>VC: ready
     Note over VC: Chuyển trạng thái sang LISTENING
 
@@ -45,26 +45,25 @@ sequenceDiagram
     end
 
     STT-->>VC: VAD event (speech_ended)
-    VC->>TURN: smart_turn_predict(turn_audio_buffer)
+    VC->>TURN: smart_turn_detector.predict(turn.get_audio())
     TURN-->>VC: Xác suất dứt câu (prob >= 0.70)
-    Note over VC: Tự động chốt lượt (hoặc nhận turn.finish từ UI)
+    Note over VC: finish_turn() chuyển state -> THINKING (hoặc nhận turn.finish từ UI)
 
-    VC->>STT: finish JSON
+    VC->>STT: _process_turn() -> STTClient.finish()
     STT-->>VC: final transcript
     VC-->>FE: transcript.final (chốt câu hỏi)
-    Note over VC: Chuyển trạng thái sang THINKING
 
     par LLM Streaming & Dual-channel processing
-        VC->>LLM: Gửi messages kèm lịch sử hội thoại
+        VC->>LLM: _produce_llm() -> services.llm_stream(messages)
         loop Stream text deltas
             LLM-->>VC: Chunk text delta
             VC-->>FE: assistant.text.delta (Hiển thị toàn văn ngay lập tức)
-            VC->>VC: SpeechFilter tách câu & chuẩn hóa tiếng Việt
+            VC->>VC: TTSStreamer tách câu & chuẩn hóa tiếng Việt
         end
         LLM-->>VC: Kết thúc LLM stream
         VC-->>FE: assistant.text.done
     and TTS Chunked Streaming (Producer - Consumer)
-        loop Với từng câu hoàn chỉnh từ SpeechFilter
+        loop Với từng câu hoàn chỉnh từ TTSStreamer
             VC->>TTS: POST /tts/stream (văn bản đã chuẩn hóa)
             loop Stream audio chunks
                 TTS-->>VC: Chunk audio (WAV bóc header -> PCM 48 kHz)
@@ -100,48 +99,45 @@ sequenceDiagram
 
 ---
 
-## 4. Pipeline xử lý LLM Streaming và SpeechFilter TTS
+## 4. Pipeline xử lý LLM Streaming và TTSStreamer TTS
 
 Hệ thống triển khai kiến trúc **Dual-channel Streaming** độc lập giữa màn hình và kênh âm thanh:
 
 ``` mermaid
 flowchart LR
-    A["LLM Text Deltas"] --> B["Kênh hiển thị màn hình<br/>assistant.text.delta"]
-    A --> C["SpeechFilter<br/>(Lọc markdown, code, KaTeX, URL)"]
+    A["LLM Text Deltas"] --> B["Kênh hiển thị màn hình\nassistant.text.delta"]
+    A --> C["TTSStreamer\n(Lọc markdown inline, link, URL)"]
     C --> D["Tách câu theo ranh giới câu tự nhiên"]
-    D --> E["Hậu xử lý tiếng Việt<br/>normalize_text_for_tts"]
-    E --> F["Queue đệm bất đồng bộ<br/>asyncio.Queue"]
+    D --> E["Hậu xử lý tiếng Việt\nnormalize_tts"]
+    E --> F["Queue đệm bất đồng bộ\nasyncio.Queue"]
     F --> G["Zero-TTS HTTP Stream Adapter"]
-    G --> H["Bóc WAV header chunk 0<br/>Căn chỉnh byte chẵn"]
-    H --> I["Kênh âm thanh<br/>Metadata JSON + Binary Payload"]
+    G --> H["Bóc WAV header chunk 0\nCăn chỉnh byte chẵn"]
+    H --> I["Kênh âm thanh\nMetadata JSON + Binary Payload"]
 ```
 
 ### Quy tắc an toàn:
-- **Lược bỏ thành phần trực quan:** Code block, bảng Markdown, link Markdown, emoji, URL và công thức toán học được SpeechFilter lược bỏ khỏi kênh đọc, nhưng vẫn giữ đầy đủ trên kênh hiển thị màn hình.
+- **Lược bỏ thành phần trực quan:** Link Markdown, URL, ký hiệu inline (`*`, `_`, `` ` ``, `~`, `#`) và gạch đầu dòng được `TTSStreamer` làm sạch khỏi kênh đọc, nhưng vẫn giữ đầy đủ trên kênh hiển thị màn hình.
 - **Giới hạn độ dài phát âm (Capping):** Giới hạn tối đa 8 câu hoặc 600 ký tự đọc để tránh bot nói quá dài làm nghẽn hội thoại. Khi vượt ngưỡng, tự động bổ sung câu thông báo: *"Phần còn lại đã được hiển thị trên màn hình."*
 - **Chuẩn hóa tiếng Việt cho giọng đọc:** Tự động đọc đúng số ghép, tiền tệ (`VNĐ`, `đồng`), số điện thoại, ngày tháng, địa chỉ và đơn vị đo lường.
 
 ---
 
-## 5. Cơ chế ngắt lời tức thì (Barge-in)
+## 5. Cơ chế hủy lượt thoại tức thì (`session.cancel`)
 
-Khi bot đang phản hồi (trạng thái `THINKING` hoặc `SPEAKING`), do kết nối STT của lượt cũ đã đóng sau lệnh `finish`, backend không thể phụ thuộc vào VAD từ ASR server. Thay vào đó, backend trực tiếp phân tích năng lượng âm thanh hiệu dụng (RMS) trên từng frame microphone nhận được kết hợp gom đệm các frame trong giai đoạn debounce:
+Khi người dùng bấm **Dừng nói** trong lúc bot đang nghe (`LISTENING`), xử lý (`THINKING`) hoặc phát âm thanh (`SPEAKING`), client dừng loa/mic ngay và gửi `session.cancel` để hủy lượt hiện tại (`cancel_turn()`). Riêng nút **Hội thoại mới** (`btnReset`) đóng WebSocket hiện tại (kích hoạt `session.close()` xóa sạch lịch sử) và mở kết nối WebSocket mới:
 
 ``` mermaid
 flowchart TD
-    A["Người dùng nói đè khi Bot đang nói/suy nghĩ"] --> B["Backend tính RMS frame audio<br/>Gom các frame trong barge_in_frames<br/>(Debounce N frame liên tiếp đạt ngưỡng RMS)"]
-    B --> C["Hủy ngay lập tức các tác vụ LLM/TTS đang stream"]
-    C --> D["Gửi playback.stop về frontend"]
-    D --> E["Frontend dừng phát tức thì & xóa hàng đợi audio"]
-    C --> F["Đánh dấu turn cũ: INTERRUPTED"]
-    F --> G["Cấp phát turn_id mới"]
-    G --> H["Nối toàn bộ barge_in_frames gửi sang STT mới & chuyển LISTENING"]
+    A["Người dùng bấm Dừng nói / gửi session.cancel"] --> B["Frontend dừng phát & xóa AudioBufferSourceNode"]
+    B --> C["Backend nhận session.cancel"]
+    C --> D["Đóng STTClient & hủy các task LLM/TTS đang chạy"]
+    D --> E["Gửi playback.stop & chuyển state về IDLE"]
 ```
 
 ### Nguyên tắc bảo đảm:
-- **Không mất âm tiết đầu:** Toàn bộ các frame âm thanh trong thời gian debounce được lưu trong `barge_in_frames` và chuyển tiếp trọn vẹn sang STT session mới ngay khi xác nhận ngắt lời, tránh mất 120–180ms âm tiết đầu tiên của người dùng.
-- **Frontend phản hồi tức thì:** Dừng phát âm thanh và làm rỗng hàng đợi phát ngay khi nhận được `playback.stop`.
-- **Chặn rò rỉ dữ liệu cũ:** Backend kiểm tra chặt chẽ `turn_id`: mọi audio chunk hoặc text delta còn sót lại của turn cũ trên đường truyền đều bị bỏ qua, đảm bảo không có hiện tượng phát lồng tiếng cũ vào lượt mới.
+- **Frontend phản hồi tức thì:** Dừng phát âm thanh và xóa hàng đợi audio ngay khi bấm dừng hoặc nhận `playback.stop`.
+- **Chặn rò rỉ dữ liệu cũ:** Backend và frontend kiểm tra chặt chẽ `turn_id`: mọi audio chunk hoặc text delta còn sót lại của turn cũ trên đường truyền đều bị bỏ qua.
+- **Không ghi lịch sử dở dang:** Lượt bị hủy trước khi LLM hoàn tất không được lưu vào `session.history`.
 
 ---
 
@@ -159,7 +155,7 @@ flowchart TD
 ## 7. Vòng đời và dọn dẹp tài nguyên (Cleanup Lifecycle)
 
 Khi kết thúc cuộc gọi hoặc khi người dùng ngắt kết nối WebSocket:
-1. Hủy toàn bộ các tác vụ nền đang chạy (`session.cancel_active_tasks()`).
+1. Hủy toàn bộ các tác vụ nền đang chạy (`session.cancel_tasks()`).
 2. Đóng kết nối WebSocket tới STT server và giải phóng HTTP stream của TTS.
 3. Xóa bộ đệm âm thanh `turn_audio_buffer` và giải phóng cấu trúc phiên khỏi bộ nhớ RAM.
 4. Cơ chế dọn dẹp bảo đảm tính **idempotent**: thực thi an toàn nhiều lần mà không gây lỗi biệt lệ hay rò rỉ tài nguyên.

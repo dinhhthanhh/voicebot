@@ -23,7 +23,7 @@ _PROMPT_FILE = _BACKEND_DIR / "prompt.txt"
 DEFAULT_SYSTEM_PROMPT = (
     _PROMPT_FILE.read_text(encoding="utf-8")
     if _PROMPT_FILE.is_file()
-    else "Bạn là trợ lý giọng nói tiếng Việt của VNPost. Trả lời ngắn gọn dưới 3 câu."
+    else "Bạn là trợ lý giọng nói tiếng Việt của Tổng công ty Bưu điện Việt Nam (VNPost). Trả lời tự nhiên, lịch sự và ngắn gọn."
 )
 
 
@@ -36,7 +36,7 @@ class Settings:
     app_port: int = field(default_factory=lambda: int(os.getenv("APP_PORT", "8000")))
     app_log_level: str = field(default_factory=lambda: os.getenv("APP_LOG_LEVEL", "INFO"))
     app_reload: bool = field(
-        default_factory=lambda: os.getenv("APP_RELOAD", "true").lower() in ("true", "1", "yes")
+        default_factory=lambda: os.getenv("APP_RELOAD", "false").lower() in ("true", "1", "yes")
     )
     cors_allow_origins: list[str] = field(
         default_factory=lambda: [
@@ -145,6 +145,13 @@ class Settings:
                 warnings.append(f"{name} chưa được thiết lập.")
 
         rules: list[tuple[bool, str]] = [
+            (not (1 <= self.app_port <= 65535), f"APP_PORT ({self.app_port}) phải nằm trong khoảng [1, 65535]."),
+            (self.stt_sample_rate <= 0, f"STT_SAMPLE_RATE ({self.stt_sample_rate}) phải lớn hơn 0."),
+            (self.tts_sample_rate <= 0, f"TTS_SAMPLE_RATE ({self.tts_sample_rate}) phải lớn hơn 0."),
+            (self.stt_connect_timeout <= 0, f"STT_CONNECT_TIMEOUT ({self.stt_connect_timeout}) phải lớn hơn 0."),
+            (self.stt_max_duration_seconds <= 0, f"STT_MAX_DURATION_SECONDS ({self.stt_max_duration_seconds}) phải lớn hơn 0."),
+            (self.tts_min_chars < 0, f"TTS_MIN_CHARS ({self.tts_min_chars}) phải >= 0."),
+            (self.voice_max_history_pairs < 0, f"VOICE_MAX_HISTORY_PAIRS ({self.voice_max_history_pairs}) phải >= 0."),
             (not (0 < self.smart_turn_threshold <= 1.0), f"SMART_TURN_THRESHOLD ({self.smart_turn_threshold}) nên nằm trong khoảng (0, 1.0]."),
             (self.smart_turn_inference_timeout_seconds <= 0, f"SMART_TURN_INFERENCE_TIMEOUT_SECONDS ({self.smart_turn_inference_timeout_seconds}) phải lớn hơn 0."),
             (self.smart_turn_fallback_seconds <= 0, f"SMART_TURN_FALLBACK_SECONDS ({self.smart_turn_fallback_seconds}) phải lớn hơn 0."),
@@ -153,6 +160,7 @@ class Settings:
             (self.tts_split_limit < 10, f"TTS_SPLIT_LIMIT ({self.tts_split_limit}) phải >= 10."),
             (self.tts_max_sentences < 1, f"TTS_MAX_SENTENCES ({self.tts_max_sentences}) phải >= 1."),
             (self.tts_max_chars < 10, f"TTS_MAX_CHARS ({self.tts_max_chars}) phải >= 10."),
+            (self.tts_min_chars > self.tts_max_chars, f"TTS_MIN_CHARS ({self.tts_min_chars}) không nên lớn hơn TTS_MAX_CHARS ({self.tts_max_chars})."),
             (self.stt_finish_timeout <= 0, f"STT_FINISH_TIMEOUT ({self.stt_finish_timeout}) phải lớn hơn 0."),
             (self.smart_turn_threads < 1, f"SMART_TURN_THREADS ({self.smart_turn_threads}) phải >= 1."),
             (self.smart_turn_max_workers < 1, f"SMART_TURN_MAX_WORKERS ({self.smart_turn_max_workers}) phải >= 1."),

@@ -14,11 +14,9 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-_BACKEND_DIR = Path(__file__).resolve().parent
-_ROOT_DIR = _BACKEND_DIR.parent
+_ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(_ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(_ROOT_DIR))
 
@@ -65,13 +63,11 @@ app.add_middleware(
 
 
 @app.get("/health")
-async def health_check():
-    return JSONResponse(
-        {
-            "status": "ok",
-            "smart_turn_ready": services.smart_turn_detector.is_ready,
-        }
-    )
+async def health_check() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "smart_turn_ready": services.smart_turn_detector.is_ready,
+    }
 
 
 async def _handle_ws_message(session: VoiceSession, message: Mapping[str, Any]) -> None:
@@ -109,7 +105,7 @@ async def websocket_voice_endpoint(websocket: WebSocket):
     )
 
     try:
-        while True:
+        while not session.closed:
             message = await websocket.receive()
             if message.get("type") == "websocket.disconnect":
                 break
