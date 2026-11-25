@@ -125,9 +125,6 @@ class Settings:
     smart_turn_fallback_seconds: float = field(
         default_factory=lambda: float(os.getenv("SMART_TURN_FALLBACK_SECONDS", "5.0"))
     )
-    smart_turn_threads: int = field(
-        default_factory=lambda: int(os.getenv("SMART_TURN_THREADS", "1"))
-    )
     smart_turn_max_workers: int = field(
         default_factory=lambda: int(os.getenv("SMART_TURN_MAX_WORKERS", "2"))
     )
@@ -162,7 +159,6 @@ class Settings:
             (self.tts_max_chars < 10, f"TTS_MAX_CHARS ({self.tts_max_chars}) phải >= 10."),
             (self.tts_min_chars > self.tts_max_chars, f"TTS_MIN_CHARS ({self.tts_min_chars}) không nên lớn hơn TTS_MAX_CHARS ({self.tts_max_chars})."),
             (self.stt_finish_timeout <= 0, f"STT_FINISH_TIMEOUT ({self.stt_finish_timeout}) phải lớn hơn 0."),
-            (self.smart_turn_threads < 1, f"SMART_TURN_THREADS ({self.smart_turn_threads}) phải >= 1."),
             (self.smart_turn_max_workers < 1, f"SMART_TURN_MAX_WORKERS ({self.smart_turn_max_workers}) phải >= 1."),
             (self.turn_max_audio_bytes < 3200, f"TURN_MAX_AUDIO_BYTES ({self.turn_max_audio_bytes}) phải >= 3200."),
         ]

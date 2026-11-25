@@ -187,9 +187,7 @@ class STTClient:
             self.is_active = False
             self.is_done.set()
 
-            current_task = None
-            with contextlib.suppress(RuntimeError):
-                current_task = asyncio.current_task()
+            current_task = asyncio.current_task()
 
             recv_task = self.recv_task
             self.recv_task = None
@@ -532,12 +530,10 @@ class SmartTurnDetector:
                     return
                 so = ort.SessionOptions()
                 so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-                so.inter_op_num_threads = 1
-                so.intra_op_num_threads = settings.smart_turn_threads
+                so.intra_op_num_threads = 1
                 so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 session = ort.InferenceSession(str(self.model_path), sess_options=so)
                 extractor = WhisperFeatureExtractor(chunk_length=8)
-                # Chỉ commit khi cả ONNX session lẫn feature extractor đều nạp thành công
                 self.session, self.feature_extractor = session, extractor
                 logger.info("Đã nạp mô hình Smart Turn: %s", self.model_path.name)
             except Exception as exc:
@@ -545,7 +541,6 @@ class SmartTurnDetector:
                 self.feature_extractor = None
                 logger.error("Lỗi khi khởi tạo Smart Turn ONNX: %s", exc)
             finally:
-                # Đặt trong finally để luồng gọi predict() đồng thời phải chờ load xong hẳn
                 self._attempted = True
 
     def _sync_predict(self, audio_bytes: bytes, sample_rate: int = 16000) -> float:

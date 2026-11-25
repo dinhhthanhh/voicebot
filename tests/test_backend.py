@@ -24,11 +24,8 @@ from backend.voice import TurnState, VoiceSession, VoiceState, _drain_queue
 
 
 def _step(coro: Any) -> Any:
-    """Thực thi đồng bộ một coroutine không tạm dừng chờ I/O."""
-    try:
-        coro.send(None)
-    except StopIteration as e:
-        return e.value
+    """Thực thi một coroutine trong event loop thật."""
+    return asyncio.run(coro)
 
 
 def _make_wav_header(extra_chunks: bytes = b"") -> bytes:
@@ -1043,7 +1040,6 @@ async def test_turn_state_close_releases_stt():
 def test_new_config_fields():
     assert isinstance(settings.app_reload, bool)
     assert settings.stt_finish_timeout == 5.0
-    assert settings.smart_turn_threads >= 1
     assert settings.smart_turn_max_workers >= 1
 
 
@@ -1106,7 +1102,6 @@ def test_process_turn_filler_tts_error_code():
 
 
 def test_validate_config_new_rules():
-    assert settings.smart_turn_threads == 1
     assert settings.smart_turn_max_workers == 2
     orig_finish = settings.stt_finish_timeout
     try:

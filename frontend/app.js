@@ -184,7 +184,6 @@ registerProcessor('mic-processor', MicProcessor);
             connectionBadge.classList.remove("connected");
             connectionText.textContent = "Mất kết nối";
             teardownCallState();
-            stateEl.textContent = "Mất kết nối";
             setErr("Mất kết nối với máy chủ.");
         };
 
@@ -457,7 +456,7 @@ registerProcessor('mic-processor', MicProcessor);
         if (isPlaying() || serverState === "speaking") { stateEl.textContent = STATE_LABELS.speaking; return; }
         if (serverState === "thinking") { stateEl.textContent = STATE_LABELS.thinking; return; }
         if (recording || serverState === "listening") { stateEl.textContent = STATE_LABELS.listening; return; }
-        if (serverState === "idle" && callActive && !recording) { stateEl.textContent = "Chờ nghe tiếp..."; return; }
+        if (serverState === "idle" && callActive) { stateEl.textContent = "Chờ nghe tiếp..."; return; }
         stateEl.textContent = STATE_LABELS[serverState] || serverState;
     }
 
@@ -537,7 +536,6 @@ registerProcessor('mic-processor', MicProcessor);
     // Gán sự kiện điều khiển
     btnTalk.onclick = async () => {
         if (!isWsOpen()) return setErr("Chưa kết nối được máy chủ. Bấm Hội thoại mới.");
-        if (isBotBusy()) return setErr("Bot đang nói. Vui lòng chờ hoặc bấm Dừng nói.");
         btnTalk.disabled = true;
         try {
             await ensureAudio();

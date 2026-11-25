@@ -117,7 +117,6 @@ Tạo file `.env` tại thư mục `backend/` (hoặc thư mục gốc dự án)
 | `SMART_TURN_THRESHOLD`       | `0.70`                                                       | Ngưỡng xác suất kết thúc câu của mô hình Smart Turn (0.0 - 1.0)|
 | `SMART_TURN_INFERENCE_TIMEOUT_SECONDS` | `3.0`                                              | Thời gian tối đa (giây) chờ mô hình Smart Turn chạy suy luận   |
 | `SMART_TURN_FALLBACK_SECONDS`| `5.0`                                                        | Thời gian im lặng (giây) tối đa trước khi tự động kết thúc lượt|
-| `SMART_TURN_THREADS`         | `1`                                                          | Số intra-op threads cho mỗi phiên suy luận ONNX               |
 | `SMART_TURN_MAX_WORKERS`     | `2`                                                          | Số worker threads trong ThreadPool cho Smart Turn             |
 
 ---

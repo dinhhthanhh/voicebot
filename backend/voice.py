@@ -150,7 +150,7 @@ class VoiceSession:
         except (ConnectionResetError, BrokenPipeError):
             self.closed = True
         except Exception as exc:
-            if any(k in f"{type(exc).__name__}: {exc}".lower() for k in ("disconnect", "closed", "close")):
+            if any(k in f"{type(exc).__name__}: {exc}".lower() for k in ("disconnect", "close")):
                 self.closed = True
             else:
                 logger.warning("Lỗi gửi WebSocket (%s): %s", type(exc).__name__, exc)
