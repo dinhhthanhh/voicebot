@@ -456,6 +456,18 @@ def _process_tts_chunk(
     return raw_chunk, header_parsed, b""
 
 
+def _validate_tts_stream_result(
+    header_parsed: bool, header_buf: bytearray, raw_bytes: int, pcm_bytes: int
+) -> None:
+    """Kiểm tra tính hợp lệ của stream TTS sau khi đọc hết HTTP 200 body."""
+    if not header_parsed and header_buf:
+        logger.error("ZeroTTS trả về WAV header không đầy đủ (%d bytes).", len(header_buf))
+        raise TTSError("Dữ liệu âm thanh từ TTS không hợp lệ (header bị cắt cụt).", code="TTS_INVALID_AUDIO")
+    if pcm_bytes == 0:
+        logger.error("ZeroTTS trả về HTTP 200 nhưng không có dữ liệu PCM (raw_bytes=%d).", raw_bytes)
+        raise TTSError("TTS không trả về dữ liệu âm thanh.", code="TTS_EMPTY_AUDIO")
+
+
 # --- Hàm chính gọi TTS ---
 async def tts_stream(text: str, voice: str | None = None, timeout: float | None = None) -> AsyncIterator[bytes]:
     """Gọi ZeroTTS HTTP stream và yield từng khối byte PCM 16-bit đã bỏ WAV header và căn chẵn byte."""
@@ -479,11 +491,14 @@ async def tts_stream(text: str, voice: str | None = None, timeout: float | None 
                 raise TTSError(f"ZeroTTS trả về HTTP {resp.status_code}: {err_body}", code=f"HTTP_{resp.status_code}")
 
             header_parsed, header_buf, leftover = False, bytearray(), b""
+            raw_bytes, pcm_bytes = 0, 0
             async for raw_chunk in resp.aiter_bytes():
                 if not raw_chunk:
                     continue
+                raw_bytes += len(raw_chunk)
                 aligned_data, header_parsed, leftover = _process_tts_chunk(raw_chunk, header_parsed, header_buf, leftover)
                 if aligned_data:
+                    pcm_bytes += len(aligned_data)
                     yield aligned_data
 
             if leftover:
@@ -491,7 +506,11 @@ async def tts_stream(text: str, voice: str | None = None, timeout: float | None 
                     "Dữ liệu PCM từ TTS không hợp lệ (stream kết thúc với %d byte lẻ). Căn chỉnh 1 byte null để bảo toàn sample 16-bit.",
                     len(leftover),
                 )
-                yield leftover + b"\x00"
+                padded = leftover + b"\x00"
+                pcm_bytes += len(padded)
+                yield padded
+
+            _validate_tts_stream_result(header_parsed, header_buf, raw_bytes, pcm_bytes)
     except httpx.TimeoutException as exc:
         raise TTSError(f"Hết thời gian chờ phản hồi TTS sau {actual_timeout}s.", code="TTS_TIMEOUT") from exc
     except httpx.RequestError as exc:

@@ -108,6 +108,9 @@ class Settings:
     turn_max_audio_bytes: int = field(
         default_factory=lambda: int(os.getenv("TURN_MAX_AUDIO_BYTES", "256000"))
     )
+    turn_no_speech_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("TURN_NO_SPEECH_TIMEOUT_SECONDS", "12.0"))
+    )
 
     # Thư mục frontend và models
     frontend_dir: Path = field(default_factory=lambda: _ROOT_DIR / "frontend")
@@ -161,6 +164,7 @@ class Settings:
             (self.stt_finish_timeout <= 0, f"STT_FINISH_TIMEOUT ({self.stt_finish_timeout}) phải lớn hơn 0."),
             (self.smart_turn_max_workers < 1, f"SMART_TURN_MAX_WORKERS ({self.smart_turn_max_workers}) phải >= 1."),
             (self.turn_max_audio_bytes < 3200, f"TURN_MAX_AUDIO_BYTES ({self.turn_max_audio_bytes}) phải >= 3200."),
+            (self.turn_no_speech_timeout_seconds <= 0, f"TURN_NO_SPEECH_TIMEOUT_SECONDS ({self.turn_no_speech_timeout_seconds}) phải lớn hơn 0."),
         ]
         for condition, msg in rules:
             if condition:

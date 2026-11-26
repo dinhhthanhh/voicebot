@@ -67,12 +67,14 @@ class TurnState:
     stt_client: services.STTClient | None = None                        # Kết nối Qwen3-ASR phục vụ pha LISTENING
     has_speech: bool = False                                            # Đã ghi nhận tiếng nói thật trong lượt hay chưa
     is_vad_speaking: bool = False                                       # Cờ báo người dùng đang nói theo sự kiện VAD
+    started_at: float = field(default_factory=time.monotonic)           # Mốc monotonic bắt đầu lượt nghe
     last_speech_time: float = 0.0                                       # Mốc monotonic gần nhất còn thấy speech/partial
     turn_audio_buffer: deque[bytes] = field(default_factory=deque)      # Bộ đệm vòng PCM gần nhất cho Smart Turn
     turn_audio_bytes: int = 0                                           # Tổng số byte hiện nằm trong `turn_audio_buffer`
     last_partial_text: str = ""                                         # Bản nhận dạng tạm gần nhất (dự phòng khi STT timeout)
     smart_turn_task: asyncio.Task[Any] | None = field(default=None, repr=False)   # Task chạy dự đoán ngắt câu Smart Turn
     stt_forward_task: asyncio.Task[Any] | None = field(default=None, repr=False)  # Task đọc event từ `stt_client`
+    no_speech_task: asyncio.Task[Any] | None = field(default=None, repr=False)    # Task watchdog giới hạn chờ tiếng nói đầu vào
 
     def buffer_audio(self, pcm: bytes, max_bytes: int | None = None) -> None:
         """Đệm PCM vào cuối hàng đợi O(1) và cắt phần đầu nếu vượt quá giới hạn bộ nhớ."""
@@ -102,6 +104,7 @@ class TurnState:
         """Hủy toàn bộ task nền của turn, reset cờ VAD và xóa bộ đệm âm thanh."""
         self.cancel_task("smart_turn_task")
         self.cancel_task("stt_forward_task")
+        self.cancel_task("no_speech_task")
         self.has_speech = False
         self.is_vad_speaking = False
         self.reset_audio()
@@ -150,12 +153,18 @@ class VoiceSession:
             async with self.send_lock:
                 if not self.closed:
                     await send()
-        except (ConnectionError, WebSocketDisconnect, ConnectionClosed):
+        except (ConnectionError, WebSocketDisconnect, ConnectionClosed, OSError):
             self.closed = True
+        except RuntimeError as exc:
+            detail = str(exc).lower()
+            if any(k in detail for k in ("disconnect", "closed", "close message", "not connected")):
+                self.closed = True
+            else:
+                logger.warning("Lỗi gửi WebSocket (RuntimeError): %s", exc)
         except Exception as exc:
-            # Bắt thêm RuntimeError từ ASGI/Starlette khi gửi sau lúc close/disconnect
+            # Bắt thêm ngoại lệ phát sinh từ ASGI/Starlette khi gửi sau lúc close/disconnect
             detail = f"{type(exc).__name__}: {exc}".lower()
-            if any(k in detail for k in ("disconnect", "closed", "close message")):
+            if any(k in detail for k in ("disconnect", "closed", "close message", "not connected")):
                 self.closed = True
             else:
                 logger.warning("Lỗi gửi WebSocket (%s): %s", type(exc).__name__, exc)
@@ -483,35 +492,37 @@ class VoiceSession:
     # -------------------------------------------------------------------------
     # --- Các hàm nhánh xử lý sự kiện âm thanh/VAD ---
     async def _run_smart_turn(self, turn_id: str) -> None:
-        """Đợi nhịp nghỉ ngắn rồi chạy Smart Turn ONNX; nếu dứt câu (>= threshold) thì gọi `finish_turn`."""
+        """Chạy Smart Turn ONNX theo lịch giãn dần (0.3s, 1.0s, 2.0s); nếu dứt câu (>= threshold) thì gọi `finish_turn`."""
         try:
-            await asyncio.sleep(0.3)  # Debounce ngắn để tránh cắt khi người dùng chỉ ngập ngừng 1 nhịp
-            turn = self.current_turn
-            if (
-                not turn
-                or not self.is_active_turn(turn_id)
-                or self.state != VoiceState.LISTENING
-                or turn.is_vad_speaking
-            ):
-                return
-            audio = turn.get_audio()
-            prob = await asyncio.wait_for(
-                services.smart_turn_detector.predict(audio),
-                timeout=settings.smart_turn_inference_timeout_seconds,
-            )
-            logger.info(
-                "Smart Turn [%s]: %.3f (threshold=%.2f)",
-                turn_id,
-                prob,
-                settings.smart_turn_threshold,
-            )
-            if (
-                prob >= settings.smart_turn_threshold
-                and self.is_active_turn(turn_id)
-                and not turn.is_vad_speaking
-                and self.state == VoiceState.LISTENING
-            ):
-                await self.finish_turn(turn_id)
+            for delay in (0.3, 0.7, 1.0):
+                await asyncio.sleep(delay)
+                turn = self.current_turn
+                if (
+                    not turn
+                    or not self.is_active_turn(turn_id)
+                    or self.state != VoiceState.LISTENING
+                    or turn.is_vad_speaking
+                ):
+                    return
+                audio = turn.get_audio()
+                prob = await asyncio.wait_for(
+                    services.smart_turn_detector.predict(audio),
+                    timeout=settings.smart_turn_inference_timeout_seconds,
+                )
+                logger.info(
+                    "Smart Turn [%s]: %.3f (threshold=%.2f)",
+                    turn_id,
+                    prob,
+                    settings.smart_turn_threshold,
+                )
+                if (
+                    prob >= settings.smart_turn_threshold
+                    and self.is_active_turn(turn_id)
+                    and not turn.is_vad_speaking
+                    and self.state == VoiceState.LISTENING
+                ):
+                    await self.finish_turn(turn_id)
+                    return
         except TimeoutError:
             logger.warning("Smart Turn timeout: %s", turn_id)
         except Exception:
@@ -521,6 +532,24 @@ class VoiceSession:
             if self.current_turn and current_task and self.current_turn.smart_turn_task is current_task:
                 self.current_turn.smart_turn_task = None
 
+    async def _watch_no_speech_timeout(self, turn_id: str) -> None:
+        """Hủy lượt nghe nếu người dùng hoàn toàn im lặng vượt quá `turn_no_speech_timeout_seconds`."""
+        try:
+            await asyncio.sleep(settings.turn_no_speech_timeout_seconds)
+            turn = self.current_turn
+            if (
+                turn
+                and self.is_active_turn(turn_id)
+                and self.state == VoiceState.LISTENING
+                and not turn.has_speech
+            ):
+                logger.info("Hết thời gian chờ giọng nói đầu vào turn [%s], đưa về IDLE.", turn_id)
+                await self.cancel_turn(turn_id)
+        finally:
+            current_task = _cur_task()
+            if self.current_turn and current_task and self.current_turn.no_speech_task is current_task:
+                self.current_turn.no_speech_task = None
+
     async def _handle_vad(self, turn_id: str, vad_state: str) -> None:
         """Cập nhật trạng thái đang nói (`speech_started` / `speech_ended`) để bật hoặc hủy Smart Turn."""
         turn = self.current_turn
@@ -529,6 +558,7 @@ class VoiceSession:
         if vad_state == "speech_started":
             turn.is_vad_speaking, turn.has_speech = True, True
             turn.last_speech_time = time.monotonic()
+            turn.cancel_task("no_speech_task")
             turn.cancel_task("smart_turn_task")
         elif vad_state == "speech_ended":
             turn.is_vad_speaking = False
@@ -551,6 +581,7 @@ class VoiceSession:
                 turn.last_partial_text = text
                 if text.strip():
                     turn.has_speech, turn.last_speech_time = True, time.monotonic()
+                    turn.cancel_task("no_speech_task")
                 await self.emit_event("transcript.partial", turn_id=turn_id, text=text)
         elif etype == "vad" and (vad_state := event.get("state") or event.get("vad_type")):
             logger.info("STT VAD event: %s", event)
@@ -579,11 +610,16 @@ class VoiceSession:
                 self.current_turn.stt_forward_task = None
 
     def is_silence_timeout(self) -> bool:
-        """Kiểm tra người dùng đã ngừng nói quá ngưỡng fallback (hoặc bị kẹt cờ VAD quá lâu) hay chưa."""
+        """Kiểm tra hết thời gian chờ giọng nói đầu vào hoặc đã ngừng nói quá ngưỡng fallback."""
         turn = self.current_turn
-        if not turn or not turn.has_speech or turn.last_speech_time <= 0:
+        if not turn:
             return False
-        elapsed = time.monotonic() - turn.last_speech_time
+        now = time.monotonic()
+        if not turn.has_speech:
+            return turn.started_at > 0 and (now - turn.started_at) >= settings.turn_no_speech_timeout_seconds
+        if turn.last_speech_time <= 0:
+            return False
+        elapsed = now - turn.last_speech_time
         if turn.is_vad_speaking:
             # Bảo vệ chống kẹt khi server VAD phát `speech_started` nhưng mất gói `speech_ended`
             max_stuck_vad = max(8.0, settings.smart_turn_fallback_seconds * 2)
@@ -614,7 +650,11 @@ class VoiceSession:
                 return
 
         if self.is_silence_timeout():
-            await self.finish_turn(turn.turn_id)
+            if not turn.has_speech:
+                logger.info("Hết thời gian chờ giọng nói đầu vào turn [%s], đưa về IDLE.", turn.turn_id)
+                await self.cancel_turn(turn.turn_id)
+            else:
+                await self.finish_turn(turn.turn_id)
 
     # -------------------------------------------------------------------------
     # F. Điều khiển vòng đời Turn & Tiếp nhận Event WebSocket
@@ -652,7 +692,9 @@ class VoiceSession:
                 await self._close_stt(stt)
                 return
             turn.stt_client = stt
+            turn.started_at = time.monotonic()
             turn.stt_forward_task = self._spawn_task(self._forward_stt(stt, turn_id))
+            turn.no_speech_task = self._spawn_task(self._watch_no_speech_timeout(turn_id))
             await self.set_state(VoiceState.LISTENING, force=True)
 
     async def finish_turn(self, turn_id: str | None = None, *, require_turn_id: bool = False) -> None:

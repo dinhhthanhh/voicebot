@@ -1528,3 +1528,133 @@ async def test_close_http_client_detaches_before_aclose():
         assert services._http_client is None
     finally:
         services._http_client = orig
+
+
+@pytest.mark.anyio
+async def test_no_speech_timeout_and_watch_task():
+    session = VoiceSession(session_id="sess_no_speech")
+    session.state = VoiceState.LISTENING
+    session.current_turn = TurnState(
+        turn_id="turn_ns",
+        has_speech=False,
+        started_at=time.monotonic() - (settings.turn_no_speech_timeout_seconds + 1.0),
+    )
+    assert session.is_silence_timeout() is True
+
+    events = []
+
+    async def mock_send(ev):
+        events.append(ev)
+
+    session.send_json_cb = mock_send
+
+    orig_timeout = settings.turn_no_speech_timeout_seconds
+    object.__setattr__(settings, "turn_no_speech_timeout_seconds", 0.05)
+    try:
+        session.current_turn = TurnState(turn_id="turn_ns_watch", has_speech=False)
+        session.state = VoiceState.LISTENING
+        await session._watch_no_speech_timeout("turn_ns_watch")
+        assert session.state == VoiceState.IDLE
+        assert session.current_turn is None
+        assert any(e.get("type") == "playback.stop" and e.get("turn_id") == "turn_ns_watch" for e in events)
+    finally:
+        object.__setattr__(settings, "turn_no_speech_timeout_seconds", orig_timeout)
+
+
+@pytest.mark.anyio
+async def test_smart_turn_retries_within_same_pause():
+    session = VoiceSession(session_id="sess_st_retry")
+    session.state = VoiceState.LISTENING
+    session.current_turn = TurnState(turn_id="turn_st_retry", has_speech=True)
+    session.current_turn.buffer_audio(b"\x01\x02" * 2000)
+
+    probs = iter([0.35, 0.85])
+    calls = 0
+    finished = []
+
+    async def fake_predict(_audio):
+        nonlocal calls
+        calls += 1
+        return next(probs)
+
+    async def fake_finish(turn_id=None, **_kwargs):
+        finished.append(turn_id)
+
+    orig_predict = services.smart_turn_detector.predict
+    orig_finish = session.finish_turn
+    orig_sleep = asyncio.sleep
+
+    async def fast_sleep(_sec):
+        await orig_sleep(0)
+
+    services.smart_turn_detector.predict = fake_predict  # type: ignore
+    session.finish_turn = fake_finish  # type: ignore
+    asyncio.sleep = fast_sleep  # type: ignore
+    try:
+        await session._run_smart_turn("turn_st_retry")
+        assert calls == 2
+        assert finished == ["turn_st_retry"]
+    finally:
+        services.smart_turn_detector.predict = orig_predict  # type: ignore
+        session.finish_turn = orig_finish  # type: ignore
+        asyncio.sleep = orig_sleep
+
+
+@pytest.mark.anyio
+async def test_tts_stream_distinguishes_empty_audio_and_truncated_header():
+    class MockResp:
+        status_code = 200
+
+        def __init__(self, payloads):
+            self._payloads = payloads
+
+        async def aiter_bytes(self):
+            for chunk in self._payloads:
+                yield chunk
+
+    class MockClient:
+        is_closed = False
+
+        def __init__(self, payloads):
+            self._payloads = payloads
+
+        @asynccontextmanager
+        async def stream(self, *_args, **_kwargs):
+            yield MockResp(self._payloads)
+
+    orig_client_fn = services.get_http_client
+    try:
+        # 1. HTTP 200 nhưng 0 byte
+        services.get_http_client = lambda: MockClient([])  # type: ignore
+        with pytest.raises(services.TTSError) as exc_empty:
+            async for _ in services.tts_stream("Xin chào"):
+                pass
+        assert exc_empty.value.code == "TTS_EMPTY_AUDIO"
+
+        # 2. HTTP 200 nhưng WAV header bị cắt cụt (< 12 bytes)
+        services.get_http_client = lambda: MockClient([b"RIFF\x24\x00"])  # type: ignore
+        with pytest.raises(services.TTSError) as exc_hdr:
+            async for _ in services.tts_stream("Xin chào"):
+                pass
+        assert exc_hdr.value.code == "TTS_INVALID_AUDIO"
+
+        # 3. Chuỗi rỗng hợp lệ vẫn return êm không lỗi
+        chunks = [c async for c in services.tts_stream("   ")]
+        assert chunks == []
+    finally:
+        services.get_http_client = orig_client_fn
+
+
+@pytest.mark.anyio
+async def test_safe_send_handles_not_connected_and_oserror():
+    for exc in (
+        OSError("Socket write failed"),
+        RuntimeError('WebSocket is not connected. Need to call "accept" first.'),
+    ):
+        session = VoiceSession(session_id="sess_send_extra")
+
+        async def broken_send(err=exc):
+            raise err
+
+        await session._safe_send(broken_send)
+        assert session.closed is True

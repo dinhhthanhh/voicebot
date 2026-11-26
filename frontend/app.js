@@ -14,6 +14,23 @@
         error: "Lỗi hệ thống",
     };
 
+    const RETRYABLE_ERROR_CODES = new Set([
+        "STT_TIMEOUT",
+        "STT_CONNECT_FAILED",
+        "STT_SEND_ERROR",
+        "STT_FORWARD_ERROR",
+        "STT_ERROR",
+        "CONNECTION_CLOSED",
+        "LLM_TIMEOUT",
+        "LLM_CONNECTION_ERROR",
+        "LLM_STREAM_ERROR",
+        "TTS_TIMEOUT",
+        "TTS_CONNECTION_ERROR",
+        "TTS_EMPTY_AUDIO",
+        "TTS_INVALID_AUDIO",
+        "TTS_STREAM_ERROR",
+    ]);
+
     // Trạng thái kết nối & đàm thoại
     let ws = null;
     let currentTurnId = null;
@@ -232,6 +249,9 @@ registerProcessor('mic-processor', MicProcessor);
                     // Nếu TTS không phát âm thanh (không có assistant.audio.done), tự mở lại lượt nghe tiếp
                     if (prevState === "thinking" && !isPlaying() && !waitAudioEndTimer) {
                         queueNextTurn();
+                    } else if (prevState === "listening" && callActive) {
+                        // Backend chủ động hủy/timeout khi user im lặng hoàn toàn -> trả UI về nút Bắt đầu nói
+                        teardownCallState();
                     }
                 }
                 refreshState();
@@ -272,12 +292,20 @@ registerProcessor('mic-processor', MicProcessor);
                 if (isMatchTurn) scheduleAutoListen();
                 break;
             case "playback.stop":
-                stopPlayback();
+                if (isMatchTurn) {
+                    stopPlayback();
+                }
                 break;
-            case "session.error":
-                setErr(m.message || "Lỗi xử lý phiên.");
+            case "session.error": {
+                const code = m.code ? `[${m.code}] ` : "";
+                const baseMsg = m.message || "Lỗi xử lý phiên.";
+                const hint = m.code && RETRYABLE_ERROR_CODES.has(m.code)
+                    ? " Bấm Bắt đầu nói để thử lại."
+                    : (m.code ? " Vui lòng bấm Hội thoại mới." : "");
+                setErr(`${code}${baseMsg}${hint}`);
                 if (callActive) teardownCallState();
                 break;
+            }
         }
     }
 
