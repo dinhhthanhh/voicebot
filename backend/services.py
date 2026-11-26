@@ -89,7 +89,6 @@ class STTClient:
         self.is_done = asyncio.Event()                     # Bật khi nhận được `final` hoặc kết nối đóng
         self.final_text = ""                               # Kết quả nhận dạng cuối cùng
         self.error_payload: dict[str, Any] | None = None   # Payload lỗi nhận từ server hoặc mất kết nối
-        self._close_lock = asyncio.Lock()                  # Khóa chống đóng trùng lặp đồng thời
         self._closed = False                               # Cờ idempotent đảm bảo chỉ đóng một lần
 
     # --- Các hàm nhánh nội bộ ---
@@ -177,31 +176,29 @@ class STTClient:
 
     # --- Các hàm chính quản lý vòng đời STT ---
     async def close(self) -> None:
-        """Đóng an toàn task nhận dữ liệu và WebSocket (idempotent, an toàn khi gọi đồng thời)."""
+        """Đóng an toàn task nhận dữ liệu và WebSocket (idempotent trên single event loop)."""
         if self._closed:
             return
-        async with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
-            self.is_active = False
-            self.is_done.set()
+        # Đặt `_closed = True` trước khi `await` nên các lời gọi lặp lại trên cùng event loop thoát ngay
+        self._closed = True
+        self.is_active = False
+        self.is_done.set()
 
-            current_task = asyncio.current_task()
+        current_task = asyncio.current_task()
 
-            recv_task = self.recv_task
-            self.recv_task = None
-            # Tránh tự hủy nếu `close()` tình cờ được gọi từ chính task `_recv_loop`
-            if recv_task and not recv_task.done() and recv_task is not current_task:
-                recv_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await recv_task
+        recv_task = self.recv_task
+        self.recv_task = None
+        # Tránh tự hủy nếu `close()` tình cờ được gọi từ chính task `_recv_loop`
+        if recv_task and not recv_task.done() and recv_task is not current_task:
+            recv_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await recv_task
 
-            ws = self.websocket
-            self.websocket = None
-            if ws:
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await ws.close(code=1000, reason="Turn closed")
+        ws = self.websocket
+        self.websocket = None
+        if ws:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await ws.close(code=1000, reason="Turn closed")
 
     @classmethod
     async def connect(cls, session_id: str, turn_id: str) -> STTClient:
@@ -218,7 +215,12 @@ class STTClient:
                 request_id=f"{req_id}_{attempt}" if attempt > 0 else req_id,
             )
             try:
-                client.websocket = await websockets.connect(settings.stt_ws_url, max_size=10 * 1024 * 1024)
+                client.websocket = await websockets.connect(
+                    settings.stt_ws_url,
+                    max_size=10 * 1024 * 1024,
+                    open_timeout=settings.stt_connect_timeout,
+                    close_timeout=2.0,
+                )
                 client.recv_task = asyncio.create_task(client._recv_loop())
                 await client._send_config()
                 await asyncio.wait_for(client.is_ready.wait(), timeout=settings.stt_connect_timeout)
@@ -329,9 +331,9 @@ def get_http_client() -> httpx.AsyncClient:
 async def close_http_client() -> None:
     """Đóng HTTP AsyncClient dùng chung khi Gateway tắt."""
     global _http_client
-    if _http_client and not _http_client.is_closed:
-        await _http_client.aclose()
-        _http_client = None
+    client, _http_client = _http_client, None
+    if client and not client.is_closed:
+        await client.aclose()
 
 
 def _parse_sse_delta(data_str: str) -> str | None:
@@ -547,16 +549,20 @@ class SmartTurnDetector:
         """Tiền xử lý tối đa 8 giây âm thanh cuối và chạy suy luận ONNX đồng bộ."""
         if self.session is None or self.feature_extractor is None:
             return 0.0
-        # Chuyển PCM int16 [-32768, 32767] -> float32 [-1.0, 1.0] và chỉ giữ lại 8 giây cuối
-        audio_f32 = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        # Cắt tối đa 8 giây cuối và căn chẵn byte (PCM 16-bit) trước khi chuyển sang float32
         max_samples = 8 * sample_rate
-        if len(audio_f32) > max_samples:
-            audio_f32 = audio_f32[-max_samples:]
+        max_bytes = max_samples * 2
+        if len(audio_bytes) > max_bytes:
+            audio_bytes = audio_bytes[-max_bytes:]
+        even_len = len(audio_bytes) & ~1
+        if even_len == 0:
+            return 0.0
+        audio_f32 = np.frombuffer(audio_bytes[:even_len], dtype=np.int16).astype(np.float32) / 32768.0
         # Chuẩn hóa zero-mean, unit-variance trước khi pad trái đúng yêu cầu của Smart Turn v3.2
-        if len(audio_f32) > 0:
-            mean = np.mean(audio_f32)
-            var = np.mean((audio_f32 - mean) ** 2)
-            audio_f32 = (audio_f32 - mean) / np.sqrt(var + 1e-7)
+        mean = np.mean(audio_f32)
+        centered = audio_f32 - mean
+        var = np.mean(centered * centered)
+        audio_f32 = centered / np.sqrt(var + 1e-7)
         if len(audio_f32) < max_samples:
             audio_f32 = np.pad(audio_f32, (max_samples - len(audio_f32), 0), mode="constant")
 

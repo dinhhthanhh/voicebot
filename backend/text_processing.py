@@ -175,6 +175,7 @@ def _read_dec(tok: str) -> str:
 def _read_token(match: re.Match[str]) -> str:
     """Chuyển đổi một token chứa số (5G, đơn vị đo, mã vận đơn, tiền tệ, số thập phân) sang chữ đọc."""
     raw_tok = match.group(0)
+    # Tách dấu câu cuối câu khỏi token số/thập phân (vd: "3.14." -> "3.14" + "."), giữ dấu chấm/phẩy bên trong
     tok = raw_tok.rstrip(".,;!?")
     punct = raw_tok[len(tok):]
 

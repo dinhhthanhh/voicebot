@@ -176,7 +176,7 @@ registerProcessor('mic-processor', MicProcessor);
             connectionBadge.classList.add("connected");
             connectionText.textContent = "Đã kết nối";
             setErr("");
-            sendJson({ type: "session.start" });
+            refreshState();
         };
 
         ws.onclose = (e) => {
@@ -211,9 +211,6 @@ registerProcessor('mic-processor', MicProcessor);
         const isMatchTurn = !m.turn_id || m.turn_id === currentTurnId;
 
         switch (m.type) {
-            case "session.ready":
-                refreshState();
-                break;
             case "voice.state": {
                 const prevState = serverState;
                 serverState = m.state;

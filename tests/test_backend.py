@@ -1209,11 +1209,13 @@ async def test_gateway_health_and_ws_message_handling():
     session.send_json_cb = mock_send
     await main._handle_ws_message(session, {"text": "{bad json"})
     await main._handle_ws_message(session, {"text": "[1, 2]"})
-    await main._handle_ws_message(session, {"text": '{"type": "session.start"}'})
+    session.state = VoiceState.SPEAKING
+    session.current_turn = TurnState(turn_id="turn_gw")
+    await main._handle_ws_message(session, {"text": '{"type": "playback.done", "turn_id": "turn_gw"}'})
 
     codes = [e.get("code") for e in events_emitted if e.get("type") == "session.error"]
     assert codes == ["INVALID_JSON", "INVALID_PAYLOAD"]
-    assert any(e.get("type") == "session.ready" for e in events_emitted)
+    assert any(e.get("type") == "voice.state" and e.get("state") == "idle" for e in events_emitted)
 
 
 def test_tts_streamer_flush_does_not_duplicate_short_hold():
@@ -1379,3 +1381,150 @@ def test_smart_turn_partial_init_failure_resets_ready(tmp_path):
     finally:
         services.ort.InferenceSession = orig_ort
         services.WhisperFeatureExtractor = orig_ext
+
+
+@pytest.mark.anyio
+async def test_handle_audio_frame_odd_bytes_in_listening_fails_once():
+    session = VoiceSession(session_id="sess_odd_listening")
+    session.state = VoiceState.LISTENING
+
+    class DummySTT:
+        is_active = True
+
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    stt = DummySTT()
+    session.current_turn = TurnState(turn_id="turn_odd", stt_client=stt)  # type: ignore
+
+    events_emitted: list[dict[str, Any]] = []
+
+    async def mock_send(ev):
+        events_emitted.append(ev)
+
+    session.send_json_cb = mock_send
+
+    await session.handle_audio_frame(b"\x01\x02\x03")
+    await session.handle_audio_frame(b"\x04\x05\x06")
+
+    err_events = [e for e in events_emitted if e.get("type") == "session.error"]
+    assert len(err_events) == 1
+    assert err_events[0].get("code") == "INVALID_AUDIO_FORMAT"
+    assert session.state == VoiceState.ERROR
+    assert stt.closed is True
+
+
+@pytest.mark.anyio
+async def test_cancel_tasks_preserves_active_tasks_set_identity():
+    session = VoiceSession(session_id="sess_set_id")
+    orig_set = session.active_tasks
+
+    done_gate = asyncio.Event()
+
+    async def self_canceller():
+        await session.cancel_tasks()
+        await done_gate.wait()
+
+    async def sleeper():
+        await asyncio.sleep(10)
+
+    session._spawn_task(sleeper())
+    runner = session._spawn_task(self_canceller())
+    await asyncio.sleep(0.01)
+
+    assert session.active_tasks is orig_set
+    assert runner in session.active_tasks
+    done_gate.set()
+    await runner
+    await asyncio.sleep(0)
+    assert runner not in session.active_tasks
+
+
+@pytest.mark.anyio
+async def test_start_turn_preserves_stt_error_code_on_connect_fail():
+    session = VoiceSession(session_id="sess_stt_overload")
+    events_emitted: list[dict[str, Any]] = []
+
+    async def mock_send(ev):
+        events_emitted.append(ev)
+
+    session.send_json_cb = mock_send
+    orig_connect = services.STTClient.connect
+
+    async def fail_connect(session_id, turn_id):
+        raise services.STTError("Quá tải", code="OVERLOADED")
+
+    services.STTClient.connect = fail_connect  # type: ignore
+    try:
+        await session.start_turn()
+        err_ev = next((e for e in events_emitted if e.get("type") == "session.error"), None)
+        assert err_ev is not None
+        assert err_ev.get("code") == "OVERLOADED"
+        assert session.state == VoiceState.ERROR
+    finally:
+        services.STTClient.connect = orig_connect  # type: ignore
+
+
+@pytest.mark.anyio
+async def test_safe_send_handles_disconnect_and_close_message_errors():
+    from starlette.websockets import WebSocketDisconnect
+    from websockets.exceptions import ConnectionClosed
+    from websockets.frames import Close
+
+    for exc in (
+        WebSocketDisconnect(code=1000),
+        ConnectionClosed(Close(1000, "bye"), None),
+        RuntimeError('Cannot call "send" once a close message has been sent.'),
+    ):
+        session = VoiceSession(session_id="sess_send_err")
+
+        async def broken_send(err=exc):
+            raise err
+
+        await session._safe_send(broken_send)
+        assert session.closed is True
+
+
+def test_smart_turn_sync_predict_handles_odd_and_oversized_buffer():
+    class FakeExt:
+        def __call__(self, audio, **_kwargs):
+            assert len(audio) == 8 * 16000
+            return {"input_features": services.np.zeros((1, 80, 800), dtype=services.np.float32)}
+
+    class FakeSession:
+        def run(self, *_args, **_kwargs):
+            return [services.np.array([[0.85]], dtype=services.np.float32)]
+
+    detector = services.SmartTurnDetector(model_path="dummy.onnx")
+    detector.feature_extractor = FakeExt()  # type: ignore
+    detector.session = FakeSession()  # type: ignore
+
+    # > 8s + odd byte count (256000 + 3201)
+    prob = detector._sync_predict(b"\x01\x02" * (128000 + 1600) + b"\x03", sample_rate=16000)
+    assert abs(prob - 0.85) < 1e-5
+    assert detector._sync_predict(b"\x01", sample_rate=16000) == 0.0
+
+
+@pytest.mark.anyio
+async def test_close_http_client_detaches_before_aclose():
+    closed = False
+
+    class DummyClient:
+        is_closed = False
+
+        async def aclose(self):
+            nonlocal closed
+            assert services._http_client is None
+            closed = True
+
+    orig = services._http_client
+    services._http_client = DummyClient()  # type: ignore
+    try:
+        await services.close_http_client()
+        assert closed is True
+        assert services._http_client is None
+    finally:
+        services._http_client = orig

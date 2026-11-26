@@ -16,6 +16,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+# Cho phép chạy trực tiếp `python backend/main.py` khi chưa cài gói dạng editable
 _ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(_ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(_ROOT_DIR))
@@ -110,10 +111,10 @@ async def websocket_voice_endpoint(websocket: WebSocket):
             if message.get("type") == "websocket.disconnect":
                 break
             await _handle_ws_message(session, message)
-    except (WebSocketDisconnect, RuntimeError, asyncio.CancelledError):
+    except (WebSocketDisconnect, asyncio.CancelledError):
         pass
     except Exception as exc:
-        if "disconnect" not in str(exc).lower():
+        if "disconnect" not in f"{type(exc).__name__}: {exc}".lower():
             logger.exception("Lỗi trong WebSocket loop: %s", exc)
     finally:
         await session.close()
