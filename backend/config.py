@@ -38,11 +38,6 @@ class Settings:
     app_reload: bool = field(
         default_factory=lambda: os.getenv("APP_RELOAD", "false").lower() in ("true", "1", "yes")
     )
-    cors_allow_origins: list[str] = field(
-        default_factory=lambda: [
-            o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()
-        ]
-    )
 
     # LLM Settings
     llm_chat_completions_url: str = field(

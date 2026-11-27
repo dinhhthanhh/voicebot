@@ -76,12 +76,11 @@ class TurnState:
     stt_forward_task: asyncio.Task[Any] | None = field(default=None, repr=False)  # Task đọc event từ `stt_client`
     no_speech_task: asyncio.Task[Any] | None = field(default=None, repr=False)    # Task watchdog giới hạn chờ tiếng nói đầu vào
 
-    def buffer_audio(self, pcm: bytes, max_bytes: int | None = None) -> None:
+    def buffer_audio(self, pcm: bytes) -> None:
         """Đệm PCM vào cuối hàng đợi O(1) và cắt phần đầu nếu vượt quá giới hạn bộ nhớ."""
-        limit = max_bytes if max_bytes is not None else settings.turn_max_audio_bytes
         self.turn_audio_buffer.append(pcm)
         self.turn_audio_bytes += len(pcm)
-        while self.turn_audio_bytes > limit and self.turn_audio_buffer:
+        while self.turn_audio_bytes > settings.turn_max_audio_bytes and self.turn_audio_buffer:
             self.turn_audio_bytes -= len(self.turn_audio_buffer.popleft())
 
     def get_audio(self) -> bytes:
@@ -455,7 +454,7 @@ class VoiceSession:
         return final_text or last_partial
 
     # --- Hàm chính điều phối xử lý trọn 1 lượt thoại ---
-    async def _process_turn(self, turn_id: str, stt: services.STTClient | None = None) -> None:
+    async def _process_turn(self, turn_id: str, stt: services.STTClient | None) -> None:
         """Chốt văn bản đầu vào, lọc trường hợp rỗng/từ đệm và kích hoạt pipeline LLM -> TTS."""
         try:
             if not self.is_active_turn(turn_id):

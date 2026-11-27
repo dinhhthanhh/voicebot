@@ -371,18 +371,18 @@ def _build_llm_payload(messages: list[dict[str, str]]) -> dict[str, Any]:
 
 
 # --- Hàm chính gọi LLM ---
-async def llm_stream(messages: list[dict[str, str]], timeout: float | None = None) -> AsyncIterator[str]:
+async def llm_stream(messages: list[dict[str, str]]) -> AsyncIterator[str]:
     """Gọi API Chat Completions dạng SSE streaming và yield từng mẩu text trả về."""
     if not settings.llm_chat_completions_url:
         raise LLMError("LLM_CHAT_COMPLETIONS_URL chưa cấu hình.", code="CONFIG_ERROR")
-    actual_timeout = timeout if timeout is not None else settings.llm_timeout_seconds
+    timeout = settings.llm_timeout_seconds
     client = get_http_client()
     try:
         async with client.stream(
             "POST",
             settings.llm_chat_completions_url,
             json=_build_llm_payload(messages),
-            timeout=httpx.Timeout(actual_timeout, connect=10.0),
+            timeout=httpx.Timeout(timeout, connect=10.0),
         ) as resp:
             if resp.status_code != 200:
                 err_body = (await resp.aread()).decode("utf-8", errors="replace")[:300]
@@ -397,7 +397,7 @@ async def llm_stream(messages: list[dict[str, str]], timeout: float | None = Non
                 if delta := _parse_sse_delta(data_str):
                     yield delta
     except httpx.TimeoutException as exc:
-        raise LLMError(f"Hết thời gian chờ phản hồi LLM sau {actual_timeout}s.", code="LLM_TIMEOUT") from exc
+        raise LLMError(f"Hết thời gian chờ phản hồi LLM sau {timeout}s.", code="LLM_TIMEOUT") from exc
     except httpx.RequestError as exc:
         raise LLMError(f"Lỗi kết nối tới LLM: {exc}", code="LLM_CONNECTION_ERROR") from exc
 
@@ -469,7 +469,7 @@ def _validate_tts_stream_result(
 
 
 # --- Hàm chính gọi TTS ---
-async def tts_stream(text: str, voice: str | None = None, timeout: float | None = None) -> AsyncIterator[bytes]:
+async def tts_stream(text: str) -> AsyncIterator[bytes]:
     """Gọi ZeroTTS HTTP stream và yield từng khối byte PCM 16-bit đã bỏ WAV header và căn chẵn byte."""
     if not settings.tts_base_url:
         raise TTSError("TTS_BASE_URL chưa cấu hình.", code="CONFIG_ERROR")
@@ -477,14 +477,14 @@ async def tts_stream(text: str, voice: str | None = None, timeout: float | None 
     if not clean_text:
         return
     url = f"{settings.tts_base_url.rstrip('/')}/{settings.tts_stream_path.lstrip('/')}"
-    actual_timeout = timeout if timeout is not None else settings.tts_timeout_seconds
+    timeout = settings.tts_timeout_seconds
     client = get_http_client()
     try:
         async with client.stream(
             "POST",
             url,
-            json={"text": clean_text, "voice": voice or settings.tts_voice},
-            timeout=httpx.Timeout(actual_timeout, connect=10.0),
+            json={"text": clean_text, "voice": settings.tts_voice},
+            timeout=httpx.Timeout(timeout, connect=10.0),
         ) as resp:
             if resp.status_code != 200:
                 err_body = (await resp.aread()).decode("utf-8", errors="replace")[:200]
@@ -512,7 +512,7 @@ async def tts_stream(text: str, voice: str | None = None, timeout: float | None 
 
             _validate_tts_stream_result(header_parsed, header_buf, raw_bytes, pcm_bytes)
     except httpx.TimeoutException as exc:
-        raise TTSError(f"Hết thời gian chờ phản hồi TTS sau {actual_timeout}s.", code="TTS_TIMEOUT") from exc
+        raise TTSError(f"Hết thời gian chờ phản hồi TTS sau {timeout}s.", code="TTS_TIMEOUT") from exc
     except httpx.RequestError as exc:
         raise TTSError(f"Lỗi kết nối tới TTS: {exc}", code="TTS_CONNECTION_ERROR") from exc
 
@@ -595,7 +595,7 @@ class SmartTurnDetector:
         return max(0.0, min(1.0, float(outputs[0][0].item())))
 
     # --- Các hàm chính ---
-    async def predict(self, audio_bytes: bytes, sample_rate: int = 16000) -> float:
+    async def predict(self, audio_bytes: bytes) -> float:
         """Dự đoán xác suất người dùng đã dứt câu [0.0..1.0] trên thread pool riêng."""
         if not self._attempted:
             await asyncio.to_thread(self.load_model)
@@ -604,7 +604,7 @@ class SmartTurnDetector:
             return 0.0
         try:
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(self._executor, self._sync_predict, audio_bytes, sample_rate)
+            return await loop.run_in_executor(self._executor, self._sync_predict, audio_bytes)
         except Exception as exc:
             logger.warning(
                 "Lỗi suy luận Smart Turn (audio_len=%d): %s",

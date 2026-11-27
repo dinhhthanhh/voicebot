@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # Cho phép chạy trực tiếp `python backend/main.py` khi chưa cài gói dạng editable
@@ -52,14 +51,6 @@ app = FastAPI(
     version="1.0.0",
     description="Hệ thống trợ lý giọng nói đàm thoại thời gian thực",
     lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_allow_origins,
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 

@@ -87,7 +87,6 @@ Tạo file `.env` tại thư mục `backend/` (hoặc thư mục gốc dự án)
 | `APP_PORT`                   | `8000`                                                       | Port chạy FastAPI server                                      |
 | `APP_LOG_LEVEL`              | `INFO`                                                       | Mức log hệ thống (`DEBUG`, `INFO`, `WARNING`, `ERROR`)        |
 | `APP_RELOAD`                 | `false`                                                      | Tự động reload uvicorn khi phát triển (`true`/`false`)        |
-| `CORS_ALLOW_ORIGINS`         | `*`                                                          | Danh sách origin được phép CORS (phân tách bằng dấu `,`)      |
 | `LLM_CHAT_COMPLETIONS_URL`   | `https://ai.vnpost.vn/vllm-qwen38-27b/v1/chat/completions`   | OpenAI-compatible chat completions endpoint của LLM           |
 | `LLM_MODEL`                  | `""`                                                         | Tên model LLM (để trống nếu vLLM tự định tuyến)               |
 | `LLM_TEMPERATURE`            | `0`                                                          | Độ sáng tạo của câu trả lời LLM                               |
